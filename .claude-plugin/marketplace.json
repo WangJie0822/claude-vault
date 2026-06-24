@@ -1,0 +1,15 @@
+{
+  "name": "claude-vault-marketplace",
+  "description": "Self-marketplace for the claude-vault plugin — a knowledge-base capture & recall loop for Claude Code.",
+  "owner": {
+    "name": "claude-vault contributors"
+  },
+  "plugins": [
+    {
+      "name": "claude-vault",
+      "description": "Auto-inject relevant Obsidian vault notes into Claude Code sessions, and distill sessions back into the vault. Cross-platform knowledge-base loop (capture + recall).",
+      "version": "0.1.0",
+      "source": "./"
+    }
+  ]
+}

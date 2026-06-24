@@ -1,0 +1,15 @@
+{
+  "description": "claude-vault: auto-inject vault notes + session distillation hooks",
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup|clear|compact", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/session_start_load.py" }] },
+      { "matcher": "startup|clear|compact", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" hooks/session_start_auto_notify.py" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/prompt_submit_load.py" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" hooks/session_end_enqueue.py" }] }
+    ]
+  }
+}
