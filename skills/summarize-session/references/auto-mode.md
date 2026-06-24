@@ -119,7 +119,7 @@ p.write_text(json.dumps(d,ensure_ascii=False,indent=2)+'\n')
 | `hard_rules.min_duration_min` | 3 | 硬规则：最小会话时长（分钟） |
 | `hard_rules.require_edit_or_write` | true | 硬规则：必须有 Edit/Write 工具调用 |
 
-跨平台 timeout 实现：由于 macOS 没有 GNU `timeout` 命令，所有超时控制走 `~/.claude/skills/summarize-session/scripts/_timeout.py`（返码 124 与 GNU 一致）。
+跨平台 timeout 实现：由于 macOS 没有 GNU `timeout` 命令，所有超时控制走 scripts 目录下的 `_timeout.py`（由各脚本内部调用，返码 124 与 GNU 一致）。
 
 ## 草稿审阅工作流
 

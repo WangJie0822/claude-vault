@@ -22,7 +22,8 @@ echo "exit=$?"
 
 ```bash
 # 先用 enqueue 脚本入队(模拟 SessionEnd hook)
-python3 ~/.claude/skills/summarize-session/scripts/enqueue_auto_summary.py \
+SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+python3 "$SS/enqueue_auto_summary.py" \
   --session "$TEST_SESSION" --cwd "$(pwd)"
 
 # 立即触发 cron

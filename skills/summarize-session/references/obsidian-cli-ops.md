@@ -5,7 +5,8 @@
 所有 Vault 内资源操作通过 scripts/obsidian_cli.py 调用：
 
 ```bash
-python3 ~/.claude/skills/summarize-session/scripts/obsidian_cli.py \
+SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+python3 "$SS/obsidian_cli.py" \
     --vault "$VAULT" <op> [其他参数]
 ```
 

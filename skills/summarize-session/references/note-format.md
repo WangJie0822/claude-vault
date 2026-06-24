@@ -65,16 +65,17 @@ summary: "一行摘要"
 **自动诊断与修复**：
 
 ```bash
+SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
 # 仅诊断
-python3 ~/.claude/skills/summarize-session/scripts/rebuild_index.py \
+python3 "$SS/rebuild_index.py" \
   --vault $VAULT --health-check-only
 
 # 自动修复 frontmatter（拆斜杠 category / 删 project / 补 subcategory）
-python3 ~/.claude/skills/summarize-session/scripts/rebuild_index.py \
+python3 "$SS/rebuild_index.py" \
   --vault $VAULT --emit=all --fix-frontmatter
 
 # 归档孤立 INDEX 到 .meta/archived-indexes/<date>/
-python3 ~/.claude/skills/summarize-session/scripts/rebuild_index.py \
+python3 "$SS/rebuild_index.py" \
   --vault $VAULT --emit=all --archive-stale-indexes
 ```
 

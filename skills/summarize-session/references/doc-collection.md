@@ -5,7 +5,8 @@
 `scripts/sync_pending_docs.py` 是唯一归集入口。SKILL.md 第四步调用：
 
 ```bash
-python3 ~/.claude/skills/summarize-session/scripts/sync_pending_docs.py \
+SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+python3 "$SS/sync_pending_docs.py" \
   --vault "$VAULT" \
   --mode incremental \
   --apply \

@@ -20,20 +20,14 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入到
 
 ## 安装（零配置）
 
-安装即生效，无需手动编辑知识库路径——vault-loader 从 `~/.claude/skills/summarize-session/config.json` 读取 `default_vault_path`（由 `/summarize-session --set-default <路径>` 写入）。默认知识库路径为 `~/.claude/knowledge-vault`，用户可配置为任意 Obsidian Vault 路径。
+作为 `claude-vault` 插件安装即生效：插件自带的 `hooks/hooks.json` 由 Claude Code 自动加载并注册 SessionStart / UserPromptSubmit hook，**无需手动编辑 `~/.claude/settings.json`**。hook 经插件的 polyglot wrapper 运行，脚本路径相对 `${CLAUDE_PLUGIN_ROOT}`（插件 cache 安装目录）解析。
 
-1. 确认 `<vault>/.meta/frontmatter-cache.json` 存在（由 `/summarize-session` 首次运行后自动生成）
-2. 在 `~/.claude/settings.json` 的 `SessionStart` 与 `UserPromptSubmit` 数组追加：
+vault-loader 从 `~/.claude/skills/summarize-session/config.json` 读取 `default_vault_path`（由 `/summarize-session --set-default <路径>` 写入）；未配置时默认 `~/.claude/knowledge-vault`，用户可配置为任意 Obsidian Vault 路径。
 
-```json
-{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/skills/vault-loader/scripts/session_start_load.py" }] }
-```
+1. 确认 `<vault>/.meta/frontmatter-cache.json` 存在（由 `/summarize-session` 首次运行后自动生成）。
+2. 首次启动新会话即生效。
 
-```json
-{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/skills/vault-loader/scripts/prompt_submit_load.py" }] }
-```
-
-3. 首次启动新会话即生效。
+> 旧的「手动在 `~/.claude/settings.json` 注册 hook」装法已废弃；若你之前手动注册过同名 hook，需删除旧注册以免与插件双触发——见 `docs/MIGRATION.md`。
 
 ## 配置
 

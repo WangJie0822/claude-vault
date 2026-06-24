@@ -9,7 +9,8 @@
 运行扫描脚本获取会话列表：
 
 ```bash
-python3 ~/.claude/skills/summarize-session/scripts/scan_sessions.py --days $DAYS
+SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+python3 "$SS/scan_sessions.py" --days $DAYS
 ```
 
 脚本输出 JSON，包含：
@@ -48,7 +49,8 @@ python3 ~/.claude/skills/summarize-session/scripts/scan_sessions.py --days $DAYS
 
 1. 调用脚本解析完整对话：
    ```bash
-   python3 ~/.claude/skills/summarize-session/scripts/scan_sessions.py --parse --session <uuid>
+   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   python3 "$SS/scan_sessions.py" --parse --session <uuid>
    ```
 
 2. 分析解析出的对话内容，识别：
@@ -101,7 +103,8 @@ python3 ~/.claude/skills/summarize-session/scripts/scan_sessions.py --days $DAYS
 1. 执行笔记写入和 CLAUDE.md 更新（与正常流程相同）
 2. 标记已处理的会话为"已总结"：
    ```bash
-   python3 ~/.claude/skills/summarize-session/scripts/scan_sessions.py --mark <uuid1> <uuid2> ...
+   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   python3 "$SS/scan_sessions.py" --mark <uuid1> <uuid2> ...
    ```
 3. 重建索引
 4. 输出确认报告
