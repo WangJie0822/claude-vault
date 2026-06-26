@@ -186,13 +186,13 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/uninstall.py" --remove-data
   1. 进入会话时基于当前项目信息加载git、工作日志等信息；
   2. 发送 prompt 后基于 prompt 内容深入加载更多相关笔记；
 
-![Claude Code 使用效果](.\images\cc_preview.png)
+![Claude Code 使用效果](images/cc-session-end-summary.png)
 
 - Obsidian 知识库效果：
   1. 在每次有效工作的会话后执行 `/summarize-session` 将你的工作决策、踩坑、技术点记录到知识库中；
   2. 伴随着cc的使用增多，不断完善补充你的个人知识库图谱，让cc越来越懂你；
 
-![Obsidian知识库效果](.\images\obsidian_preview.png)
+![Obsidian知识库效果](images/obsidian-vault-preview.png)
 
 ## 许可证
 
