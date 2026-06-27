@@ -18,6 +18,7 @@ def _default_weights() -> dict:
         "mtime_recent_90d": 0.5,
         "prompt_tag_hit": 4,
         "prompt_summary_hit": 2,
+        "prompt_keyword_hit": 3,
     }
 
 
@@ -241,3 +242,36 @@ def test_empty_keyword_does_not_match() -> None:
     from scripts._scorer import _kw_in_text
     assert _kw_in_text("", "任意文本 abc") is False
     assert _kw_in_text("", "") is False
+
+
+def test_keyword_only_hit_scores_keyword_weight():
+    e = Entry(path="x.md", keywords=("扩展词召回",))
+    sigs = Signals(prompt_keywords={"扩展词召回"})
+    assert topical_score(e, sigs, _default_weights()) == 3
+
+
+def test_keyword_hit_deduped_against_tag():
+    # 同一查询词既命中 tag 又命中 keyword → 只计 tag(4)，不双计(不 +3)
+    e = Entry(path="x.md", tags=("vault-loader",), keywords=("vault-loader",))
+    sigs = Signals(prompt_keywords={"vault-loader"})
+    assert topical_score(e, sigs, _default_weights()) == 4
+
+
+def test_tag_and_distinct_keyword_sum():
+    # 不同查询词分别命中 tag 与 keyword → 4 + 3 = 7
+    e = Entry(path="x.md", tags=("android",), keywords=("回归测试",))
+    sigs = Signals(prompt_keywords={"android", "回归测试"})
+    assert topical_score(e, sigs, _default_weights()) == 7
+
+
+def test_use_keywords_false_ignores_keywords():
+    e = Entry(path="x.md", keywords=("扩展词召回",))
+    sigs = Signals(prompt_keywords={"扩展词召回"})
+    assert topical_score(e, sigs, _default_weights(), use_keywords=False) == 0
+
+
+def test_empty_keywords_unchanged():
+    # 空 keywords 笔记走原路径，旧值域不变（tag=4）
+    e = Entry(path="x.md", tags=("android",))
+    sigs = Signals(prompt_keywords={"android"})
+    assert topical_score(e, sigs, _default_weights()) == 4

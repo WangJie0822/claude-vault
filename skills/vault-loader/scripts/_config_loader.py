@@ -44,6 +44,7 @@ DEFAULT_CONFIG: dict = {
         "mtime_recent_90d": 0.5,
         "prompt_tag_hit": 4,
         "prompt_summary_hit": 2,
+        "prompt_keyword_hit": 3,
     },
 
     "keyword_to_tags": {},
@@ -64,6 +65,7 @@ DEFAULT_CONFIG: dict = {
 
     "relevance": {
         "strip_slash_command": True,        # 剥 prompt 首个 slash 命令名 token
+        "use_keywords": True,               # 止血开关：false 时 scorer 忽略 keywords，不杀整个 loader
         "min_topical_score": 4,             # 精度闸门：仅 topical_score ≥ 此值才注入
         # fulltext_topical_threshold 与 confidence_bands.high 同值=6 时：topical=6 的条目，若由
         # ≥2 个不同关键词命中则走全文分支；若仅单个词刷满（B 纵深防御 _FULLTEXT_MIN_DISTINCT），

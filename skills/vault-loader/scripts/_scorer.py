@@ -75,7 +75,12 @@ def _keyword_hits_summary(keyword: str, entry: Entry) -> bool:
     return _kw_in_text(keyword, entry.summary)
 
 
-def score(entry: Entry, signals: Signals, weights: dict) -> float:
+def _keyword_hits_keywords(keyword: str, entry: Entry) -> bool:
+    return any(_kw_in_text(keyword, k) for k in entry.keywords)
+
+
+def score(entry: Entry, signals: Signals, weights: dict,
+          use_keywords: bool = True) -> float:
     """计算单篇笔记的相关性分数。"""
     total: float = 0
 
@@ -112,21 +117,35 @@ def score(entry: Entry, signals: Signals, weights: dict) -> float:
             total += weights["prompt_tag_hit"]
         if any(_keyword_hits_summary(kw, entry) for kw in signals.prompt_keywords):
             total += weights["prompt_summary_hit"]
+        if use_keywords and entry.keywords:
+            kw_only = [kw for kw in signals.prompt_keywords
+                       if not _keyword_hits_tags(kw, entry)]
+            if any(_keyword_hits_keywords(kw, entry) for kw in kw_only):
+                total += weights["prompt_keyword_hit"]
 
     return total
 
 
-def topical_score(entry: Entry, signals: Signals, weights: dict) -> float:
-    """仅 prompt 关键词的话题命中分（tag/summary），不含 context（target_tags/mtime）。
+def topical_score(entry: Entry, signals: Signals, weights: dict,
+                  use_keywords: bool = True) -> float:
+    """仅 prompt 关键词的话题命中分（tag/summary/keywords），不含 context（target_tags/mtime）。
 
     供精度闸门判定'真话题相关'用，与 score() 解耦。
-    默认权重（prompt_tag_hit=4 / prompt_summary_hit=2）下值域 {0,2,4,6}；relevance 段阈值
-    （min_topical_score / fulltext_topical_threshold / confidence_bands.high）默认值假定该权重，
-    改 scoring 权重需同步调阈值。"""
+    默认权重（prompt_tag_hit=4 / prompt_summary_hit=2 / prompt_keyword_hit=3）下值域 {0,2,3,4,5,6,7,8,9}；
+    relevance 段阈值（min_topical_score / fulltext_topical_threshold / confidence_bands.high）默认值
+    假定该权重，改 scoring 权重需同步调阈值。
+    keywords 命中加 prompt_keyword_hit（去重 + 门控）。"""
     total: float = 0
     if signals.prompt_keywords:
-        if any(_keyword_hits_tags(kw, entry) for kw in signals.prompt_keywords):
+        tag_hit = any(_keyword_hits_tags(kw, entry) for kw in signals.prompt_keywords)
+        if tag_hit:
             total += weights["prompt_tag_hit"]
         if any(_keyword_hits_summary(kw, entry) for kw in signals.prompt_keywords):
             total += weights["prompt_summary_hit"]
+        # keyword 命中：仅对未命中任何 tag 的查询词计（去重），门控 use_keywords + entry.keywords
+        if use_keywords and entry.keywords:
+            kw_only = [kw for kw in signals.prompt_keywords
+                       if not _keyword_hits_tags(kw, entry)]
+            if any(_keyword_hits_keywords(kw, entry) for kw in kw_only):
+                total += weights["prompt_keyword_hit"]
     return total
