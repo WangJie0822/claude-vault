@@ -49,9 +49,17 @@ summary: "一行摘要"
 | 字段 | 何时添加 |
 |------|---------|
 | `updated` | 修改已有笔记时，设为当前日期 |
+| `keywords` | 几乎总是添加：3-8 个检索扩展词（同义词/别名/跨中英文术语），供 vault-loader 召回。与 tags 区分：tags 给人导航，keywords 给机器召回 |
 | `related` | 有明确关联笔记时（纯文本名称列表） |
 | `source` | 文档归集时记录原始路径 |
 | `status` | 非 active 状态时（默认 active 无需显式写入） |
+
+### keywords 生成规则（vault-loader 召回用）
+
+写/更新笔记时为 `keywords` 产出 3-8 个**检索扩展词**：
+- 收录：核心概念的同义词/近义词、英文↔中文对译、常见别名与缩写、用户可能换的说法。
+- 质量约束（与 `enrich_keywords.py::sanitize_keywords` 同口径）：CJK 词 ≥2 字、ASCII 词 ≥3 字；禁单字与超宽通用词（"性能/优化/设计"——子串匹配会刷命中无关提问）；禁含换行与 YAML 元字符；每篇 ≤8 条。
+- 内联数组写法：`keywords: [扩展词召回, 相关性打分, recall]`。
 
 ### frontmatter 强约束（rebuild_index.py 强制）
 

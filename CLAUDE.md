@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **vault-loader**（读端，只读）——通过 hook 把相关笔记自动注入会话上下文。
 - **vault**（手动检索）——会话中按关键词 / 分类 / 标签调取笔记。
 
-**核心数据契约**：`<vault>/.meta/frontmatter-cache.json` 是写端（summarize-session 的 `rebuild_index.py`）与读端（vault-loader 的 `load_cache`）之间的唯一接口。读端 `load_cache` 校验 `_version`，不匹配返回空索引——改一端的 cache schema 必须同步另一端。
+**核心数据契约**：`<vault>/.meta/frontmatter-cache.json` 是写端（summarize-session 的 `rebuild_index.py`）与读端（vault-loader 的 `load_cache`）之间的唯一接口。读端 `load_cache` 校验 `_version`，不匹配返回空索引——改一端的 cache schema 必须同步另一端。笔记 frontmatter 的 `keywords`（检索扩展词）经此 cache 流到读端 scorer，是**可选增量字段**——新增它**不**触发 `_version` 变更（读端缺失默认空、双向兼容）。
 
 **Vault 路径解析**：所有 skill 都从 `~/.claude/skills/summarize-session/config.json::default_vault_path` 取 Vault 路径（由 `/summarize-session --set-default <路径>` 写入），默认 `~/.claude/knowledge-vault`。`be9eec7` 起 `vault_path` 与 `default_vault_path` 同值，启动有跨 skill 一致性自检（fail-open，仅 stderr 告警）。
 

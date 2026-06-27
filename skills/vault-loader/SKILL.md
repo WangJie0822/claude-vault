@@ -42,6 +42,8 @@ vault-loader 从 `~/.claude/skills/summarize-session/config.json` 读取 `defaul
 - `session_start.{max_notes, max_recent_worklogs, recent_worklog_days, max_commits, include_tag_matched_notes}`（`min_score` 已废弃：startup 不再打分，保留仅为旧配置兼容）
 - `user_prompt_submit.{max_notes, min_score, fulltext_threshold, fulltext_max_bytes, min_keyword_count, state_ttl_hours}`
 - `scoring.*`：评分权重表
+- `scoring.prompt_keyword_hit`：笔记 frontmatter `keywords` 命中的独立权重（默认 3，< `prompt_tag_hit`）
+- `relevance.use_keywords`：true（默认）时 keyword 参与打分；false 为止血开关，scorer 完全忽略 keywords（不杀整个 loader）
 - `keyword_to_tags`：cwd 关键词 → tag 映射
 - `opt_out_paths`：路径前缀黑名单
 - `verbose_on_skip`：跳过时输出短提示

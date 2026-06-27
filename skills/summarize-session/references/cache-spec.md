@@ -15,7 +15,8 @@
       "status": "active",
       "summary": "一行摘要",
       "updated": "2026-03-24",
-      "created": "2026-03-19"
+      "created": "2026-03-19",
+      "keywords": ["扩展词召回", "recall"]
     }
   }
 }
@@ -24,6 +25,7 @@
 - key 为相对于 `$VAULT` 的路径
 - `mtime` 为整数秒 Unix 时间戳（通过 Python `os.path.getmtime()` 获取，无跨平台问题）
 - 其余字段为 frontmatter **原始值**（不做降级推断）
+- `keywords`（可选）为 frontmatter 的检索扩展词数组，纯增量字段，**不触发 `_version` 变更**；旧 cache 无此字段时读端默认空、平滑降级
 - 缺失的字段不写入（如文件无 `summary`，则 entry 中无 `summary` key）
 
 ## 失效与重建
