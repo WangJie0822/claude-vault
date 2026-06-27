@@ -19,6 +19,7 @@ def build_large_vault(target: Path, n_notes: int = 500, seed: int = 42) -> None:
 
     (target / ".meta").mkdir(parents=True, exist_ok=True)
 
+    kw_pool = ["召回", "扩展词", "相关性打分", "recall", "回归测试", "缓存契约"]
     entries = {}
     for i in range(n_notes):
         cat = rng.choice(categories)
@@ -30,6 +31,7 @@ def build_large_vault(target: Path, n_notes: int = 500, seed: int = 42) -> None:
             "summary": f"笔记 {i} — {' '.join(tags[:2])} 相关内容",
             "mtime": 1700000000 + rng.randint(0, 100_000_000),
             "updated": "2026-04-01",
+            "keywords": rng.sample(kw_pool, k=rng.randint(0, 3)),
         }
 
     cache = target / ".meta" / "frontmatter-cache.json"
