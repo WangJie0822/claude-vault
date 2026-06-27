@@ -14,14 +14,23 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
-_YAML_META = set(":[]{}#&*!|>'\"%@`\\")
+_YAML_META = set(":[]{}#&*!|>'\"%@`\\,")
 _MAX_KEYWORDS = 8
 _TIMEOUT = 60
 _CJK = re.compile(r"[一-鿿]")
+
+
+def _is_unsafe_char(c: str) -> bool:
+    """YAML 元字符 / 控制字符（C*，含 \\n \\r \\t \\x00）/ 行段分隔符（U+2028 Zl、U+2029 Zp）一律拒。
+    普通空格（Zs）不拒——它不破坏 YAML flow 标量。"""
+    cat = unicodedata.category(c)
+    return c in _YAML_META or cat[0] == "C" or cat in ("Zl", "Zp")
 
 
 def sanitize_keywords(raw) -> list[str]:
@@ -33,7 +42,7 @@ def sanitize_keywords(raw) -> list[str]:
         if not isinstance(item, str):
             continue
         k = item.strip()
-        if not k or "\n" in k or any(c in _YAML_META for c in k):
+        if not k or any(_is_unsafe_char(c) for c in k):
             continue
         has_cjk = bool(_CJK.search(k))
         min_len = 2 if has_cjk else 3
@@ -52,11 +61,14 @@ def _call_claude(content: str) -> str | None:
         "为下面这篇笔记生成 3-8 个中文/英文检索扩展词（同义词、别名、跨语言术语），"
         "只输出 JSON：{\"keywords\": [...]}。笔记：\n"
     )
+    claude = shutil.which("claude")
+    if claude is None:
+        return None
     env = dict(os.environ)
     env["VAULT_LOADER_DISABLE"] = "1"
     try:
         r = subprocess.run(
-            ["claude", "-p", "--model", "haiku"],
+            [claude, "-p", "--model", "haiku"],
             input=prompt + content,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=_TIMEOUT, env=env, shell=False,
@@ -81,10 +93,26 @@ def _build_frontmatter_with_keywords(text: str, keywords: list[str]) -> str | No
     return head + new_body + tail + rest
 
 
+def _extract_json(text) -> str | None:
+    """从 claude 输出剥 ```json 围栏 / 提取首个 {...}，容忍前后缀文字。"""
+    if not isinstance(text, str):
+        return None
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        return m.group(1)
+    i, j = text.find("{"), text.rfind("}")
+    if i != -1 and j != -1 and j > i:
+        return text[i:j + 1]
+    return None
+
+
 def enrich_note(note_path: Path, model_output: str) -> bool:
     """解析模型输出、sanitize、写回。非法/无变更返回 False（原文不动）。"""
+    raw_json = _extract_json(model_output)
+    if raw_json is None:
+        return False
     try:
-        data = json.loads(model_output)
+        data = json.loads(raw_json)
     except (json.JSONDecodeError, TypeError):
         return False
     keywords = sanitize_keywords(data.get("keywords") if isinstance(data, dict) else None)
@@ -99,8 +127,13 @@ def enrich_note(note_path: Path, model_output: str) -> bool:
         return False
     try:
         from _fs import atomic_write_text
+    except ImportError:
+        print(f"[enrich] _fs 不可用，无法写回: {note_path}", file=sys.stderr)
+        return False
+    try:
         atomic_write_text(str(note_path), new_text)
-    except Exception:
+    except OSError as exc:
+        print(f"[enrich] 写回失败 {note_path}: {exc}", file=sys.stderr)
         return False
     return True
 
@@ -117,7 +150,8 @@ def main(argv=None) -> int:
         print(f"vault 不存在: {vault}", file=sys.stderr)
         return 1
 
-    done = 0
+    processed = 0   # 受 --limit 约束：dry-run=候选篇、real=已发起 claude 调用篇
+    enriched = 0
     for note in vault.rglob("*.md"):
         if any(p in {".meta", ".obsidian", ".git", ".trash"} for p in note.relative_to(vault).parts):
             continue
@@ -130,22 +164,26 @@ def main(argv=None) -> int:
             continue
         if re.search(r"^keywords:", text, re.MULTILINE):
             continue
-        if args.limit and done >= args.limit:
+        if args.limit and processed >= args.limit:
             break
         if args.dry_run:
             print(f"[dry-run] 待 enrich: {note.relative_to(vault)}")
-            done += 1
+            processed += 1
             continue
+        processed += 1
         out = _call_claude(text)
         if out is None:
             print(f"跳过（claude 失败/缺失）: {note.relative_to(vault)}", file=sys.stderr)
             continue
         if enrich_note(rp, out):
-            done += 1
+            enriched += 1
             print(f"已 enrich: {note.relative_to(vault)}")
         else:
             print(f"跳过（校验不过）: {note.relative_to(vault)}", file=sys.stderr)
-    print(json.dumps({"enriched": done}, ensure_ascii=False))
+    if enriched and not args.dry_run:
+        print("提示：已改写 frontmatter，请运行 rebuild_index.py 刷新 frontmatter-cache.json 使召回生效",
+              file=sys.stderr)
+    print(json.dumps({"processed": processed, "enriched": enriched}, ensure_ascii=False))
     return 0
 
 

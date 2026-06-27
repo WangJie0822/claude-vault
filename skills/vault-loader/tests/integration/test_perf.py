@@ -67,7 +67,7 @@ def test_prompt_submit_under_300ms(tmp_home: Path, large_vault: Path) -> None:
     for _ in range(3):
         elapsed, _ = _run_script(
             "prompt_submit_load.py", Path("/tmp"),
-            prompt="please explain the hook spec implementation",
+            prompt="召回 扩展词 相关性打分 回归测试 语义检索 关键词匹配 怎么优化实现",
         )
         samples.append(elapsed)
 

@@ -519,6 +519,30 @@ def test_prompt_source_empty_string_processed(tmp_home: Path, tmp_vault: Path,
     assert "hook.md" in d["hookSpecificOutput"]["additionalContext"]
 
 
+# ---------------------------------------------------------------------------
+# T-H1：keyword-only 命中端到端行为测试
+# ---------------------------------------------------------------------------
+
+def test_keyword_only_note_injected_as_candidate_not_fulltext(
+        tmp_home, tmp_vault, write_frontmatter_cache):
+    # T-H1：keyword-only 命中（topical=3 < min_topical=4）应经 hook 真注入候选清单、不触发全文
+    cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(tmp_vault)}),
+                   encoding="utf-8")
+    write_frontmatter_cache({
+        "技术笔记/kw.md": {"tags": ["misc"], "summary": "一段与查询无关的摘要内容",
+                          "keywords": ["扩展词召回", "相关性打分"], "mtime": 1900000000},
+    })
+    r = _run(tmp_vault, "扩展词召回 相关性打分 怎么实现")
+    data = _parse(r)
+    assert data is not None, r.stderr
+    ctx = data["hookSpecificOutput"]["additionalContext"]
+    assert "vault-loader 候选" in ctx            # 清单模式（非全文）
+    assert "技术笔记/kw.md" in ctx                # keyword-only 笔记进了候选
+    assert "自动加载全文" not in ctx              # 未触发自动全文
+
+
 def test_skip_non_user_disabled_processes_notification(tmp_home: Path, tmp_vault: Path,
                                                        write_frontmatter_cache) -> None:
     """skip_non_user_prompts=false → 即便 task-notification 也处理（可关闭的逃生阀）。"""
