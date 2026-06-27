@@ -1,7 +1,7 @@
 {
   "name": "claude-vault",
   "description": "Auto-inject relevant Obsidian vault notes into Claude Code sessions, and distill sessions back into the vault. Cross-platform knowledge-base loop (capture + recall).",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": { "name": "claude-vault contributors" },
   "license": "MIT"
 }
