@@ -17,7 +17,8 @@ from scripts._frontmatter_reader import load_cache
 from scripts._output import emit, approx_size_str
 from scripts._vault_init import ensure_vault
 from scripts._scorer import (
-    Signals, score, topical_score, _keyword_hits_tags, _keyword_hits_summary,
+    Signals, score, topical_score,
+    _keyword_hits_tags, _keyword_hits_summary, _keyword_hits_keywords,
 )
 from scripts._signal_collect import (
     collect_signal_b_keyword_map,
@@ -79,11 +80,13 @@ def build_fulltext_injection(title: str, content: str) -> str:
 
 
 def _hit_keywords(entry, prompt_keywords) -> list[str]:
-    """命中该 entry 的 tag/summary 的 prompt 关键词，保序去重。
+    """命中该 entry 的 tag/summary/keywords 的 prompt 关键词，保序去重。
     与精度闸门 topical 口径一致（不含 path）——path 命中不计入话题相关性，
     避免向主模型展示仅靠文件名命中的词、高估相关性。"""
     return [kw for kw in sorted(prompt_keywords)
-            if _keyword_hits_tags(kw, entry) or _keyword_hits_summary(kw, entry)]
+            if _keyword_hits_tags(kw, entry)
+            or _keyword_hits_summary(kw, entry)
+            or _keyword_hits_keywords(kw, entry)]
 
 
 def _candidate_title(entry, short_chars: int) -> str:
@@ -263,12 +266,13 @@ def main() -> int:
     candidate_injected = all_injected - fulltext_injected  # 曾以弱候选注入、未升级全文
 
     weights = config["scoring"]
+    use_kw = rel_cfg.get("use_keywords", True)
     min_topical = rel_cfg["min_topical_score"]
     ft_topical = rel_cfg["fulltext_topical_threshold"]
     scored = []
     any_relevant = False   # 有任一篇 topical 达标（含被去重的）→ 区分"全失配"vs"已注入过"
     for path, entry in entries.items():
-        t = topical_score(entry, signals, weights)
+        t = topical_score(entry, signals, weights, use_keywords=use_kw)
         if path in fulltext_injected:
             if t >= min_topical:
                 any_relevant = True   # 仍相关但已拿全文 → 不重注、抑制兜底
@@ -277,14 +281,16 @@ def main() -> int:
             # 曾弱候选注入：仅升到全文阈值才作升级候选再注入（治 reverse High#1：
             # 升级候选不在渲染层排除，进 scored 参与主候选；非主候选时仍可见于清单、保留升级机会）
             if t >= ft_topical:
-                scored.append((score(entry, signals, weights), t, entry))
+                scored.append((score(entry, signals, weights, use_keywords=use_kw), t, entry))
             elif t >= min_topical:
                 any_relevant = True   # 仍相关但已展示过弱候选 → 不重复展示、抑制兜底
             continue
-        # 新篇：精度闸门——只认真话题信号，不让 context 底噪单独过闸
-        if t < min_topical:
+        # 新篇：精度闸门——topical 达标，或 keyword-only 命中也放进候选（解 A，低排名）
+        has_kw_hit = use_kw and bool(entry.keywords) and any(
+            _keyword_hits_keywords(kw, entry) for kw in prompt_keywords)
+        if t < min_topical and not has_kw_hit:
             continue
-        scored.append((score(entry, signals, weights), t, entry))
+        scored.append((score(entry, signals, weights, use_keywords=use_kw), t, entry))
 
     scored.sort(key=lambda x: (-x[0], -x[2].mtime))
     if not scored:
