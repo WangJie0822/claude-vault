@@ -25,3 +25,9 @@ def test_precision_noise_note_not_surfaced_by_unrelated_keyword():
                   keywords=("swift", "xcode"))
     sigs = Signals(prompt_keywords={"召回", "扩展词"})
     assert topical_score(noise, sigs, _w()) == 0
+
+
+def test_single_char_keyword_filtered_at_read(write_frontmatter_cache, tmp_vault):
+    from scripts._frontmatter_reader import load_cache
+    write_frontmatter_cache({"b.md": {"keywords": ["回", "回归测试"]}})
+    assert load_cache(tmp_vault)["b.md"].keywords == ("回归测试",)

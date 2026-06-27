@@ -59,7 +59,10 @@ def load_cache(vault_path: Path) -> dict[str, Entry]:
             kw_raw = meta.get("keywords")
             if not isinstance(kw_raw, list):
                 kw_raw = []
-            keywords = tuple(k for k in kw_raw if isinstance(k, str))
+            keywords = tuple(
+                k for k in kw_raw
+                if isinstance(k, str) and len(k.strip()) >= 2
+            )
             result[path] = Entry(
                 path=path,
                 tags=tags,
