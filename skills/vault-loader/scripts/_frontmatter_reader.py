@@ -19,6 +19,7 @@ class Entry:
     summary: str = ""
     mtime: int = 0
     updated: str = ""
+    keywords: tuple[str, ...] = field(default_factory=tuple)
 
 
 def load_cache(vault_path: Path) -> dict[str, Entry]:
@@ -55,6 +56,10 @@ def load_cache(vault_path: Path) -> dict[str, Entry]:
                 continue
             tags_raw = meta.get("tags") or []
             tags = tuple(t for t in tags_raw if isinstance(t, str))
+            kw_raw = meta.get("keywords")
+            if not isinstance(kw_raw, list):
+                kw_raw = []
+            keywords = tuple(k for k in kw_raw if isinstance(k, str))
             result[path] = Entry(
                 path=path,
                 tags=tags,
@@ -62,6 +67,7 @@ def load_cache(vault_path: Path) -> dict[str, Entry]:
                 summary=str(meta.get("summary", "")),
                 mtime=int(meta.get("mtime", 0) or 0),
                 updated=str(meta.get("updated", "")),
+                keywords=keywords,
             )
         return result
 

@@ -83,3 +83,31 @@ def test_correct_version_loads(tmp_path):
     (meta / "frontmatter-cache.json").write_text(
         '{"_version": %d, "entries": {"a.md": {"tags": ["x"]}}}' % CACHE_VERSION, encoding="utf-8")
     assert "a.md" in load_cache(tmp_path)
+
+
+def test_load_cache_reads_keywords(write_frontmatter_cache, tmp_vault):
+    from scripts._frontmatter_reader import load_cache
+    write_frontmatter_cache({
+        "a.md": {"tags": ["t1"], "summary": "s", "keywords": ["同义词", "alias"]},
+    })
+    entries = load_cache(tmp_vault)
+    assert entries["a.md"].keywords == ("同义词", "alias")
+
+
+def test_load_cache_keywords_absent_defaults_empty(write_frontmatter_cache, tmp_vault):
+    from scripts._frontmatter_reader import load_cache
+    write_frontmatter_cache({"a.md": {"tags": ["t1"], "summary": "s"}})
+    assert load_cache(tmp_vault)["a.md"].keywords == ()
+
+
+def test_load_cache_keywords_scalar_not_char_iterated(write_frontmatter_cache, tmp_vault):
+    # keywords 写成标量字符串（非数组）不得被逐字符迭代成 ('f','o','o')
+    from scripts._frontmatter_reader import load_cache
+    write_frontmatter_cache({"a.md": {"keywords": "foo"}})
+    assert load_cache(tmp_vault)["a.md"].keywords == ()
+
+
+def test_load_cache_keywords_drops_non_str(write_frontmatter_cache, tmp_vault):
+    from scripts._frontmatter_reader import load_cache
+    write_frontmatter_cache({"a.md": {"keywords": ["ok", 123, None, "good"]}})
+    assert load_cache(tmp_vault)["a.md"].keywords == ("ok", "good")
