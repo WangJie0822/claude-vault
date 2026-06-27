@@ -369,7 +369,7 @@ def _read_entry(vault: Path, rel: str, mtime: int):
         head = f.read(2000)
     fm = parse_frontmatter(head)
     entry = {'mtime': mtime}
-    for field in ('tags', 'category', 'subcategory', 'status', 'summary', 'updated', 'created', 'project'):
+    for field in ('tags', 'category', 'subcategory', 'status', 'summary', 'updated', 'created', 'project', 'keywords'):
         if field in fm:
             entry[field] = fm[field]
     entry['_has_frontmatter'] = bool(fm)

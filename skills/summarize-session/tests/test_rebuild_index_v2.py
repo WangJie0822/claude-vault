@@ -407,3 +407,26 @@ def test_rebuild_index_rejects_traversal_category(tmp_path):
     assert '非法路径字符' in r.stderr
     # vault 外(tmp_path/../../evil)不应被创建
     assert not (tmp_path.parent.parent / 'evil').exists()
+
+
+def test_read_entry_picks_up_keywords(tmp_path):
+    from rebuild_index import _read_entry
+    vault = tmp_path / "v"
+    vault.mkdir()
+    note = vault / "a.md"
+    note.write_text(
+        "---\ntags: [t1]\nkeywords: [同义词, alias]\nsummary: s\n---\n# 标题\n",
+        encoding="utf-8",
+    )
+    entry = _read_entry(vault, "a.md", 123)
+    assert entry["keywords"] == ["同义词", "alias"]
+
+
+def test_read_entry_no_keywords_field_absent(tmp_path):
+    from rebuild_index import _read_entry
+    vault = tmp_path / "v"
+    vault.mkdir()
+    note = vault / "b.md"
+    note.write_text("---\ntags: [t1]\nsummary: s\n---\n# 标题\n", encoding="utf-8")
+    entry = _read_entry(vault, "b.md", 123)
+    assert "keywords" not in entry
