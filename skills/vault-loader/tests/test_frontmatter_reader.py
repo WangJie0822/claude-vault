@@ -111,3 +111,10 @@ def test_load_cache_keywords_drops_non_str(write_frontmatter_cache, tmp_vault):
     from scripts._frontmatter_reader import load_cache
     write_frontmatter_cache({"a.md": {"keywords": ["ok", 123, None, "good"]}})
     assert load_cache(tmp_vault)["a.md"].keywords == ("ok", "good")
+
+
+def test_load_cache_caps_keyword_count(write_frontmatter_cache, tmp_vault):
+    # B2：读端每篇 keyword 条数上限（纵深防异常膨胀 cache）
+    from scripts._frontmatter_reader import load_cache, MAX_KEYWORDS_PER_ENTRY
+    write_frontmatter_cache({"a.md": {"keywords": [f"词条{i}" for i in range(50)]}})
+    assert len(load_cache(tmp_vault)["a.md"].keywords) == MAX_KEYWORDS_PER_ENTRY

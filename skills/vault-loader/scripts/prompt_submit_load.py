@@ -237,6 +237,11 @@ def main() -> int:
         rel_cfg.get("split_english_token", True),
         rel_cfg.get("en_subtoken_min", 4),
     )
+    # PERF-P2：M 软上限——巨型 prompt 关键词数过大令 O(N×M×K) 评分破 <300ms 预算；超限取确定性
+    # 子集（sorted 前 N）。有 use_keywords 止血阀 + fail-open 兜底，截断只影响极端大粘贴的召回完整性。
+    max_kw = rel_cfg.get("max_prompt_keywords", 30)
+    if max_kw and len(prompt_keywords) > max_kw:
+        prompt_keywords = set(sorted(prompt_keywords)[:max_kw])
     # 触发点1：关键词数不足 → 静默早退（不出兜底——中文短追问几乎都卡这、出会刷屏）
     if len(prompt_keywords) < ups_cfg["min_keyword_count"]:
         return 0

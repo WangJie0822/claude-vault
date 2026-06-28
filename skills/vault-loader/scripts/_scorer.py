@@ -79,6 +79,35 @@ def _keyword_hits_keywords(keyword: str, entry: Entry) -> bool:
     return any(_kw_in_text(keyword, k) for k in entry.keywords)
 
 
+def has_keyword_hit(entry: Entry, prompt_keywords, use_keywords: bool = True) -> bool:
+    """是否有「未命中任何 tag」的查询词命中 entry.keywords。
+    打分（_prompt_topical_hits）与候选闸门（prompt_submit_load）共用此单点判定，
+    避免逻辑漂移。去重语义：既命中 tag 又命中 keyword 的词只算 tag、不计 keyword。"""
+    if not (use_keywords and entry.keywords and prompt_keywords):
+        return False
+    return any(
+        _keyword_hits_keywords(kw, entry)
+        for kw in prompt_keywords
+        if not _keyword_hits_tags(kw, entry)
+    )
+
+
+def _prompt_topical_hits(entry: Entry, signals: Signals, weights: dict,
+                         use_keywords: bool = True) -> float:
+    """prompt 关键词对 tag/summary/keywords 的话题命中分（去重 + 门控）。
+    score() 的 J 段与 topical_score() 共用此单点，消除重复、防漂移。"""
+    if not signals.prompt_keywords:
+        return 0.0
+    total: float = 0
+    if any(_keyword_hits_tags(kw, entry) for kw in signals.prompt_keywords):
+        total += weights["prompt_tag_hit"]
+    if any(_keyword_hits_summary(kw, entry) for kw in signals.prompt_keywords):
+        total += weights["prompt_summary_hit"]
+    if has_keyword_hit(entry, signals.prompt_keywords, use_keywords):
+        total += weights["prompt_keyword_hit"]
+    return total
+
+
 def score(entry: Entry, signals: Signals, weights: dict,
           use_keywords: bool = True) -> float:
     """计算单篇笔记的相关性分数。"""
@@ -111,17 +140,8 @@ def score(entry: Entry, signals: Signals, weights: dict,
         elif age_days <= 90:
             total += weights["mtime_recent_90d"]
 
-    # J：UserPromptSubmit 模式追加
-    if signals.prompt_keywords:
-        if any(_keyword_hits_tags(kw, entry) for kw in signals.prompt_keywords):
-            total += weights["prompt_tag_hit"]
-        if any(_keyword_hits_summary(kw, entry) for kw in signals.prompt_keywords):
-            total += weights["prompt_summary_hit"]
-        if use_keywords and entry.keywords:
-            kw_only = [kw for kw in signals.prompt_keywords
-                       if not _keyword_hits_tags(kw, entry)]
-            if any(_keyword_hits_keywords(kw, entry) for kw in kw_only):
-                total += weights["prompt_keyword_hit"]
+    # J：UserPromptSubmit 模式追加（与 topical_score 共用 _prompt_topical_hits 单点）
+    total += _prompt_topical_hits(entry, signals, weights, use_keywords)
 
     return total
 
@@ -135,17 +155,4 @@ def topical_score(entry: Entry, signals: Signals, weights: dict,
     relevance 段阈值（min_topical_score / fulltext_topical_threshold / confidence_bands.high）默认值
     假定该权重，改 scoring 权重需同步调阈值。
     keywords 命中加 prompt_keyword_hit（去重 + 门控）。"""
-    total: float = 0
-    if signals.prompt_keywords:
-        tag_hit = any(_keyword_hits_tags(kw, entry) for kw in signals.prompt_keywords)
-        if tag_hit:
-            total += weights["prompt_tag_hit"]
-        if any(_keyword_hits_summary(kw, entry) for kw in signals.prompt_keywords):
-            total += weights["prompt_summary_hit"]
-        # keyword 命中：仅对未命中任何 tag 的查询词计（去重），门控 use_keywords + entry.keywords
-        if use_keywords and entry.keywords:
-            kw_only = [kw for kw in signals.prompt_keywords
-                       if not _keyword_hits_tags(kw, entry)]
-            if any(_keyword_hits_keywords(kw, entry) for kw in kw_only):
-                total += weights["prompt_keyword_hit"]
-    return total
+    return _prompt_topical_hits(entry, signals, weights, use_keywords)

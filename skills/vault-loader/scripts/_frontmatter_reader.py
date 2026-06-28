@@ -8,6 +8,9 @@ from pathlib import Path
 
 MAX_CACHE_BYTES = 10 * 1024 * 1024  # 10 MB 上限，超出视为异常膨胀
 CACHE_VERSION = 1  # 与写端（rebuild_index）保持对称；版本不符时静默丢弃旧 cache
+# 读端每篇 keyword 条数上限（纵深防御）：写端 sanitize 上限 8，此处留余量；防异常/恶意 cache
+# 单篇塞数千 keyword 令 O(N×M×K) 评分爆炸。
+MAX_KEYWORDS_PER_ENTRY = 16
 
 
 @dataclass(frozen=True)
@@ -62,7 +65,7 @@ def load_cache(vault_path: Path) -> dict[str, Entry]:
             keywords = tuple(
                 k for k in kw_raw
                 if isinstance(k, str) and len(k.strip()) >= 2
-            )
+            )[:MAX_KEYWORDS_PER_ENTRY]
             result[path] = Entry(
                 path=path,
                 tags=tags,

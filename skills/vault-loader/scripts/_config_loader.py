@@ -80,6 +80,9 @@ DEFAULT_CONFIG: dict = {
         "fallback_hint": True,              # topical 全失配（仅触发点2）时一行用户可见提示
         # 拦截非用户手输 prompt（后台 task-notification/系统注入）——含 UUID/tool-id/路径碎片污染
         "skip_non_user_prompts": True,
+        # PERF-P2：prompt 关键词数（M）软上限。巨型 prompt（大段粘贴）会令 O(N×M×K) 评分破
+        # <300ms 预算；超上限时取确定性子集（sorted 前 N）。0/None 表示不限。
+        "max_prompt_keywords": 30,
     },
 }
 

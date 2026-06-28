@@ -601,3 +601,18 @@ def test_b_summary_single_keyword_mid_band() -> None:
         {"verbosity": "list", "show_size": True}, rel_cfg,
     )
     assert "- single  [中置信]" in out
+
+
+def test_huge_prompt_capped_no_crash(tmp_home, tmp_vault, write_frontmatter_cache):
+    # PERF-P2：M 软上限——60 关键词的大 prompt 经 hook 不崩、正常返回（截断到 max_prompt_keywords）
+    cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(tmp_vault)}),
+                   encoding="utf-8")
+    write_frontmatter_cache({
+        "技术笔记/a.md": {"tags": ["misc"], "summary": "s", "keywords": ["召回"],
+                         "mtime": 1900000000},
+    })
+    prompt = " ".join(f"词条{i}" for i in range(60))
+    r = _run(tmp_vault, prompt)
+    assert r.returncode == 0   # 不崩（M 截断生效，O(N×M×K) 不爆）

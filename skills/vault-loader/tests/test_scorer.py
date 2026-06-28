@@ -275,3 +275,23 @@ def test_empty_keywords_unchanged():
     e = Entry(path="x.md", tags=("android",))
     sigs = Signals(prompt_keywords={"android"})
     assert topical_score(e, sigs, _default_weights()) == 4
+
+
+def test_score_keyword_only_path():
+    # B1：score() 的 keyword 路径直测（与 topical_score 共用 _prompt_topical_hits，此前无直测）
+    from scripts._scorer import score
+    e = Entry(path="x.md", keywords=("扩展词召回",))
+    sigs = Signals(prompt_keywords={"扩展词召回"})
+    assert score(e, sigs, _default_weights()) == 3
+
+
+def test_has_keyword_hit_dedups_and_gates():
+    from scripts._scorer import has_keyword_hit
+    e = Entry(path="x.md", tags=("vault-loader",), keywords=("vault-loader", "召回"))
+    # "vault-loader" 既命中 tag 又命中 keyword → 去重后不算；"召回" 仅命中 keyword → 算
+    assert has_keyword_hit(e, {"vault-loader"}) is False
+    assert has_keyword_hit(e, {"召回"}) is True
+    # 门控：use_keywords=False / 空 keywords / 空 prompt → False
+    assert has_keyword_hit(e, {"召回"}, use_keywords=False) is False
+    assert has_keyword_hit(Entry(path="y.md"), {"召回"}) is False
+    assert has_keyword_hit(e, set()) is False

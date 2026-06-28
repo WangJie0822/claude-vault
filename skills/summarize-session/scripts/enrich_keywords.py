@@ -81,15 +81,17 @@ def _call_claude(content: str) -> str | None:
 
 
 def _build_frontmatter_with_keywords(text: str, keywords: list[str]) -> str | None:
-    """把 keywords 安全序列化进现有 frontmatter（已有则替换）。无 frontmatter 返回 None。"""
-    m = re.match(r"^(---\n)(.*?)(\n---\n?)", text, re.DOTALL)
+    """把 keywords 安全序列化进现有 frontmatter（已有则替换）。无 frontmatter 返回 None。
+    容忍 CRLF（\\r\\n）与 LF 两种行尾，避免 CRLF 笔记被静默跳过。"""
+    m = re.match(r"^(---\r?\n)(.*?)(\r?\n---\r?\n?)", text, re.DOTALL)
     if not m:
         return None
     head, body, tail = m.group(1), m.group(2), m.group(3)
     rest = text[m.end():]
+    nl = "\r\n" if head.endswith("\r\n") else "\n"
     kw_line = "keywords: [" + ", ".join(keywords) + "]"
-    body_no_kw = re.sub(r"^keywords:.*$", "", body, flags=re.MULTILINE).rstrip("\n")
-    new_body = body_no_kw + "\n" + kw_line
+    body_no_kw = re.sub(r"^keywords:.*$", "", body, flags=re.MULTILINE).rstrip("\r\n")
+    new_body = body_no_kw + nl + kw_line
     return head + new_body + tail + rest
 
 
@@ -97,7 +99,8 @@ def _extract_json(text) -> str | None:
     """从 claude 输出剥 ```json 围栏 / 提取首个 {...}，容忍前后缀文字。"""
     if not isinstance(text, str):
         return None
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    # 贪婪 \{.*\}：捕获围栏内首 { 到末 }，容忍嵌套对象（非贪婪 .*? 会截到首个 } 致嵌套失败）
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
     if m:
         return m.group(1)
     i, j = text.find("{"), text.rfind("}")

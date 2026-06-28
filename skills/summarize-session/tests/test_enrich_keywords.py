@@ -92,3 +92,19 @@ def test_main_limit_counts_attempted_calls(tmp_path, monkeypatch):
     rc = E.main(["--vault", str(vault), "--limit", "2"])
     assert rc == 0
     assert calls["n"] == 2   # 即便全失败，也不超过 limit 次付费调用
+
+
+def test_extract_json_handles_nested():
+    # B3：围栏内嵌套对象（贪婪 \{.*\}）应完整提取，非贪婪会截到首个 } 致失败
+    import json as _j
+    out = E._extract_json('前缀\n```json\n{"keywords": ["a"], "meta": {"n": 1}}\n```')
+    assert _j.loads(out) == {"keywords": ["a"], "meta": {"n": 1}}
+
+
+def test_enrich_note_crlf_frontmatter(tmp_path):
+    # B4：CRLF 行尾笔记不再被静默跳过
+    note = tmp_path / "a.md"
+    note.write_text("---\r\ntags: [t]\r\nsummary: s\r\n---\r\n# x\r\n正文\r\n", encoding="utf-8")
+    assert E.enrich_note(note, '{"keywords": ["召回", "recall"]}') is True
+    txt = note.read_text(encoding="utf-8")
+    assert "keywords:" in txt and "召回" in txt and "正文" in txt
