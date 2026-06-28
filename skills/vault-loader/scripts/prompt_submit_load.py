@@ -17,7 +17,7 @@ from scripts._frontmatter_reader import load_cache
 from scripts._output import emit, approx_size_str
 from scripts._vault_init import ensure_vault
 from scripts._scorer import (
-    Signals, score, topical_score,
+    Signals, score, topical_score, has_keyword_hit,
     _keyword_hits_tags, _keyword_hits_summary, _keyword_hits_keywords,
 )
 from scripts._signal_collect import (
@@ -290,10 +290,9 @@ def main() -> int:
             elif t >= min_topical:
                 any_relevant = True   # 仍相关但已展示过弱候选 → 不重复展示、抑制兜底
             continue
-        # 新篇：精度闸门——topical 达标，或 keyword-only 命中也放进候选（解 A，低排名）
-        has_kw_hit = use_kw and bool(entry.keywords) and any(
-            _keyword_hits_keywords(kw, entry) for kw in prompt_keywords)
-        if t < min_topical and not has_kw_hit:
+        # 新篇：精度闸门——topical 达标，或 keyword-only 命中也放进候选（解 A，低排名）。
+        # 与打分共用 has_keyword_hit 单点（含 tag 去重），口径一致、防漂移。
+        if t < min_topical and not has_keyword_hit(entry, prompt_keywords, use_kw):
             continue
         scored.append((score(entry, signals, weights, use_keywords=use_kw), t, entry))
 

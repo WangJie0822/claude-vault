@@ -97,7 +97,7 @@ def _prompt_topical_hits(entry: Entry, signals: Signals, weights: dict,
     """prompt 关键词对 tag/summary/keywords 的话题命中分（去重 + 门控）。
     score() 的 J 段与 topical_score() 共用此单点，消除重复、防漂移。"""
     if not signals.prompt_keywords:
-        return 0.0
+        return 0
     total: float = 0
     if any(_keyword_hits_tags(kw, entry) for kw in signals.prompt_keywords):
         total += weights["prompt_tag_hit"]
