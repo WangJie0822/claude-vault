@@ -21,7 +21,7 @@
 
 > 仓库地址由你提供（你自己的 fork 或某个 marketplace 列表）。插件名为 `claude-vault`。
 
-安装后 hook **自动生效**——插件自带的 `hooks/hooks.json` 会被 Claude Code 自动加载注册（SessionStart / UserPromptSubmit / SessionEnd），**无需手动编辑 `~/.claude/settings.json`**。若要临时停用，见下方「停用逃生阀」。
+安装后 hook **自动生效**——插件自带的 `hooks/hooks.json` 会被 Claude Code 自动加载注册（SessionStart / UserPromptSubmit），**无需手动编辑 `~/.claude/settings.json`**。若要临时停用，见下方「停用逃生阀」。
 
 ---
 
@@ -86,69 +86,13 @@ hook 通过一个 polyglot 包装脚本运行，按以下顺序探测 Python 解
 
 ---
 
-## auto-mode（需显式开启，默认关闭）
-
-auto-mode 会安排一个定时任务，在你休息时自动对已完成的会话运行 `summarize-session`。
-
-**默认状态：关闭。** 必须显式开启。
-
-### 风险 —— 开启前请阅读
-
-- **定时调用付费的 `claude` CLI。** 每次运行消耗记到你账户的 API token。
-- **读取会话 transcript 并发送给 LLM。** 你的对话内容（`~/.claude/projects/` 下的 JSONL 文件）会被发送到 Anthropic API。
-- **自动提交到你的知识库。** 笔记和工作日志会在无交互确认的情况下被写入并 `git commit`。
-
-### 开启 auto-mode
-
-```bash
-# 第 1 步：在 config 中设 enabled=true
-python3 -c "
-import json, pathlib
-p = pathlib.Path.home() / '.claude/skills/summarize-session/config.json'
-d = json.loads(p.read_text())
-d['auto']['enabled'] = True
-p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + '\n')
-"
-
-# 第 2 步：安装定时器（跨平台；会打印风险并要求确认）
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_scheduler.py"
-
-# 带参数（指定触发时间、跳过确认提示）：
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_scheduler.py" --when 02:30 --yes
-```
-
-`${CLAUDE_PLUGIN_ROOT}` 由 Claude Code 在插件安装时自动注入，指向插件的 cache 安装目录（**不是** `~/.claude/skills/`）。
-
-定时器按平台自适应：
-
-- **Windows** — 任务计划程序（`schtasks`）
-- **Linux** — systemd user timer（无 systemd 时回退 crontab）
-- **macOS** — launchd plist
-
-**建议：先以 `dry_run=true` 跑 7 天**再开启真实写入。日志见 `~/.claude/skills/summarize-session/auto-runs/run-*.log`。
-
-完整指南：`skills/summarize-session/references/auto-mode.md`
-
----
-
 ## 卸载
 
-> **重要：** 先运行卸载脚本，**再**移除插件。若先移除插件，定时任务会残留且脚本无法再清理它。
-
 ```bash
-# 第 1 步：移除定时任务并清理
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/uninstall.py"
-
-# 同时移除运行时状态（队列、日志、草稿）——不会删除你的笔记知识库：
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/uninstall.py" --remove-data
-
-# 第 2 步：移除插件
 /plugin uninstall claude-vault
 ```
 
-`${CLAUDE_PLUGIN_ROOT}` 是插件的 cache 安装目录（由 Claude Code 注入），脚本位于其中，而非直接在 `~/.claude/skills/` 下。
-
-`--remove-data` 只移除运行时 config 和状态文件。**你的笔记知识库（`~/.claude/knowledge-vault` 或任何自定义路径）不会被触碰。**
+插件本身无定时任务 / 后台进程，直接卸载即可。运行时状态（`config.json`、`*.jsonl`、`summarized-sessions.json` 等）保存在 `~/.claude/skills/summarize-session/`，如需彻底清理可手动删除该目录下的运行时文件。**你的笔记知识库（`~/.claude/knowledge-vault` 或任何自定义路径）不会被触碰。**
 
 ---
 
@@ -175,8 +119,6 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/uninstall.py" --remove-data
 ## 已知限制
 
 - **针对中文笔记工作流调优。** 目录名、frontmatter 字段和分类匹配都按中文优化。英文及其他语言用户的自动匹配准确度会下降（关键词提取、标签推断、分类路由可能漏掉很多笔记）。
-- auto-mode 的草稿合并是追加式的；语义去重留给用户在草稿评审时处理。
-- auto-mode 的 LLM 价值过滤偶尔可能误判会话；先以 `dry_run=true` 跑一段时间有助于校准。
 
 ---
 

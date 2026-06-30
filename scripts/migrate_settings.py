@@ -1,6 +1,10 @@
 """scripts/migrate_settings.py — remove old hook registrations from settings.json.
 
-Targets the 4 hook scripts that are now bundled inside the claude-vault plugin.
+Targets old (pre-plugin) manual hook registrations. Two of the names are the
+plugin's current hooks (session_start_load.py, prompt_submit_load.py); the other
+two (session_start_auto_notify.py, session_end_enqueue.py) belonged to the
+removed auto-mode and are still stripped here so any stale registration left in a
+user's settings.json gets cleaned up.
 Running without --apply is a safe dry-run: nothing is modified.
 
 Claude Code settings.json hooks format (two supported layouts):
@@ -33,7 +37,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# The 4 hook script filenames that are now owned by the plugin.
+# Hook script filenames from old (pre-plugin) manual registrations to strip.
+# session_start_load.py / prompt_submit_load.py are the plugin's current hooks;
+# session_start_auto_notify.py / session_end_enqueue.py are legacy auto-mode
+# hooks (auto-mode removed) — kept here only to clean up any stale registration.
 # An entry is matched if any of these names appears in:
 #   - the entry's top-level "command" string, OR
 #   - any element of the entry's "args" list.

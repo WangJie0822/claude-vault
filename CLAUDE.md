@@ -20,11 +20,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Hook 管线（`hooks/`）
 
-- `hooks/hooks.json` 声明 SessionStart / UserPromptSubmit / SessionEnd 三类 hook，全部经 `hooks/run-hook.cmd` 路由，脚本路径相对 `${CLAUDE_PLUGIN_ROOT}` 解析。
+- `hooks/hooks.json` 声明 SessionStart / UserPromptSubmit 两类 hook，全部经 `hooks/run-hook.cmd` 路由，脚本路径相对 `${CLAUDE_PLUGIN_ROOT}` 解析。
 - `${CLAUDE_PLUGIN_ROOT}` 由 Claude Code 注入，指向插件的 **cache 安装目录**，不是 `~/.claude/skills/`。
 - **`run-hook.cmd` 是 polyglot 脚本**：同一文件既是合法的 Windows batch 又是合法的 POSIX sh（顶部 `: << 'BATCH'` heredoc 让 sh 跳过 batch 段）。单文件而非 `.cmd`+`.sh` 两份，是因为 Claude Code 在 Windows 上对含 `.sh` 的命令会前置 bash，导致双文件 wrapper 失效。改这个文件务必保持两种解释器都能正确解析，并保持 LF 行尾（`.gitattributes` 对 `*.sh`/`*.cmd` 强制 `eol=lf`，CRLF 会破坏 shebang / heredoc）。
 - wrapper 按 `py` → `python3` → `python` 顺序探测解释器；找不到任何 Python 即静默 `exit 0`。
-- **所有 hook fail-open**：`hooks/_hook_common.py::fail_open` 吞掉异常后 `exit 0`；脚本顶层 `try/except` 也兜底 `exit 0`。任何 hook 都不得阻断会话。新增 hook 逻辑时保持这一不变量。
+- **所有 hook fail-open**：脚本顶层 `try/except` 兜底 `exit 0`。任何 hook 都不得阻断会话。新增 hook 逻辑时保持这一不变量。
 
 ### vault-loader 注入与打分模型
 
@@ -37,7 +37,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### summarize-session
 
-skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模式：正常 / `-f`（强制，跳确认）/ `--auto`（headless cron，走草稿区）/ `--catch-up` / `--quick` / `--review-drafts` / `--apply-drafts`。Vault 内资源优先经 `scripts/obsidian_cli.py` 封装，Obsidian CLI 不可用时降级文件 I/O。**auto-mode 默认关闭、需显式 opt-in**（定时调用付费 `claude` CLI + 发送 transcript 给 LLM + 无交互自动 commit，有成本/隐私风险）。
+skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模式：正常 / `-f`（强制，跳确认）/ `--catch-up` / `--quick`。Vault 内资源优先经 `scripts/obsidian_cli.py` 封装，Obsidian CLI 不可用时降级文件 I/O。
 
 ## 分发边界（重要）
 
@@ -47,7 +47,7 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 - `packaging/` —— 作者发布工具：`build_plugin.py`（脱敏闸门，见下）、`import_assets.py`（从 `~/.claude` 源 allowlist 同步资产到插件目录）。含作者特定脱敏规则，对安装者无用。
 - `docs/superpowers/` —— spec / plan 设计文档（含私人引用，不能随 clone 泄露）。
 - `.superpowers/` —— subagent-driven 开发的 task 简报。
-- 运行时产物：`config.json`、`*.jsonl`、`auto-runs/`、`auto-drafts/`、`summarized-sessions.json`、`*.log`。
+- 运行时产物：`config.json`、`*.jsonl`、`summarized-sessions.json`、`*.log`。
 
 **发布前脱敏闸门**：`python packaging/build_plugin.py` 扫描私人内容正则（作者标识、私有 IP、真实路径、session UUID 等），命中即 `exit 1`。`SKIP_DIRS` 排除 `packaging`/`docs`/`.superpowers` 避免自指误报。新增分发文件前过一遍这个扫描。
 
@@ -79,7 +79,7 @@ python -m pytest packaging/test_build_plugin.py
 
 ## 约束与约定
 
-- 任何改动必须保持 **macOS / Linux / Windows 三平台兼容**（polyglot wrapper、跨平台定时器 `scripts/install_scheduler.py` 适配 schtasks / systemd / launchd）。
+- 任何改动必须保持 **macOS / Linux / Windows 三平台兼容**（polyglot wrapper 适配三平台 shell）。
 - hook 必须 fail-open，永不阻断会话。
 - vault-loader 对 Vault 只读；summarize-session 是唯一写入方（且只追加/新建，不删除已有笔记）。
 - git 跟踪文件中不写 Obsidian `[[...]]` wikilink（vault 是个人知识库层、不随仓库分发）。

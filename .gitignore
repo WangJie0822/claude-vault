@@ -3,9 +3,6 @@ __pycache__/
 .pytest_cache/
 *.jsonl
 summarized-sessions.json
-auto-runs/
-auto-drafts/
-.auto-paused
 config.json
 *.log
 docs/superpowers/

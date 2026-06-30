@@ -7,9 +7,9 @@ ROOT = Path(__file__).resolve().parent.parent
 def test_hooks_json_valid_and_covers_events():
     data = json.loads((ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))
     h = data["hooks"]
-    assert len(h["SessionStart"]) == 2          # vault-loader + auto-notify
+    assert len(h["SessionStart"]) == 1          # vault-loader
     assert len(h["UserPromptSubmit"]) == 1
-    assert len(h["SessionEnd"]) == 1
+    assert "SessionEnd" not in h                 # auto-mode 已移除
     # All commands use CLAUDE_PLUGIN_ROOT, no private/absolute paths
     blob = json.dumps(data)
     assert "${CLAUDE_PLUGIN_ROOT}" in blob

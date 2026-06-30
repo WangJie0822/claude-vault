@@ -26,9 +26,3 @@ def test_user_prompt_submit_fresh_user_exit0(tmp_path):
     r = _run_hook("skills/vault-loader/scripts/prompt_submit_load.py",
                   {"prompt": "hello", "cwd": str(tmp_path)}, tmp_path)
     assert r.returncode == 0
-
-
-def test_session_end_no_spawn_default(tmp_path):
-    r = _run_hook("hooks/session_end_enqueue.py",
-                  {"session_id": "s1", "cwd": str(tmp_path)}, tmp_path)
-    assert r.returncode == 0  # auto 默认关，不 spawn 也 exit 0

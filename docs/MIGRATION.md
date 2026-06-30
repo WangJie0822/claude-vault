@@ -18,7 +18,8 @@
 
 **若启用插件却不删除 `settings.json` 旧注册，会双触发**：
 - SessionStart 知识库上下文注入两遍（双倍 token）
-- SessionEnd 对同一会话**入队两次** → 重复自动总结、重复写 vault、重复 git commit
+- UserPromptSubmit 同理重复注入
+- 旧的 auto-mode 注册（`session_start_auto_notify.py` / `session_end_enqueue.py`）现已无对应脚本，会静默 no-op，但仍应一并清理
 
 ## 迁移步骤（必须原子完成）
 
@@ -28,7 +29,7 @@
 2. **同时**从 `~/.claude/settings.json` 删除上述 4 条 hook 注册（SessionStart 2 条 + UserPromptSubmit 1 条 + SessionEnd 1 条）
 3. 新开一个会话，验证**单次触发**：
    - SessionStart：知识库上下文只注入一次（不重复出现）
-   - SessionEnd（若启用 auto-mode）：检查 `auto-runs/enqueue.log`，单会话只入队一条
+   - UserPromptSubmit：prompt 相关注入只出现一次
 
 ## 配置与数据的延续
 
@@ -123,7 +124,6 @@ function claude { & claude.exe --plugin-dir "<插件目录绝对路径>" @args }
 新开会话后验证单次触发：
 
 - **SessionStart**：知识库上下文注入只出现一次（搜索输出中无重复）
-- **SessionEnd**：检查 `auto-runs/enqueue.log`，单次会话只写入一条记录
 - **Skill 列表**：无同名重复条目
 
 ---
