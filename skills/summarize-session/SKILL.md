@@ -433,6 +433,14 @@ summary: "2026-03-19 工作记录"
      # 确认后 --apply（自动 .bak 备份）
      python3 "$SS/reclaim_and_prune.py" --vault "$VAULT" --apply
      ```
+   - **清理已归集超龄条目**（pending-docs 只增不减时）：已归集（有 vault_path）的条目原文已安全在 Vault，其跟踪记录在归集超过 N 天（默认 30）后可手动清理；`prune_archived.py` 独立手动跑，**不接入 sync、无 config、无自动触发**：
+     ```bash
+     # 先 dry-run 预览 pruned_planned（--older-than N 调阈值，默认 30 天）
+     SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+     python3 "$SS/prune_archived.py" --vault "$VAULT"
+     # 确认后 --apply（自动 .bak 轮转备份）
+     python3 "$SS/prune_archived.py" --vault "$VAULT" --apply
+     ```
    - `conflict_vault_edited / conflict_both_edited` 状态由本次 sync 输出 JSON 反映（不写回 pending-docs，用户决策后改原文件再跑即可）
    - 解析 sync 输出 JSON 的 `conflict_vault_edited` 和 `conflict_both_edited` 数组，在第五步输出中提示用户
 2. **触发 Obsidian 重扫**（若 CLI 可用）：
