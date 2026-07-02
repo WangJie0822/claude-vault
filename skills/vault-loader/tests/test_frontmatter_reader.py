@@ -118,3 +118,44 @@ def test_load_cache_caps_keyword_count(write_frontmatter_cache, tmp_vault):
     from scripts._frontmatter_reader import load_cache, MAX_KEYWORDS_PER_ENTRY
     write_frontmatter_cache({"a.md": {"keywords": [f"词条{i}" for i in range(50)]}})
     assert len(load_cache(tmp_vault)["a.md"].keywords) == MAX_KEYWORDS_PER_ENTRY
+
+
+def test_tags_capped_at_max_count(tmp_path) -> None:
+    """F6 对称护栏：tags 条数超过 32 条时按 MAX_TAGS_PER_ENTRY 截断（与 keywords 上限对称）。"""
+    import json
+    from scripts._frontmatter_reader import load_cache, MAX_TAGS_PER_ENTRY
+
+    meta = tmp_path / ".meta"; meta.mkdir()
+    entry = {"tags": [f"t{i}" for i in range(50)], "summary": "s", "mtime": 1}
+    (meta / "frontmatter-cache.json").write_text(
+        json.dumps({"_version": 1, "entries": {"a.md": entry}}), encoding="utf-8")
+    entries = load_cache(tmp_path)
+    tags = entries["a.md"].tags
+    assert len(tags) == MAX_TAGS_PER_ENTRY == 32
+
+
+def test_overlong_tag_dropped_within_cap_window(tmp_path) -> None:
+    """F6 对称护栏：单条 tag 超过 128 字符按 MAX_TAG_CHARS 过滤丢弃。
+
+    超长 tag 必须落在 [:32] 条数截断窗口**以内**，否则本测试对长度过滤零区分力——
+    条数截断本身就会把窗口外的元素排除，无法证明长度过滤是否真的生效
+    （历史教训：曾把超长 tag 放在第 51 位，条数截断先天排除它，删掉长度过滤条件测试仍 PASS）。
+    """
+    import json
+    from scripts._frontmatter_reader import load_cache
+
+    meta = tmp_path / ".meta"; meta.mkdir()
+    overlong = "x" * 200
+    tags_raw = [f"t{i}" for i in range(10)] + [overlong] + [f"t{i}" for i in range(10, 31)]
+    assert len(tags_raw) == 32  # 超长 tag（索引 10）落在 32 条截断窗口以内
+    entry = {"tags": tags_raw, "summary": "s", "mtime": 1}
+    (meta / "frontmatter-cache.json").write_text(
+        json.dumps({"_version": 1, "entries": {"a.md": entry}}), encoding="utf-8")
+    entries = load_cache(tmp_path)
+    tags = entries["a.md"].tags
+
+    assert overlong not in tags
+    assert all(len(t) <= 128 for t in tags)
+    # 长度过滤生效后超长 tag 被剔除，剩余 31 条有效 tag 全部保留（未触发条数截断）
+    assert len(tags) == 31
+    assert tags == tuple(f"t{i}" for i in range(31))

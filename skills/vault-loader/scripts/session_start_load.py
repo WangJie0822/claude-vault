@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts._config_loader import load_config, check_vault_path_consistency
 from scripts._frontmatter_reader import load_cache
-from scripts._output import emit, approx_size_str
+from scripts._output import emit, approx_size_str, sanitize_injected_text
+from scripts._scorer import is_archived
 from scripts._vault_init import ensure_vault
 from scripts._signal_collect import (
     collect_recent_commits,
@@ -71,15 +72,19 @@ def build_injection_text_ss(cwd, git_top, target_tags, project_notes,
         lines.append(f"## 项目相关笔记（近期 {len(project_notes)} 篇）")
         lines.append("")
         for e in project_notes:
-            summary = e.summary or "(无摘要)"
-            mtime_str = f", {e.updated}" if e.updated else ""
-            lines.append(f"- [[{e.path}]] — {summary}{mtime_str}")
+            summary = sanitize_injected_text(e.summary or "(无摘要)", keep_newlines=False)
+            updated_clean = sanitize_injected_text(e.updated, keep_newlines=False) if e.updated else ""
+            mtime_str = f", {updated_clean}" if updated_clean else ""
+            # F5：path 与 summary 一样源自不可信笔记 frontmatter，wikilink 嵌入点净化控制字符
+            path_clean = sanitize_injected_text(e.path, keep_newlines=False)
+            lines.append(f"- [[{path_clean}]] — {summary}{mtime_str}")
         lines.append("")
     if top_worklogs:
         lines.append(f"## 近 {recent_worklog_days} 天工作日志")
         lines.append("")
         for wl in top_worklogs:
-            lines.append(f"- [[{wl}]]")
+            wl_clean = sanitize_injected_text(wl, keep_newlines=False)
+            lines.append(f"- [[{wl_clean}]]")
         lines.append("")
     if recent_commits:
         lines.append(f"## 近期提交（{len(recent_commits)}）")
@@ -191,8 +196,12 @@ def main() -> int:
     # 注意：cache 为空不早退——工作日志/提交不依赖 cache，仍应渲染。
     entries = load_cache(vault_path)
     include_tag = ss_cfg.get("include_tag_matched_notes", True)
+    exclude_tags = {t.lower() for t in config.get("relevance", {}).get("exclude_note_tags", [])}
 
     def _is_project_note(entry) -> bool:
+        # 第1层：archived 等排除 tag 不进召回池（卫生措施非安全边界；/vault 手动检索不受影响）
+        if is_archived(entry, exclude_tags):
+            return False
         # 项目目录直接命中（强信号），或标签匹配（弱信号，开关可关）
         if entry.path in project_paths:
             return True

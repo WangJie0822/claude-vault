@@ -303,20 +303,53 @@ def _split_english_subtokens(token: str, en_subtoken_min: int) -> set[str]:
             if len(p) >= en_subtoken_min and not p.isdigit() and not _is_noise_token(p)}
 
 
+# ===== 第0层：CJK bigram 分词（J-private，不动全局 _CN_TOKEN_RE，避免外溢 D/F 信号）=====
+
+# J 专用：≥2 字连续中文（全局 _CN_TOKEN_RE 是 {3,}，供 D/F 信号，保持不动）
+_CN_TOKEN_RE_J = _re.compile(r"[一-鿿]{2,}")
+
+# 函数词 bigram 停用表（闭集 108 词：汉语功能词+超泛口语词+趋向补语；
+# 唯一基准 = spec 2026-07-02-vault-loader-recall-layer0-1-design.md 附录 A，不得增删）
+_CJK_FUNCTION_BIGRAMS = frozenset("""
+怎么 什么 为什 如何 哪里 哪个 哪些 是否 能否 可否
+一下 一个 一些 一样 这个 这些 那个 那些 这里 那里 这样 那样 这么 那么 这边 那边
+我们 你们 他们 她们 它们 咱们 自己 大家 别人
+现在 刚才 之前 之后 以前 以后 然后 接着 首先 其次 最后 目前 已经 马上 立刻
+应该 需要 必须 可以 可能 也许 大概 或者 还是 而且 并且 但是 不过 因为 所以 如果 虽然 即使 就是 不是 没有 还有 只有 只是 其实 真的 确实
+继续 好的 好了 谢谢 请问 帮我 麻烦 不用 不要 知道 觉得 认为 感觉 希望 想要
+时候 东西 事情 问题 地方 看看 试试
+出来 起来 下来 上去 进去 出去 回来 过来 过去
+""".split())
+
+
+def _split_cjk_bigrams(run: str) -> list[str]:
+    """CJK 连续段 → 滑窗 bigram（保序）：len==2 取自身，≥3 切相邻 bigram；停用表过滤。
+    只治查询侧分词，不建词典（dict-free，规避分析文档 F2 词典噪声）。"""
+    toks = [run] if len(run) == 2 else [run[i:i + 2] for i in range(len(run) - 1)]
+    return [t for t in toks if t not in _CJK_FUNCTION_BIGRAMS]
+
+
+def is_pure_cjk_keywords(keywords: list[str]) -> bool:
+    """关键词集是否全部为 CJK token（触发点1纯 CJK 放宽的判定，供 prompt_submit_load）。"""
+    return bool(keywords) and all(_CN_TOKEN_RE_J.fullmatch(k) for k in keywords)
+
+
 def collect_signal_j_prompt_keywords(
     prompt: str,
     strip_slash_command: bool = True,
     split_english_token: bool = True,
     en_subtoken_min: int = 4,
+    split_cjk_bigram: bool = True,
+    max_keywords: int | None = None,
 ) -> set[str]:
-    """从用户 prompt 中提取关键词。
+    """从用户 prompt 提取关键词（单趟位置扫描 → 真文档序）。
     - strip_slash_command：剥首个 slash 命令名 token（默认 True）
-    - split_english_token：含 _/- 的英文 token 按 [_-] 再切分（并集保留原 token，默认 True）
-    - en_subtoken_min：子片最小长度（默认 4；3 经实证为召回灾难）
-    - 仅读前 4 KB
-    - 英文 token ≥ 4 字母
-    - 中文 token ≥ 3 字
-    - 全部 lowercase（英文部分）
+    - split_english_token：含 _/- 英文 token 按 [_-] 再切分（默认 True）
+    - en_subtoken_min：英文子片最小长度（默认 4；3 经实证为召回灾难）
+    - split_cjk_bigram：CJK ≥2 字段滑窗 bigram + 停用表（默认 True；False=旧 mega-token {3,} 行为）
+    - max_keywords：头尾文档序截断（first ⌈N/2⌉ + last ⌊N/2⌋，None/0=不截断）——
+      纯 first-N 会在「长粘贴+末尾提问」丢光提问词（评审 R1 实证），故两端都保留
+    - 仅读前 4 KB；英文 ≥4 字母 lowercase
     """
     if not prompt:
         return set()
@@ -325,17 +358,36 @@ def collect_signal_j_prompt_keywords(
         prompt = _strip_slash_command(prompt)
 
     truncated = prompt[:MAX_PROMPT_BYTES]
-    keywords: set[str] = set()
 
+    # 单趟：EN 与 CJK 各自 finditer 后按 match 起始位置归并（真文档序——旧双趟结构
+    # 英文恒排前，混合 prompt 截断时会系统性丢中文）
+    events: list[tuple[int, list[str]]] = []
     for m in _EN_TOKEN_RE.finditer(truncated):
         tok = m.group(0).lower()
-        subs = _split_english_subtokens(tok, en_subtoken_min) if split_english_token else set()
-        # B2：原 token 仅在非噪声时保留（harvest_201718_... 等机器 id 整体丢、但其有用子片
-        # harvest 仍由 subs 保留；纯词 analyze_bugs 非噪声照常保留，零回归）
-        if not _is_noise_token(tok):
-            keywords.add(tok)
-        keywords |= subs
-    for m in _CN_TOKEN_RE.finditer(truncated):
-        keywords.add(m.group(0))
+        toks: list[str] = [] if _is_noise_token(tok) else [tok]
+        if split_english_token:
+            toks += sorted(_split_english_subtokens(tok, en_subtoken_min) - {tok})
+        events.append((m.start(), toks))
+    cn_re = _CN_TOKEN_RE_J if split_cjk_bigram else _CN_TOKEN_RE
+    for m in cn_re.finditer(truncated):
+        run = m.group(0)
+        events.append((m.start(), _split_cjk_bigrams(run) if split_cjk_bigram else [run]))
+    events.sort(key=lambda x: x[0])
 
-    return keywords
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _, toks in events:
+        for t in toks:
+            if t not in seen:
+                seen.add(t)
+                ordered.append(t)
+
+    if max_keywords and len(ordered) > max_keywords:
+        hn = (max_keywords + 1) // 2
+        tn = max_keywords // 2
+        head = ordered[:hn]
+        head_set = set(head)
+        tail = [t for t in (ordered[-tn:] if tn else []) if t not in head_set]
+        ordered = (head + tail)[:max_keywords]
+
+    return set(ordered)

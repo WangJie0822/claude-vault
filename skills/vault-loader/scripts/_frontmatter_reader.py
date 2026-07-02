@@ -11,6 +11,9 @@ CACHE_VERSION = 1  # 与写端（rebuild_index）保持对称；版本不符时�
 # 读端每篇 keyword 条数上限（纵深防御）：写端 sanitize 上限 8，此处留余量；防异常/恶意 cache
 # 单篇塞数千 keyword 令 O(N×M×K) 评分爆炸。
 MAX_KEYWORDS_PER_ENTRY = 16
+# F6 对称护栏：tags 与 keywords 同理，防异常/恶意 cache 单篇塞海量 tags 拖垮评分
+MAX_TAGS_PER_ENTRY = 32
+MAX_TAG_CHARS = 128
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,8 @@ def load_cache(vault_path: Path) -> dict[str, Entry]:
             if not isinstance(meta, dict):
                 continue
             tags_raw = meta.get("tags") or []
-            tags = tuple(t for t in tags_raw if isinstance(t, str))
+            tags = tuple(t for t in tags_raw
+                         if isinstance(t, str) and len(t) <= MAX_TAG_CHARS)[:MAX_TAGS_PER_ENTRY]
             kw_raw = meta.get("keywords")
             if not isinstance(kw_raw, list):
                 kw_raw = []

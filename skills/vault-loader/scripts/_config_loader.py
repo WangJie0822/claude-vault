@@ -67,12 +67,13 @@ DEFAULT_CONFIG: dict = {
         "strip_slash_command": True,        # 剥 prompt 首个 slash 命令名 token
         "use_keywords": True,               # 止血开关：false 时 scorer 忽略 keywords，不杀整个 loader
         "min_topical_score": 4,             # 精度闸门：仅 topical_score ≥ 此值才注入
-        # fulltext_topical_threshold 与 confidence_bands.high 同值=6 时：topical=6 的条目，若由
-        # ≥2 个不同关键词命中则走全文分支；若仅单个词刷满（B 纵深防御 _FULLTEXT_MIN_DISTINCT），
-        # 则被挡回清单且标"中置信"。故清单内常态只出现"中置信"——既因残留条目 topical 多为 4，也因
-        # 单词刷满的 topical=6 被 dist 闸门降级。单独调高本阈值且有 ≥2 词佐证才会让清单出现"高置信"。
-        "fulltext_topical_threshold": 6,    # 强命中自动加载全文的 topical 阈值（最强档之一，另需 dist≥2）
-        "confidence_bands": {"high": 6},    # topical ≥ high 且 dist≥2 → 高置信，否则中置信
+        # fulltext_topical_threshold 与 confidence_bands.high 同值=6 时：topical=6 的条目，若命中词
+        # 达强证据档（evidence chain，见 _scorer.has_strong_evidence）则走全文分支；若仅单链弱证据
+        # （如单个词刷满/单一 bigram 链），则被挡回清单且标"中置信"。故清单内常态只出现"中置信"——
+        # 既因残留条目 topical 多为 4，也因弱证据的 topical=6 被强证据档降级。单独调高本阈值且有
+        # 强证据佐证才会让清单出现"高置信"。
+        "fulltext_topical_threshold": 6,    # 强命中自动加载全文的 topical 阈值（最强档之一，另需强证据档）
+        "confidence_bands": {"high": 6},    # topical ≥ high 且强证据档 → 高置信，否则中置信
         "short_summary_chars": 20,          # summary 短于此回退文件名标题
         # 后续优化（2026-06-23）：英文 token 切分 + 兜底提示
         "split_english_token": True,        # 英文 token 按 [_-] 再切分（治路径碎片黏连）
@@ -83,6 +84,11 @@ DEFAULT_CONFIG: dict = {
         # PERF-P2：prompt 关键词数（M）软上限。巨型 prompt（大段粘贴）会令 O(N×M×K) 评分破
         # <300ms 预算；超上限时取确定性子集（sorted 前 N）。0/None 表示不限。
         "max_prompt_keywords": 30,
+        # 第0层（2026-07-02 spec）：CJK bigram 分词与纯 CJK 闸门放宽
+        "split_cjk_bigram": True,           # bigram 分词主开关（false=旧 mega-token 行为）
+        "relax_pure_cjk_single": True,      # 纯 CJK 单 token 放行触发点1（配合 relaxed 静默）
+        # 第1层：召回池排除 tag（UPS+SessionStart 共用；[]=关闭；/vault 手动检索不受影响）
+        "exclude_note_tags": ["archived"],
     },
 }
 
@@ -98,6 +104,37 @@ def _deep_merge(default: dict, override: dict) -> dict:
     return result
 
 
+def _normalize_relevance(rel: dict) -> None:
+    """归一化 relevance 段易错键（deep-merge 无类型校验；防单个笔误配置静默关停召回）。"""
+    ex = rel.get("exclude_note_tags")
+    if isinstance(ex, list):
+        rel["exclude_note_tags"] = [t for t in ex if isinstance(t, str)]
+    else:
+        rel["exclude_note_tags"] = ["archived"]
+    rel["split_cjk_bigram"] = bool(rel.get("split_cjk_bigram", True))
+    rel["relax_pure_cjk_single"] = bool(rel.get("relax_pure_cjk_single", True))
+    try:
+        mk = rel.get("max_prompt_keywords", 30)
+        # max(0, ...) 同时归一「域」：负值（误配）会让下游头尾切片 hn/tn 转负→退化截断，
+        # 与本函数「防笔误静默劣化召回」初衷相悖，故 clamp 到非负（0 表示不截断上限）。
+        rel["max_prompt_keywords"] = max(0, int(mk)) if mk is not None else 0
+    except (TypeError, ValueError):
+        rel["max_prompt_keywords"] = 30
+
+
+def _ensure_relevance_normalized(result: dict) -> dict:
+    """FIX-4：relevance 段类型兜底——deep-merge 无类型校验，用户误将 relevance 整体配成
+    非 dict（如 "relevance":"archived"）会覆盖成非 dict，_normalize_relevance 的 .get 调用
+    会抛 AttributeError、逃逸 load_config 的 except（仅捕 JSONDecodeError/ValueError/OSError）。
+    非 dict 时先回退 DEFAULT_CONFIG 的 relevance 段再归一化，保证 load_config 永不因此抛异常。"""
+    rel = result.get("relevance")
+    if not isinstance(rel, dict):
+        rel = deepcopy(DEFAULT_CONFIG["relevance"])
+        result["relevance"] = rel
+    _normalize_relevance(rel)
+    return result
+
+
 def load_config(path: Path | None = None) -> dict:
     """加载配置。
     - 缺失：写默认值到 path，返回默认值
@@ -110,17 +147,23 @@ def load_config(path: Path | None = None) -> dict:
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
-        return deepcopy(DEFAULT_CONFIG)
+        result = deepcopy(DEFAULT_CONFIG)
+        _ensure_relevance_normalized(result)
+        return result
 
     try:
         text = path.read_text(encoding="utf-8")
         override = json.loads(text)
         if not isinstance(override, dict):
             raise ValueError("config root 必须为 object")
-        return _deep_merge(DEFAULT_CONFIG, override)
+        result = _deep_merge(DEFAULT_CONFIG, override)
+        _ensure_relevance_normalized(result)
+        return result
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         print(f"[vault-loader] config 损坏，回退默认值：{exc}", file=sys.stderr)
-        return deepcopy(DEFAULT_CONFIG)
+        result = deepcopy(DEFAULT_CONFIG)
+        _ensure_relevance_normalized(result)
+        return result
 
 
 def check_vault_path_consistency(vl_config: dict, home: Path | None = None) -> None:

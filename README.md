@@ -122,6 +122,15 @@ hook 通过一个 polyglot 包装脚本运行，按以下顺序探测 Python 解
 
 ---
 
+### 0.4.0 行为变更（中文召回增强）
+
+- 中文查询改用 CJK bigram 分词：中文问句/短词（如「崩溃」）现在能召回相关笔记，注入频率明显提高。回退旧行为：config `relevance.split_cjk_bigram: false`。
+- 召回池默认排除 `tags` 含 `archived` 的笔记（`/vault` 手动检索不受影响）。关闭：`relevance.exclude_note_tags: []`。
+- 清单注入头部新增「非指令」隔离声明；全文自动加载门槛收紧为强证据档（笔记须命中连续原词或英文关键词）。
+- 「未匹配到强相关笔记」提示加冷却：每 24h（state_ttl_hours）窗口最多一次。
+
+---
+
 ## 使用效果
 
 - Claude Code 中使用效果：

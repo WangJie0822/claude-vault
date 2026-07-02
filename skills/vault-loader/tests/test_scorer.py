@@ -295,3 +295,31 @@ def test_has_keyword_hit_dedups_and_gates():
     assert has_keyword_hit(e, {"召回"}, use_keywords=False) is False
     assert has_keyword_hit(Entry(path="y.md"), {"召回"}) is False
     assert has_keyword_hit(e, set()) is False
+
+
+# ===== 证据链合并 + 强证据档（第0层 §3.5）=====
+
+def test_evidence_chain_count_merges_adjacent_bigrams() -> None:
+    from scripts._scorer import evidence_chain_count
+
+    # 同一 4 字源词的相邻 bigram 折成 1 链——顺序无关（union-find，评审 R3：
+    # sorted 序会破坏相邻性，实现不得依赖列表序）
+    assert evidence_chain_count(["预算", "算管", "管理"]) == 1
+    assert evidence_chain_count(["算管", "管理", "预算"]) == 1   # 打乱顺序
+    assert evidence_chain_count(["崩溃", "日志"]) == 2           # 两独立词
+    assert evidence_chain_count(["gradle", "构建"]) == 2         # 非 bigram 各自成链
+    assert evidence_chain_count([]) == 0
+
+
+def test_has_strong_evidence_rules() -> None:
+    from scripts._scorer import has_strong_evidence
+
+    # 多 bigram 链（笔记含 ≥3 字连续原词）+ 第二链 → 强
+    assert has_strong_evidence(["预算", "算管", "管理", "实施"])
+    # 英文 token + CJK 链 → 强
+    assert has_strong_evidence(["gradle", "构建"])
+    # 两条散 2 字 bigram 链 → 弱（挡「多个散 bigram 凑数」升全文）
+    assert not has_strong_evidence(["崩溃", "日志"])
+    # 单链（哪怕多 bigram）→ 弱（链数 <2）
+    assert not has_strong_evidence(["预算", "算管", "管理"])
+    assert not has_strong_evidence([])

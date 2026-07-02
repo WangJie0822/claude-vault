@@ -131,3 +131,85 @@ def test_fulltext_corrupted_returns_empty(tmp_home: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("{ broken")
     assert load_fulltext_injected(cwd, ttl_hours=24) == set()
+
+
+def test_fallback_ts_roundtrip(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows Path.home()
+    from scripts._state import (load_fallback_ts, save_fallback_ts,
+                                fallback_cooldown_expired, save_injected,
+                                load_already_injected)
+    from pathlib import Path
+
+    cwd = Path(str(tmp_path / "proj"))
+    assert load_fallback_ts(cwd) == 0.0
+    assert fallback_cooldown_expired(cwd, 24)          # 从未提示 → 允许
+    save_fallback_ts(cwd)
+    assert load_fallback_ts(cwd) > 0
+    assert not fallback_cooldown_expired(cwd, 24)      # 冷却中
+    # save_injected 不得丢 fallback_ts
+    save_injected(cwd, ["a.md"])
+    assert load_fallback_ts(cwd) > 0
+    assert load_already_injected(cwd, 24) == {"a.md"}
+
+
+def test_save_injected_trims_when_oversized(tmp_path, monkeypatch) -> None:
+    """写端护栏（评审 R6）：merged 超限时裁剪为「本轮 ∪ fulltext」，防撞 100KB 后
+    读端返回空集、去重永久失效。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    from scripts._state import save_injected, load_already_injected, MAX_STATE_PATHS
+    from pathlib import Path
+
+    cwd = Path(str(tmp_path / "proj"))
+    save_injected(cwd, [f"很长的笔记路径/note-{i:04d}.md" for i in range(MAX_STATE_PATHS + 50)])
+    save_injected(cwd, ["本轮/new.md"], fulltext_paths=["本轮/full.md"])
+    loaded = load_already_injected(cwd, 24)
+    assert "本轮/new.md" in loaded and "本轮/full.md" in loaded
+    assert len(loaded) <= MAX_STATE_PATHS   # 裁剪生效，未无界增长
+
+
+def test_save_injected_trims_on_byte_budget(tmp_path, monkeypatch) -> None:
+    """F-T2：隔离「字节触发器」分支——条数 < MAX_STATE_PATHS 但序列化 > TRIM_STATE_BYTES
+    时也须裁剪。删 line 108 的字节触发器（只留条数）会让此分支回归 → state 涨到读端
+    100KB 上限后 load 返空、去重永久失效。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    from scripts._state import (save_injected, load_already_injected,
+                                MAX_STATE_PATHS, TRIM_STATE_BYTES)
+    from pathlib import Path
+
+    cwd = Path(str(tmp_path / "proj"))
+    # 300 条 × ~400 字符 ≈ 120KB > 90KB，但 300 « 2000（条数触发器不生效，仅字节触发器）
+    long_paths = ["x" * 400 + f"/{i:03d}.md" for i in range(300)]
+    assert len(long_paths) < MAX_STATE_PATHS
+    save_injected(cwd, long_paths)
+    # 第二次写：merged=302 条仍 < 2000 但 >90KB → 只可能由字节触发器裁剪
+    save_injected(cwd, ["本轮/new.md"], fulltext_paths=["本轮/full.md"])
+    loaded = load_already_injected(cwd, 24)
+    assert "本轮/new.md" in loaded and "本轮/full.md" in loaded
+    assert len(loaded) < 50                 # 字节分支裁到「本轮 ∪ fulltext」；未裁则 302
+    # 未撞读端 100KB 上限（否则 load 返空）——本条已 in loaded 即证
+    import json as _json
+    assert len(_json.dumps(sorted(loaded)).encode("utf-8")) < TRIM_STATE_BYTES
+
+
+def test_fallback_cooldown_rearms_after_ttl(tmp_path, monkeypatch) -> None:
+    """F-T1：兜底冷却第三态——非零但陈旧的 fallback_ts 超 ttl 后重新允许提示（re-arm）。
+    防「>ttl*3600 误写成 <」或漏乘 3600 致提示永久消失（前两态测试无法捕获）。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    from scripts._state import fallback_cooldown_expired, state_path_for_cwd
+    from pathlib import Path
+
+    cwd = Path(str(tmp_path / "proj"))
+    p = state_path_for_cwd(cwd)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    stale = time.time() - 25 * 3600         # 25h 前（ttl=24 → 已过期）
+    p.write_text(json.dumps({"fallback_ts": stale, "timestamp": stale,
+                             "paths": [], "fulltext_paths": []}), encoding="utf-8")
+    assert fallback_cooldown_expired(cwd, 24)        # 过期 → 重新允许（第三态）
+    fresh = time.time() - 3600              # 1h 前（仍在窗口内）
+    p.write_text(json.dumps({"fallback_ts": fresh, "timestamp": fresh,
+                             "paths": [], "fulltext_paths": []}), encoding="utf-8")
+    assert not fallback_cooldown_expired(cwd, 24)    # 仍冷却

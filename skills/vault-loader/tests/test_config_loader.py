@@ -238,3 +238,84 @@ def test_check_exception_is_swallowed(tmp_home: Path, capsys) -> None:
     captured = capsys.readouterr()
     # 不期望告警（路径解析失败静默跳过）
     assert "崩溃" not in captured.err
+
+
+# ── Task 3：config 第0/1层三键 + relevance 归一化 ──────────────────────────────
+
+def test_new_relevance_keys_defaults(tmp_path) -> None:
+    from scripts._config_loader import load_config
+
+    cfg = load_config(tmp_path / "config.json")
+    rel = cfg["relevance"]
+    assert rel["split_cjk_bigram"] is True
+    assert rel["relax_pure_cjk_single"] is True
+    assert rel["exclude_note_tags"] == ["archived"]
+
+
+def test_relevance_normalization_coerces_bad_types(tmp_path) -> None:
+    """deep-merge 无类型校验：笔误配置不得静默关停召回（security finding）。"""
+    import json
+    from scripts._config_loader import load_config
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"relevance": {
+        "exclude_note_tags": "archived",      # 应为 list → 回退默认
+        "split_cjk_bigram": "yes",            # 非 bool → bool() 真值化
+        "relax_pure_cjk_single": 0,           # → False
+        "max_prompt_keywords": "30",          # 字符串 → int
+    }}), encoding="utf-8")
+    rel = load_config(p)["relevance"]
+    assert rel["exclude_note_tags"] == ["archived"]
+    assert rel["split_cjk_bigram"] is True
+    assert rel["relax_pure_cjk_single"] is False
+    assert rel["max_prompt_keywords"] == 30
+
+
+def test_relevance_normalization_bad_int_falls_back(tmp_path) -> None:
+    import json
+    from scripts._config_loader import load_config
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"relevance": {"max_prompt_keywords": "abc",
+                                           "exclude_note_tags": ["Archived", 123]}}),
+                 encoding="utf-8")
+    rel = load_config(p)["relevance"]
+    assert rel["max_prompt_keywords"] == 30          # 非法 → 默认
+    assert rel["exclude_note_tags"] == ["Archived"]  # 逐元素滤非 str
+
+
+def test_relevance_normalization_clamps_negative_max_keywords(tmp_path) -> None:
+    """F-BP-3：负 max_prompt_keywords（可解析为 int 但语义非法）会让下游头尾切片
+    hn/tn 转负→退化截断，违「防笔误静默劣化召回」初衷。归一化须 clamp 到非负。"""
+    import json
+    from scripts._config_loader import load_config
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"relevance": {"max_prompt_keywords": -5}}),
+                 encoding="utf-8")
+    rel = load_config(p)["relevance"]
+    assert rel["max_prompt_keywords"] == 0           # 负 → clamp 到 0（不截断上限）
+
+
+def test_relevance_non_dict_string_falls_back_to_default(tmp_path) -> None:
+    """FIX-4：relevance 整段配成非 dict（如误把 archived 值直接顶替整段）时，
+    旧代码 _normalize_relevance 的 .get 调用会抛 AttributeError、逃逸 load_config 的
+    except（仅捕 JSONDecodeError/ValueError/OSError）。必须优雅回退 DEFAULT_CONFIG。"""
+    import json
+    from scripts._config_loader import load_config, DEFAULT_CONFIG
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"relevance": "archived"}), encoding="utf-8")
+    rel = load_config(p)["relevance"]  # 不应抛异常
+    assert rel == DEFAULT_CONFIG["relevance"]
+    assert rel["split_cjk_bigram"] is True
+
+
+def test_relevance_non_dict_list_falls_back_to_default(tmp_path) -> None:
+    import json
+    from scripts._config_loader import load_config, DEFAULT_CONFIG
+
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"relevance": ["x"]}), encoding="utf-8")
+    rel = load_config(p)["relevance"]  # 不应抛异常
+    assert rel == DEFAULT_CONFIG["relevance"]

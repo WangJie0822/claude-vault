@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 
 MAX_STATE_BYTES = 100 * 1024  # 100 KB，超出视为损坏
+MAX_STATE_PATHS = 2000  # 写端护栏（评审 R6）：超出即裁剪，防撞读端 100KB 上限后去重永久失效
+TRIM_STATE_BYTES = 90 * 1024  # 90 KB，留量提前裁剪，避免踩线抖动
 
 
 def _cwd_hash(cwd: Path) -> str:
@@ -77,6 +79,7 @@ def save_injected(
 
     existing_paths: set[str] = set()
     existing_fulltext: set[str] = set()
+    existing_fallback_ts: float = 0.0
     if p.exists():
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
@@ -86,6 +89,7 @@ def save_injected(
             old_ft = data.get("fulltext_paths", [])
             if isinstance(old_ft, list):
                 existing_fulltext = {x for x in old_ft if isinstance(x, str)}
+            existing_fallback_ts = data.get("fallback_ts", 0)
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -98,5 +102,56 @@ def save_injected(
         "timestamp": time.time(),
         "paths": merged_paths,
         "fulltext_paths": merged_ft,
+        "fallback_ts": existing_fallback_ts,
     }
-    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    if len(merged_paths) > MAX_STATE_PATHS or len(serialized.encode("utf-8")) > TRIM_STATE_BYTES:
+        # 写端护栏：撞读端 100KB 上限前主动裁剪为「本轮注入 ∪ 全部已知全文」重置
+        # （fulltext 集小且最值得保留——防同篇全文重注）
+        merged_ft = sorted(existing_fulltext | new_ft)
+        merged_paths = sorted(new_paths | set(merged_ft))
+        payload["paths"] = merged_paths
+        payload["fulltext_paths"] = merged_ft
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    p.write_text(serialized, encoding="utf-8")
+
+
+def load_fallback_ts(cwd: Path) -> float:
+    """上次兜底提示时间戳；缺失/损坏/超限 → 0（等效允许提示，fail-open）。"""
+    p = state_path_for_cwd(cwd)
+    if not p.exists():
+        return 0.0
+    try:
+        if p.stat().st_size > MAX_STATE_BYTES:
+            return 0.0
+        data = json.loads(p.read_text(encoding="utf-8"))
+        ts = data.get("fallback_ts", 0) if isinstance(data, dict) else 0
+        return float(ts) if isinstance(ts, (int, float)) else 0.0
+    except (json.JSONDecodeError, OSError, ValueError):
+        return 0.0
+
+
+def fallback_cooldown_expired(cwd: Path, ttl_hours: int) -> bool:
+    """兜底冷却（评审 R4：bigram 使离题中文/日文繁体输入每轮触发兜底）：
+    距上次提示超过 ttl_hours 才允许再次提示。复用 state_ttl_hours，不新增 config 键。"""
+    return time.time() - load_fallback_ts(cwd) > ttl_hours * 3600
+
+
+def save_fallback_ts(cwd: Path) -> None:
+    """记录本次兜底提示时间。只 setdefault 其余字段——不得刷新 paths 的 timestamp
+    （否则会变相续命注入去重 TTL）。"""
+    p = state_path_for_cwd(cwd)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {}
+    if p.exists():
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (json.JSONDecodeError, OSError):
+            pass
+    data["fallback_ts"] = time.time()
+    data.setdefault("timestamp", 0)
+    data.setdefault("paths", [])
+    data.setdefault("fulltext_paths", [])
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

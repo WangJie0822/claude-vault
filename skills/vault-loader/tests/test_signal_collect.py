@@ -311,8 +311,10 @@ def test_signal_j_extracts_chinese_tokens() -> None:
     from scripts._signal_collect import collect_signal_j_prompt_keywords
 
     kws = collect_signal_j_prompt_keywords("帮我看一下事实优先约束的实现")
-    assert any("事实优先" in k for k in kws) or "事实优先约束" in kws
-    assert any("实现" in k for k in kws)
+    # bigram 语义（2026-07-02 spec）：4 字词以相邻 bigram 形式出现；功能词（帮我/一下）被停用表滤除
+    assert "事实" in kws and "实优" in kws and "优先" in kws
+    assert "实现" in kws
+    assert "帮我" not in kws and "一下" not in kws
 
 
 def test_signal_j_truncates_long_prompt() -> None:
@@ -529,3 +531,108 @@ def test_signal_a_excludes_root_index(tmp_path):
         project_root=Path('/x/demo'), vault_path=vault, extra_paths=['.'])
     assert '未分类 索引.md' not in paths
     assert '游离.md' in paths
+
+
+# ===== CJK bigram 切分（第0层）=====
+
+def test_split_cjk_bigrams_sliding_window() -> None:
+    from scripts._signal_collect import _split_cjk_bigrams
+
+    assert _split_cjk_bigrams("唤醒词") == ["唤醒", "醒词"]
+    assert _split_cjk_bigrams("预算管理") == ["预算", "算管", "管理"]
+
+
+def test_split_cjk_bigrams_two_char_run_is_itself() -> None:
+    from scripts._signal_collect import _split_cjk_bigrams
+
+    assert _split_cjk_bigrams("崩溃") == ["崩溃"]
+
+
+def test_split_cjk_bigrams_filters_function_words() -> None:
+    from scripts._signal_collect import _split_cjk_bigrams
+
+    # 怎么/么配 中只有 '怎么' 在停用表
+    assert _split_cjk_bigrams("怎么配") == ["么配"]
+    # 全功能词 → 空
+    assert _split_cjk_bigrams("怎么") == []
+
+
+def test_cjk_function_bigrams_table_is_spec_appendix_a() -> None:
+    from scripts._signal_collect import _CJK_FUNCTION_BIGRAMS
+
+    assert len(_CJK_FUNCTION_BIGRAMS) == 108
+    assert all(len(w) == 2 for w in _CJK_FUNCTION_BIGRAMS)
+    for w in ("怎么", "一下", "继续", "好的", "问题", "看看", "出来"):
+        assert w in _CJK_FUNCTION_BIGRAMS
+    for w in ("崩溃", "测试", "日志"):  # 内容词绝不入表
+        assert w not in _CJK_FUNCTION_BIGRAMS
+
+
+def test_is_pure_cjk_keywords() -> None:
+    from scripts._signal_collect import is_pure_cjk_keywords
+
+    assert is_pure_cjk_keywords({"崩溃"})
+    assert is_pure_cjk_keywords({"崩溃", "日志"})
+    assert not is_pure_cjk_keywords({"崩溃", "gradle"})
+    assert not is_pure_cjk_keywords(set())
+
+
+def test_signal_j_two_char_cjk_word_tokenized() -> None:
+    from scripts._signal_collect import collect_signal_j_prompt_keywords
+
+    assert collect_signal_j_prompt_keywords("崩溃") == {"崩溃"}
+    assert collect_signal_j_prompt_keywords("app闪退") == {"闪退"}  # 'app' <4 字母仍丢弃
+
+
+def test_signal_j_split_cjk_bigram_off_restores_legacy() -> None:
+    from scripts._signal_collect import collect_signal_j_prompt_keywords
+
+    kws = collect_signal_j_prompt_keywords("如何优化召回相关性", split_cjk_bigram=False)
+    assert kws == {"如何优化召回相关性"}  # 旧 mega-token（{3,}）行为
+    assert collect_signal_j_prompt_keywords("崩溃", split_cjk_bigram=False) == set()
+
+
+def test_signal_j_max_keywords_head_tail_truncation() -> None:
+    from scripts._signal_collect import collect_signal_j_prompt_keywords
+
+    # 长粘贴 + 末尾提问（reverse R1 反例）：头尾截断须保留末尾提问词
+    paste = "这是一段很长的构建日志输出内容用于模拟用户粘贴大段文本的场景" * 40
+    prompt = paste + "\n请问：如何优化召回相关性以及分词效果"
+    kws = collect_signal_j_prompt_keywords(prompt, max_keywords=30)
+    assert len(kws) <= 30
+    for tail_kw in ("召回", "分词", "优化", "相关"):
+        assert tail_kw in kws
+
+
+def test_signal_j_mixed_doc_order_cap_deterministic() -> None:
+    from scripts._signal_collect import collect_signal_j_prompt_keywords
+
+    kws1 = collect_signal_j_prompt_keywords("gradle 构建 " + "中文填充内容测试样本 " * 60, max_keywords=10)
+    kws2 = collect_signal_j_prompt_keywords("gradle 构建 " + "中文填充内容测试样本 " * 60, max_keywords=10)
+    assert kws1 == kws2 and len(kws1) <= 10
+    assert "gradle" in kws1  # 头部 EN token 保留
+
+
+def test_signal_j_max_keywords_one_still_caps() -> None:
+    """FIX-1 回归：max_keywords=1 时 tail = ordered[-(1//2):] == ordered[-0:] == 整表，
+    截断反向失效。修后 tn=0 时 tail 必须为空，最终硬兜底 [:1] 保证只出 1 个词。"""
+    from scripts._signal_collect import collect_signal_j_prompt_keywords
+
+    prompt = "gradle 构建 中文填充内容测试样本 召回 分词 相关性 优化"
+    kws = collect_signal_j_prompt_keywords(prompt, max_keywords=1)
+    assert len(kws) == 1
+
+
+def test_signal_j_max_keywords_two_caps_at_two() -> None:
+    from scripts._signal_collect import collect_signal_j_prompt_keywords
+
+    prompt = "gradle 构建 中文填充内容测试样本 召回 分词 相关性 优化"
+    kws = collect_signal_j_prompt_keywords(prompt, max_keywords=2)
+    assert len(kws) <= 2
+
+
+def test_global_cn_token_re_untouched_guard() -> None:
+    """D/F 信号守护：全局 _CN_TOKEN_RE 必须保持 {3,}（改它会外溢 D/F 信号）。"""
+    from scripts._signal_collect import _CN_TOKEN_RE
+
+    assert _CN_TOKEN_RE.pattern == r"[一-鿿]{3,}"

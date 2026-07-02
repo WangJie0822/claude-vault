@@ -67,6 +67,15 @@ def _keyword_hits_entry(keyword: str, entry: Entry) -> bool:
     return False
 
 
+def is_archived(entry: Entry, exclude_tags: set[str]) -> bool:
+    """笔记是否命中排除 tag（archived 等，大小写不敏感）。第1层召回池过滤单点，
+    供 prompt_submit_load(UPS) / session_start_load(SessionStart) / 回归 gold 集共用，
+    避免过滤逻辑三处漂移。exclude_tags 应为已 lower 的 set；空 set → 恒 False。"""
+    if not exclude_tags:
+        return False
+    return any(t.lower() in exclude_tags for t in entry.tags)
+
+
 def _keyword_hits_tags(keyword: str, entry: Entry) -> bool:
     return any(_kw_in_text(keyword, t) for t in entry.tags)
 
@@ -156,3 +165,41 @@ def topical_score(entry: Entry, signals: Signals, weights: dict,
     假定该权重，改 scoring 权重需同步调阈值。
     keywords 命中加 prompt_keyword_hit（去重 + 门控）。"""
     return _prompt_topical_hits(entry, signals, weights, use_keywords)
+
+
+# ===== 第0层 §3.5：证据链合并 + 强证据档（纯计算，供 prompt_submit_load 门槛/置信） =====
+
+_CJK_BIGRAM_FULL_RE = re.compile(r"[一-鿿]{2}")
+
+
+def evidence_chain_count(hits: list[str]) -> int:
+    """union-find 证据链合并：两个 2 字 CJK bigram 任一方向首尾重叠一字 → 同链
+    （同一连续源词切出的相邻 bigram 归并为一条证据）；非 bigram token 各自成链。
+    修复：裸 len(hits) 会被相邻 bigram 膨胀（4 字词→3 hits）击穿 dist≥2 纵深防御；
+    实现必须全对判定而非 sorted 相邻对（CJK codepoint 序破坏相邻性，评审 R3）。"""
+    n = len(hits)
+    parent = list(range(n))
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = hits[i], hits[j]
+            if (_CJK_BIGRAM_FULL_RE.fullmatch(a) and _CJK_BIGRAM_FULL_RE.fullmatch(b)
+                    and (a[1] == b[0] or b[1] == a[0])):
+                parent[_find(i)] = _find(j)
+    return len({_find(i) for i in range(n)})
+
+
+def has_strong_evidence(hits: list[str]) -> bool:
+    """全文/高置信强证据档（用户拍板，spec §3.5）：链数 ≥2 且（存在多 bigram 合并链
+    ——即笔记含用户输入的 ≥3 字连续词——或 ≥1 个非 bigram 命中 token）。
+    效果（PoC v2 实证）：「看看日志输出」类散 bigram 弱命中不再升全文/标高置信。"""
+    chains = evidence_chain_count(hits)
+    if chains < 2:
+        return False
+    return chains < len(hits) or any(not _CJK_BIGRAM_FULL_RE.fullmatch(h) for h in hits)
