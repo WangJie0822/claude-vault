@@ -14,10 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts._config_loader import load_config
 from scripts._frontmatter_reader import load_cache
+from scripts._note_paths import resolve_note_path
 from scripts._output import emit, approx_size_str, sanitize_injected_text
 from scripts._vault_init import ensure_vault
 from scripts._scorer import (
-    Signals, score, topical_score, has_keyword_hit,
+    Signals, score, topical_score, has_keyword_hit, build_tag_df,
     _keyword_hits_tags, _keyword_hits_summary, _keyword_hits_keywords,
     has_strong_evidence, is_archived,
 )
@@ -121,16 +122,20 @@ def build_injection_text_ups(scored, keywords_str, prompt_keywords, ups_cfg, rel
     ]
     if ft_candidates:
         ft_total, ft_cand_topical, ft_entry = max(ft_candidates, key=lambda x: (x[1], x[0]))
-        note_path = vault_path / ft_entry.path
-        try:
-            # errors=replace：非 UTF-8 笔记不应让 hook 崩（fulltext 分支现可由 topical 触发，
-            # 对齐 load_cache/signal_collect 的容错读，避免 UnicodeDecodeError 逃逸成静默崩溃）
-            content = note_path.read_text(encoding="utf-8", errors="replace")
-            content = content[: ups_cfg["fulltext_max_bytes"]]
-            if len(content) == ups_cfg["fulltext_max_bytes"]:
-                content += "\n...（截断）"
-        except OSError:
+        note_path = resolve_note_path(vault_path, ft_entry.path)
+        if note_path is None:
+            # 路径越界 / 非 .md / 不存在：与「读失败」同等降级，**不得裸拼接回退**
             content = "（无法读取）"
+        else:
+            try:
+                # errors=replace：非 UTF-8 笔记不应让 hook 崩（fulltext 分支现可由 topical 触发，
+                # 对齐 load_cache/signal_collect 的容错读，避免 UnicodeDecodeError 逃逸成静默崩溃）
+                content = note_path.read_text(encoding="utf-8", errors="replace")
+                content = content[: ups_cfg["fulltext_max_bytes"]]
+                if len(content) == ups_cfg["fulltext_max_bytes"]:
+                    content += "\n...（截断）"
+            except OSError:
+                content = "（无法读取）"
         rest = [x for x in scored if x[2].path != ft_entry.path][: ups_cfg["max_notes"] - 1]
         # F5：path 同 summary 一样源自不可信笔记 frontmatter，wikilink 嵌入点净化控制字符
         ft_path_clean = sanitize_injected_text(ft_entry.path, keep_newlines=False)
@@ -288,14 +293,20 @@ def main() -> int:
     use_kw = rel_cfg.get("use_keywords", True)
     min_topical = rel_cfg["min_topical_score"]
     ft_topical = rel_cfg["fulltext_topical_threshold"]
+    # 第1层：archived 等排除 tag 不进召回池（卫生措施非安全边界；/vault 手动检索不受影响）。
+    # tag_df/n_docs 必须与排序循环同口径（均基于 active_entries）：否则 archived 笔记的 tag
+    # 会抬高 tag_df/n_docs 分母，而它们根本不参与排序竞争，造成 IDF 因子失真、PoC 数字不可复现。
+    exclude_tags = {t.lower() for t in rel_cfg.get("exclude_note_tags", [])}
+    active_entries = {p: e for p, e in entries.items() if not is_archived(e, exclude_tags)}
+    _use_tag_idf = rel_cfg.get("use_tag_idf", True)
+    _tag_df = build_tag_df(active_entries) if _use_tag_idf else None
+    _n_docs = len(active_entries)
+    _floor = rel_cfg.get("tag_idf_floor", 0.5)
     scored = []
     any_relevant = False   # 有任一篇 topical 达标（含被去重的）→ 区分"全失配"vs"已注入过"
-    exclude_tags = {t.lower() for t in rel_cfg.get("exclude_note_tags", [])}
-    for path, entry in entries.items():
-        # 第1层：archived 等排除 tag 不进召回池（卫生措施非安全边界；/vault 手动检索不受影响）
-        if is_archived(entry, exclude_tags):
-            continue
-        t = topical_score(entry, signals, weights, use_keywords=use_kw)
+    for path, entry in active_entries.items():
+        t = topical_score(entry, signals, weights, use_kw,
+                          tag_df=_tag_df, n_docs=_n_docs, tag_idf_floor=_floor)
         if path in fulltext_injected:
             if t >= min_topical:
                 any_relevant = True   # 仍相关但已拿全文 → 不重注、抑制兜底
@@ -304,15 +315,20 @@ def main() -> int:
             # 曾弱候选注入：仅升到全文阈值才作升级候选再注入（治 reverse High#1：
             # 升级候选不在渲染层排除，进 scored 参与主候选；非主候选时仍可见于清单、保留升级机会）
             if t >= ft_topical:
-                scored.append((score(entry, signals, weights, use_keywords=use_kw), t, entry))
+                scored.append((score(entry, signals, weights, use_kw,
+                                     tag_df=_tag_df, n_docs=_n_docs, tag_idf_floor=_floor), t, entry))
             elif t >= min_topical:
                 any_relevant = True   # 仍相关但已展示过弱候选 → 不重复展示、抑制兜底
             continue
-        # 新篇：精度闸门——topical 达标，或 keyword-only 命中也放进候选（解 A，低排名）。
+        # 新篇：精度闸门——topical 达标即进候选。keyword-only 命中：默认权重
+        # (prompt_keyword_hit=5 ≥ min_topical=4) 下已由 t >= min_topical 直接放行、且**高于**
+        # 被 IDF 降权的泛 tag（非低排名）；下面的 has_keyword_hit 旁路仅当用户把
+        # prompt_keyword_hit 调到 <min_topical 时才复活（默认下是死分支，保留以守护自定义低权重 config）。
         # 与打分共用 has_keyword_hit 单点（含 tag 去重），口径一致、防漂移。
         if t < min_topical and not has_keyword_hit(entry, prompt_keywords, use_kw):
             continue
-        scored.append((score(entry, signals, weights, use_keywords=use_kw), t, entry))
+        scored.append((score(entry, signals, weights, use_kw,
+                             tag_df=_tag_df, n_docs=_n_docs, tag_idf_floor=_floor), t, entry))
 
     scored.sort(key=lambda x: (-x[0], -x[2].mtime))
     if not scored:

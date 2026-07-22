@@ -317,6 +317,16 @@ python3 "$SS/obsidian_cli.py" --vault "$VAULT" <op> [...]
 
 笔记不得放在 `$VAULT` 根目录，必须归类到子文件夹中。
 
+**frontmatter 必填字段（写笔记前先确认，不要事后补）**：
+
+| 字段 | 要求 |
+|---|---|
+| `tags` | 3 个左右，给人导航用 |
+| `summary` | 一句话说清这篇解决了什么，**不少于 20 字**（过短会导致召回时退化为只显示文件名） |
+| `keywords` | **必填 3-8 个检索扩展词**，给机器召回用。写同义词 / 别名 / 中英术语 / 精确的技术名词（如 `MSYS 路径 mangle`、`ProductFlavor 门禁`），**不要写泛词**（「性能」「优化」「设计」会刷命中无关提问）。CJK 词 ≥2 字、ASCII 词 ≥3 字。内联写法：`keywords: [扩展词召回, 相关性打分, recall]` |
+
+> ⚠️ `keywords` 是 vault-loader 召回的**精确信号通路**，缺失会让这篇笔记在别人（和未来的你）提问时召不回来。完整规则见 `references/note-format.md`。
+
 **操作全部通过封装层 `scripts/obsidian_cli.py`**（详见 `references/obsidian-cli-ops.md`）：
 
 - 查重：`python3 .../obsidian_cli.py --vault "$VAULT" search --query "<关键词>"` → 读 JSON.data.paths

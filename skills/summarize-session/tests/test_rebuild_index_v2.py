@@ -430,3 +430,142 @@ def test_read_entry_no_keywords_field_absent(tmp_path):
     note.write_text("---\ntags: [t1]\nsummary: s\n---\n# 标题\n", encoding="utf-8")
     entry = _read_entry(vault, "b.md", 123)
     assert "keywords" not in entry
+
+
+def test_health_check_reports_keywords_missing():
+    """缺 keywords 的知识笔记应被统计；工作日志豁免。"""
+    from rebuild_index import _health_check
+    from pathlib import Path
+
+    entries = {
+        "技术笔记/a.md": {"category": "技术笔记", "keywords": ["扩展词召回", "recall"],
+                          "_has_frontmatter": True},
+        "技术笔记/b.md": {"category": "技术笔记", "_has_frontmatter": True},
+        "技术笔记/c.md": {"category": "技术笔记", "keywords": [], "_has_frontmatter": True},
+        "工作日志/2026年/07月/2026-07-21.md": {"category": "工作日志", "_has_frontmatter": True},
+    }
+    issues = _health_check(entries, Path("/nonexistent"), indexes_written=[])
+    missing = set(issues["keywords_missing"])
+    assert "技术笔记/b.md" in missing
+    assert "技术笔记/c.md" in missing
+    assert "技术笔记/a.md" not in missing
+    assert "工作日志/2026年/07月/2026-07-21.md" not in missing, "工作日志应豁免"
+
+
+def test_report_includes_keywords_missing_count(tmp_path):
+    """report 的 health_check 段必须含 keywords_missing 计数。"""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    vault = tmp_path / "V"
+    (vault / "技术笔记").mkdir(parents=True)
+    (vault / "技术笔记" / "x.md").write_text(
+        "---\ncategory: 技术笔记\nsummary: 测试笔记内容说明\n---\n正文", encoding="utf-8")
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "rebuild_index.py"
+    r = subprocess.run([sys.executable, str(script), "--vault", str(vault)],
+                       capture_output=True, text=True, encoding="utf-8")
+    report = json.loads(r.stdout.strip().splitlines()[-1])
+    assert "keywords_missing" in report["health_check"]
+    assert report["health_check"]["keywords_missing"] == 1
+
+
+def _build_worklog_heavy_vault(vault, n_worklogs, notes_with_kw, notes_missing_kw):
+    """构造「大量工作日志 + 少量技术笔记(部分缺 keywords)」的 Vault。
+
+    工作日志在 keywords 覆盖率统计中豁免(不进分子也不进分母);
+    技术笔记按 notes_with_kw/notes_missing_kw 划分是否带 keywords 字段。
+    """
+    wl_dir = vault / "工作日志"
+    wl_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(n_worklogs):
+        (wl_dir / "log{}.md".format(i)).write_text(
+            "---\ncategory: 工作日志\nsummary: 日常记录{}\n---\n正文".format(i),
+            encoding="utf-8")
+
+    note_dir = vault / "技术笔记"
+    note_dir.mkdir(parents=True, exist_ok=True)
+    idx = 0
+    for _ in range(notes_with_kw):
+        (note_dir / "has_kw_{}.md".format(idx)).write_text(
+            "---\ncategory: 技术笔记\nkeywords: [关键词{0}]\nsummary: 说明{0}\n---\n正文".format(idx),
+            encoding="utf-8")
+        idx += 1
+    for _ in range(notes_missing_kw):
+        (note_dir / "no_kw_{}.md".format(idx)).write_text(
+            "---\ncategory: 技术笔记\nsummary: 说明{0}\n---\n正文".format(idx),
+            encoding="utf-8")
+        idx += 1
+
+
+def _run_rebuild(vault):
+    import subprocess
+    import sys
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[1] / "scripts" / "rebuild_index.py"
+    return subprocess.run(
+        [sys.executable, str(script), "--vault", str(vault)],
+        capture_output=True, text=True, encoding="utf-8")
+
+
+def test_keywords_coverage_uses_applicable_denominator_not_total(tmp_path):
+    """反例(核心回归):工作日志远多于知识笔记、知识笔记多数缺 keywords 时,
+    keywords_coverage 必须反映「适用笔记(技术笔记)」内的真实覆盖率并触发告警。
+
+    构造:40 篇工作日志(豁免) + 10 篇技术笔记(2 篇有 keywords、8 篇缺)。
+      - 正确口径(分母=适用笔记 10): (10-8)*100//10 = 20% -> <80,应告警
+      - 错误口径(分母=total_notes 50,即修复前公式): (50-8)*100//50 = 84% -> >=80,不会告警
+    用修复前的公式跑本场景必然得到 84(不告警),与此断言矛盾 -> 该场景专门用于把公式错误炸出来。
+    """
+    import json
+
+    vault = tmp_path / "V"
+    vault.mkdir()
+    _build_worklog_heavy_vault(vault, n_worklogs=40, notes_with_kw=2, notes_missing_kw=8)
+
+    r = _run_rebuild(vault)
+    report = json.loads(r.stdout.strip().splitlines()[-1])
+
+    assert report["total_notes"] == 50
+    assert report["health_check"]["keywords_missing"] == 8
+    assert report["health_check"]["keywords_coverage"] == 20, (
+        "覆盖率应按适用笔记(10 篇技术笔记)计算为 20%,"
+        "而不是被 40 篇工作日志稀释成 (50-8)*100//50=84%")
+    assert "警告" in r.stderr, "真实覆盖率 20% < 80%,必须触发 stderr 告警"
+    assert "keywords 覆盖率" in r.stderr
+    assert "20%" in r.stderr
+    assert "8/10" in r.stderr, "告警文案应展示 缺失/适用 而非 缺失/总数"
+
+
+def test_keywords_coverage_high_no_warning(tmp_path):
+    """适用笔记 keywords 覆盖率 >=80% 时,stderr 不应出现覆盖率告警。"""
+    import json
+
+    vault = tmp_path / "V"
+    vault.mkdir()
+    # 5 篇工作日志(豁免) + 10 篇技术笔记,9 篇有 keywords -> 90% 覆盖率
+    _build_worklog_heavy_vault(vault, n_worklogs=5, notes_with_kw=9, notes_missing_kw=1)
+
+    r = _run_rebuild(vault)
+    report = json.loads(r.stdout.strip().splitlines()[-1])
+
+    assert report["health_check"]["keywords_coverage"] == 90
+    assert "keywords 覆盖率" not in r.stderr
+
+
+def test_keywords_coverage_none_when_no_applicable_notes(tmp_path):
+    """Vault 中全部是工作日志(无适用笔记)时,keywords_coverage 应为 None,不崩溃、不告警。"""
+    import json
+
+    vault = tmp_path / "V"
+    vault.mkdir()
+    _build_worklog_heavy_vault(vault, n_worklogs=5, notes_with_kw=0, notes_missing_kw=0)
+
+    r = _run_rebuild(vault)
+    assert r.returncode == 0
+    report = json.loads(r.stdout.strip().splitlines()[-1])
+
+    assert report["health_check"]["keywords_coverage"] is None
+    assert "keywords 覆盖率" not in r.stderr

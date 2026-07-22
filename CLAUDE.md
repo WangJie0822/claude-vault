@@ -75,7 +75,7 @@ cd skills/summarize-session && python -m pytest tests/
 python -m pytest packaging/test_build_plugin.py
 ```
 
-已实测：`tests/` 69、vault-loader 181、summarize-session 278 个用例可正常收集。
+已实测（2026-07-22 更新）：`tests/` 69、vault-loader **277 collected**（276 passed / 1 skipped）、summarize-session 278 个用例可正常收集（vault-loader 因召回质量四项组合修复由 181 增至 277，含 full-review 整改补的 tag-IDF gating 边界守卫与 gold delta 断言）。
 
 测试用 `monkeypatch` 隔离 HOME；Windows 上 `Path.home()` 取 `USERPROFILE` 而非 `HOME`，conftest 两者都 set（只 set HOME 在 Windows 无效）。
 

@@ -114,11 +114,32 @@ hook 通过一个 polyglot 包装脚本运行，按以下顺序探测 Python 解
 | 创建 `~/.claude/.vault-loader-disabled`（文件） | 持续生效直到删除该文件 |
 | 在 `~/.claude/skills/vault-loader/config.json` 中设 `enabled: false` | 永久生效直到改回 |
 
+### 定向回退（调节而非停用）
+
+若某次打分改动导致召回变差，可只回退**单项**而非停用整个 loader（改 `~/.claude/skills/vault-loader/config.json` 的 `relevance` 段）：
+
+| config 键 | 作用 |
+|---|---|
+| `relevance.use_tag_idf: false` | 关闭 tag-IDF 加权，tag 命中回到等权（数值等价旧行为） |
+| `relevance.use_keywords: false` | scorer 忽略 keywords 字段 |
+| `relevance.tag_idf_floor`（调高，如 `0.7`） | 减弱泛 tag 降权强度 |
+
+比整体停用代价小得多（不丢 SessionStart 项目上下文与 summarize-session 联动）。详见 vault-loader 的 SKILL.md 配置说明。
+
 ---
 
 ## 已知限制
 
 - **针对中文笔记工作流调优。** 目录名、frontmatter 字段和分类匹配都按中文优化。英文及其他语言用户的自动匹配准确度会下降（关键词提取、标签推断、分类路由可能漏掉很多笔记）。
+
+---
+
+### 0.5.0 行为变更（召回质量增强 + 安全修复）
+
+- **tag 命中改按 IDF 加权**：泛 tag（很多笔记共有）权重降低，精确信号更易胜出；`keywords` 命中权重从 3 提到 5。回退旧行为：config `relevance.use_tag_idf: false`、`scoring.prompt_keyword_hit: 3`。
+- **写端补齐 keywords 覆盖**：summarize-session 把 keywords 要求移进执行路径，rebuild_index 统计覆盖率并在过低时 stderr 告警。
+- **安全**：笔记路径解析收敛到带容器校验的单点，堵住 cache 中被篡改的越界 path 读到 Vault 外文件。
+- ⚠️ **存量用户升级须知**：已运行过旧版的用户，`config.json` 持久化的旧值会压制新默认，需手动把 `scoring.prompt_keyword_hit` 改为 `5`（或删 config 重建）。详见 [docs/MIGRATION.md](docs/MIGRATION.md)。
 
 ---
 

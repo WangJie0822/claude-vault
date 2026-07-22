@@ -400,6 +400,8 @@ def _health_check(entries: dict, vault: Path, indexes_written: list):
         'folder_subcat_missing': [], # 子目录下 subcategory 缺失
         'no_frontmatter': [],        # 完全无 frontmatter
         'stale_indexes': [],         # 磁盘上有但本次未写入的 INDEX
+        'keywords_missing': [],      # 缺 keywords 的知识笔记（工作日志豁免）
+        'keywords_applicable': [],   # keywords 统计口径的分母:与 keywords_missing 同豁免规则
     }
 
     for rel, entry in entries.items():
@@ -412,6 +414,16 @@ def _health_check(entries: dict, vault: Path, indexes_written: list):
         if not has_fm:
             issues['no_frontmatter'].append(rel)
             continue
+        # keywords 覆盖率：keywords 是 vault-loader 的精确召回信号通路，
+        # 缺失即该篇在提问时召不回来。工作日志是流水账非知识笔记，豁免。
+        # keywords_applicable 与 keywords_missing 用同一豁免条件(cat != '工作日志'),
+        # 保证覆盖率分子分母同口径——分母不豁免会被工作日志的天然存在持续稀释、掩盖真实缺口。
+        # 注：无 frontmatter 笔记已在上方 `if not has_fm: continue` 跳过，不进本分母
+        # （另计 no_frontmatter，避免双重计），故覆盖率分母 = 有 frontmatter 且非工作日志的知识笔记。
+        if cat != '工作日志':
+            issues['keywords_applicable'].append(rel)
+            if not (entry.get('keywords') or []):
+                issues['keywords_missing'].append(rel)
         if cat and '/' in cat:
             issues['category_with_slash'].append({'path': rel, 'category': cat})
         if proj:
@@ -805,6 +817,16 @@ def main():
         # 归档后重新跑诊断,stale_indexes 应为空
         final_issues = _health_check(entries, vault, index_files_written)
 
+    # keywords 覆盖率：分子分母必须同口径(均豁免工作日志),否则工作日志的天然存量
+    # 会持续稀释分母、把真实缺口摊薄到告警阈值以下(见 keywords_applicable 定义处注释)。
+    # 无适用笔记(纯工作日志 Vault)时覆盖率无意义,记 None 且不告警。
+    _kw_missing = len(final_issues.get('keywords_missing', []))
+    _kw_applicable = len(final_issues.get('keywords_applicable', []))
+    _kw_coverage = (
+        (_kw_applicable - _kw_missing) * 100 // _kw_applicable
+        if _kw_applicable else None
+    )
+
     # 9. 输出报告
     report = {
         'total_notes': len(entries),
@@ -823,12 +845,26 @@ def main():
             'unresolved_links': len(final_issues.get('unresolved_links', [])),
             'specplan_no_backlink_samples': final_issues.get('specplan_no_backlink', [])[:10],
             'unresolved_links_samples': final_issues.get('unresolved_links', [])[:10],
+            'keywords_missing': len(final_issues.get('keywords_missing', [])),
+            'keywords_missing_samples': final_issues.get('keywords_missing', [])[:10],
+            'keywords_coverage': _kw_coverage,
         },
     }
     if fix_report:
         report['fix_frontmatter'] = fix_report
     if archive_report:
         report['archive_stale_indexes'] = archive_report
+
+    # keywords 覆盖率告警：低覆盖意味着召回的精确信号通路是空的，
+    # 但这在正常流程里完全不可见，故主动提示（stderr，不影响 JSON 报告消费方）。
+    # 复用上面算好的 _kw_coverage,不重复计算。
+    if _kw_coverage is not None and _kw_coverage < 80:
+        print(
+            '警告: keywords 覆盖率仅 {}% ({}/{} 篇缺失)。'
+            'vault-loader 的精确召回通路依赖该字段；'
+            '可运行 enrich_keywords.py 回填存量。'.format(
+                _kw_coverage, _kw_missing, _kw_applicable),
+            file=sys.stderr)
     print(json.dumps(report, ensure_ascii=False))
 
 

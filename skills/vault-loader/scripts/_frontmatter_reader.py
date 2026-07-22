@@ -8,8 +8,10 @@ from pathlib import Path
 
 MAX_CACHE_BYTES = 10 * 1024 * 1024  # 10 MB 上限，超出视为异常膨胀
 CACHE_VERSION = 1  # 与写端（rebuild_index）保持对称；版本不符时静默丢弃旧 cache
-# 读端每篇 keyword 条数上限（纵深防御）：写端 sanitize 上限 8，此处留余量；防异常/恶意 cache
-# 单篇塞数千 keyword 令 O(N×M×K) 评分爆炸。
+# 读端每篇 keyword 条数上限（纵深防御）：防异常/恶意 cache 单篇塞数千 keyword 令
+# O(N×M×K) 评分爆炸。注：写端主路径（rebuild_index 读手写 frontmatter）不 sanitize、
+# 不 cap；仅可选 enrich_keywords.py 回填时 cap 8。故本上限 16 是手写 keywords 路径的
+# 唯一实际防线，非余量。
 MAX_KEYWORDS_PER_ENTRY = 16
 # F6 对称护栏：tags 与 keywords 同理，防异常/恶意 cache 单篇塞海量 tags 拖垮评分
 MAX_TAGS_PER_ENTRY = 32

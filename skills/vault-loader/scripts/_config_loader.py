@@ -44,7 +44,8 @@ DEFAULT_CONFIG: dict = {
         "mtime_recent_90d": 0.5,
         "prompt_tag_hit": 4,
         "prompt_summary_hit": 2,
-        "prompt_keyword_hit": 3,
+        "prompt_keyword_hit": 5,   # 3→5：keywords 是策展的精确召回信号，
+                                   # 必须能胜过泛 tag 命中（实测 keywords=3 时打不过 tag=4）
     },
 
     "keyword_to_tags": {},
@@ -89,6 +90,11 @@ DEFAULT_CONFIG: dict = {
         "relax_pure_cjk_single": True,      # 纯 CJK 单 token 放行触发点1（配合 relaxed 静默）
         # 第1层：召回池排除 tag（UPS+SessionStart 共用；[]=关闭；/vault 手动检索不受影响）
         "exclude_note_tags": ["archived"],
+        # tag-IDF：泛 tag（superpowers 覆盖 142/680）与 singleton tag 此前等权，
+        # 是噪声与漏召回同时发生的直接成因。use_tag_idf=false 为止血开关，
+        # 关闭后数值等价回到旧行为，不杀整个 loader。
+        "use_tag_idf": True,
+        "tag_idf_floor": 0.5,       # 泛 tag 的保底因子；0 会让泛 tag 归零、行为剧变
     },
 }
 

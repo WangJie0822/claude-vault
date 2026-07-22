@@ -37,6 +37,18 @@
 - **现有 vault**：插件默认 `vault_path` 为 `~/.claude/knowledge-vault`。若你要继续使用现有的 vault 目录，在 `~/.claude/skills/vault-loader/config.json` 把 `vault_path` 设为你的现有 vault 路径，并在 summarize-session config 把 `default_vault_path` 设为同一路径（两者需一致，启动时会自检告警）。
 - **frontmatter-cache**：现有的 `<vault>/.meta/frontmatter-cache.json` 若版本为 `_version: 1` 可直接复用；否则下次 `/summarize-session` 会重建。
 
+## ⚠️ 从旧版升级到「召回质量修复版」的须知（面向所有升级用户）
+
+本版本把 `scoring.prompt_keyword_hit` 默认值从 3 提到 5（让精确 keywords 命中能胜过泛 tag），并新增 tag-IDF 加权（`relevance.use_tag_idf`）。
+
+**但已运行过一次旧版的存量用户须注意**：你的 `~/.claude/skills/vault-loader/config.json` 已持久化旧值 `prompt_keyword_hit: 3`，升级后经 deep-merge **会压制新默认 5**；而同批新增的 `use_tag_idf` 作为**新键**会补默认 `true` 生效。净结果是「tag-IDF 收窄候选集、但 keywords 权重仍是 3」的**半套组合**，召回可能**不如修复前**。
+
+**`/plugin update` 不会修复这一点**（它不触碰用户态 `config.json`）。存量用户须二选一让修复完整生效：
+1. 删除 `~/.claude/skills/vault-loader/config.json` 让其按新默认重建（会丢失你的自定义配置，重建后需重新设置 `vault_path` 等）；
+2. 手动把该文件里 `scoring.prompt_keyword_hit` 改为 `5`。
+
+全新安装用户不受影响（config 按新默认生成）。上一条「config 无需搬动」是就**路径延续**而言，不含本次的默认值变更。
+
 ## 单源工作流（--plugin-dir）
 
 > **适用场景**：你希望直接从本地插件仓库加载插件，改动即生效，无需手动同步到 `~/.claude/skills/`。

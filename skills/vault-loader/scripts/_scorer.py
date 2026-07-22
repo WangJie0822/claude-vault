@@ -1,6 +1,7 @@
 """相关性评分函数。纯计算，不读 IO。"""
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -101,15 +102,65 @@ def has_keyword_hit(entry: Entry, prompt_keywords, use_keywords: bool = True) ->
     )
 
 
+def build_tag_df(entries) -> dict[str, int]:
+    """统计每个 tag（小写）覆盖的笔记数。entries 为 {path: Entry}。
+
+    数据全在 cache 内存里，无额外 IO；实测 ~1ms@1000 篇、~7ms@5000 篇
+    （线性 O(N·avg_tags)，封顶 MAX_TAGS=32）。
+    """
+    df: dict[str, int] = {}
+    for e in entries.values():
+        for t in set(t.lower() for t in e.tags):
+            df[t] = df.get(t, 0) + 1
+    return df
+
+
+def tag_idf_factor(tag: str, tag_df: dict, n_docs: int, floor: float = 0.5) -> float:
+    """tag 的 IDF 加权因子，值域 [floor, 1.0]。
+
+    泛 tag（如 superpowers 覆盖 142/680 篇）与 singleton tag 此前完全等权，
+    是「噪声」与「漏召回」同时发生的直接成因。这里按 IDF 降权，但**保底 floor**：
+    全归零会让大量原本 topical=6 的条目掉到 min_topical_score 以下被整体过滤，属行为剧变。
+    保底后**同时有 summary/keyword 命中**的泛 tag 条目仍可召回、只排在精确命中之后；
+    但**仅有泛 tag 命中**（无 summary/keyword）的孤 tag 条目会因降权后低于 min_topical
+    被候选闸门**有意剔除**（降噪）——即 tag-IDF 不只是重排序，它**改变了召回集**。
+    隐式耦合不变量：孤共享 tag 是否存活 ⇔ prompt_tag_hit × tag_idf_floor ≥ min_topical_score；
+    默认（4×0.5=2 < 4）下 df≥2 孤 tag 被剔除、仅 singleton（factor=1.0→4.0）存活。改
+    tag_idf_floor / min_topical_score / prompt_tag_hit 任一都会移动这条召回边界
+    （守卫见 tests/test_tag_idf.py::test_orphan_df2_tag_drops_below_gate）。
+    """
+    if not tag_df or n_docs <= 1:
+        return 1.0
+    df = tag_df.get(tag.lower(), 1)
+    if df <= 0:
+        return 1.0
+    # ln(1+N/df) / ln(1+N) → df=1 时为 1.0，df 越大越接近 0
+    idf_norm = math.log(1.0 + n_docs / df) / math.log(1.0 + n_docs)
+    idf_norm = max(0.0, min(1.0, idf_norm))
+    return floor + (1.0 - floor) * idf_norm
+
+
 def _prompt_topical_hits(entry: Entry, signals: Signals, weights: dict,
-                         use_keywords: bool = True) -> float:
+                         use_keywords: bool = True, tag_df=None,
+                         n_docs: int = 0, tag_idf_floor: float = 0.5) -> float:
     """prompt 关键词对 tag/summary/keywords 的话题命中分（去重 + 门控）。
-    score() 的 J 段与 topical_score() 共用此单点，消除重复、防漂移。"""
+    score() 的 J 段与 topical_score() 共用此单点，消除重复、防漂移。
+
+    tag_df 为 None 时数值等价保持旧行为（tag 命中拿满 prompt_tag_hit；注：factor=1.0
+    使返回 float 4.0 而非 int 4，`==` 成立故数值等价，非逐字节相同）；
+    传入 tag_df 时按 IDF 降权，多 tag 命中取 max 而非累加（防堆砌 tag 刷分）。
+    """
     if not signals.prompt_keywords:
         return 0
     total: float = 0
-    if any(_keyword_hits_tags(kw, entry) for kw in signals.prompt_keywords):
-        total += weights["prompt_tag_hit"]
+    hit_tags = [t for t in entry.tags
+                if any(_kw_in_text(kw, t) for kw in signals.prompt_keywords)]
+    if hit_tags:
+        if tag_df:
+            factor = max(tag_idf_factor(t, tag_df, n_docs, tag_idf_floor) for t in hit_tags)
+        else:
+            factor = 1.0
+        total += weights["prompt_tag_hit"] * factor
     if any(_keyword_hits_summary(kw, entry) for kw in signals.prompt_keywords):
         total += weights["prompt_summary_hit"]
     if has_keyword_hit(entry, signals.prompt_keywords, use_keywords):
@@ -118,7 +169,8 @@ def _prompt_topical_hits(entry: Entry, signals: Signals, weights: dict,
 
 
 def score(entry: Entry, signals: Signals, weights: dict,
-          use_keywords: bool = True) -> float:
+          use_keywords: bool = True, tag_df=None,
+          n_docs: int = 0, tag_idf_floor: float = 0.5) -> float:
     """计算单篇笔记的相关性分数。"""
     total: float = 0
 
@@ -150,21 +202,24 @@ def score(entry: Entry, signals: Signals, weights: dict,
             total += weights["mtime_recent_90d"]
 
     # J：UserPromptSubmit 模式追加（与 topical_score 共用 _prompt_topical_hits 单点）
-    total += _prompt_topical_hits(entry, signals, weights, use_keywords)
+    total += _prompt_topical_hits(entry, signals, weights, use_keywords,
+                                  tag_df, n_docs, tag_idf_floor)
 
     return total
 
 
 def topical_score(entry: Entry, signals: Signals, weights: dict,
-                  use_keywords: bool = True) -> float:
-    """仅 prompt 关键词的话题命中分（tag/summary/keywords），不含 context（target_tags/mtime）。
+                  use_keywords: bool = True, tag_df=None,
+                  n_docs: int = 0, tag_idf_floor: float = 0.5) -> float:
+    """仅 prompt 关键词的话题命中分（tag/summary/keywords），不含 context。
 
-    供精度闸门判定'真话题相关'用，与 score() 解耦。
-    默认权重（prompt_tag_hit=4 / prompt_summary_hit=2 / prompt_keyword_hit=3）下值域 {0,2,3,4,5,6,7,8,9}；
-    relevance 段阈值（min_topical_score / fulltext_topical_threshold / confidence_bands.high）默认值
-    假定该权重，改 scoring 权重需同步调阈值。
-    keywords 命中加 prompt_keyword_hit（去重 + 门控）。"""
-    return _prompt_topical_hits(entry, signals, weights, use_keywords)
+    值域：tag 命中 [prompt_tag_hit*floor, prompt_tag_hit] + summary + keywords。
+    默认权重（tag=4 / summary=2 / keywords=5、floor=0.5）下上界为 11。
+    relevance 段阈值（min_topical_score / fulltext_topical_threshold /
+    confidence_bands.high）假定该权重，改 scoring 权重需同步调阈值。
+    """
+    return _prompt_topical_hits(entry, signals, weights, use_keywords,
+                                tag_df, n_docs, tag_idf_floor)
 
 
 # ===== 第0层 §3.5：证据链合并 + 强证据档（纯计算，供 prompt_submit_load 门槛/置信） =====

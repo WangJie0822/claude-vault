@@ -318,15 +318,23 @@ def test_fulltext_upgrade_from_candidate(tmp_home: Path, tmp_vault: Path,
 
 def test_upgrade_candidate_not_primary_stays_visible(tmp_home: Path, tmp_vault: Path,
                                                      write_frontmatter_cache) -> None:
-    """reverse High#1 固化：两篇升级候选(topical=6)竞争，仅 total 高者升全文主候选；
-    total 低的升级候选仍在 rest 清单可见、不入 fulltext_paths（保留升级机会，不凭空消失）。"""
+    """reverse High#1 固化：两篇升级候选(topical≥6)竞争，仅 total 高者升全文主候选；
+    total 低的升级候选仍在 rest 清单可见、不入 fulltext_paths（保留升级机会，不凭空消失）。
+
+    Task 8 起 tag 命中按 IDF 加权：本 fixture 语料仅 2 篇且共享 hook/skill 两个 tag，
+    IDF 会判定其"广泛"而降权（df=2/n_docs=2），仅靠 tag+summary 已不足以过
+    fulltext_topical_threshold=6。故补充 keywords 命中（不受 tag-IDF 影响的独立信号）
+    把两篇 topical 都推回远高于 6，保持本测试原本要验证的"total 高者夺主候选"语义不变
+    ——这不是在弱化断言，是让 fixture 语料摆脱 tag-IDF 在极小语料下的边界失真。"""
     from scripts._state import save_injected, load_fulltext_injected
     write_frontmatter_cache({
         "技术笔记/a.md": {"tags": ["hook", "skill"],
                          "summary": "hook 的实现说明详述与背景介绍文档资料",
+                         "keywords": ["implementation"],
                          "mtime": 1900000000},   # 未来 mtime → +1 → total 更高 → 夺主候选
         "技术笔记/b.md": {"tags": ["hook", "skill"],
                          "summary": "hook 的另一实现说明详述与背景资料",
+                         "keywords": ["implementation"],
                          "mtime": 1262304000},   # 2010 → mtime 加成 0 → total 低
     })
     (tmp_vault / "技术笔记").mkdir()
@@ -756,6 +764,43 @@ def test_exclude_note_tags_empty_disables_filter(tmp_home: Path, tmp_vault: Path
     r = _run(Path("/tmp"), "gradle 构建配置调优")
     d = _parse(r); assert d is not None
     assert "spec-x.md" in d["hookSpecificOutput"]["additionalContext"]
+
+
+# ---------------------------------------------------------------------------
+# Task 8 review Finding 2：tag-IDF 止血开关端到端集成
+# ---------------------------------------------------------------------------
+
+def test_use_tag_idf_false_restores_legacy_weight_end_to_end(
+        tmp_home: Path, tmp_vault: Path, write_frontmatter_cache) -> None:
+    """止血开关端到端：relevance.use_tag_idf=false 时，只命中泛 tag 的笔记应恢复旧的
+    满权重（topical=4=min_topical_score）过闸候选注入；默认 true 时同一语料因 tag-IDF
+    降权跌破 min_topical_score(4) 被过滤、不注入。二者行为不同——证明 `rel_cfg.get
+    ("use_tag_idf")` 这条配置读取路径真的被走到、真的到达 build_tag_df 的调用/跳过分支
+    （而非只在 _scorer 函数级验证过默认参数，如 test_tag_idf.py::
+    test_tag_df_none_preserves_legacy_behavior 那样）。
+
+    实测核对（本机 py 脚本，同权重/同语料）：topical ON≈2.30（<4 被过滤）、
+    topical OFF=4.0（=4 过闸）。"""
+    entries = {}
+    for i in range(100):
+        entries[f"技术笔记/broad{i}.md"] = {
+            "tags": ["broad"], "summary": "无关内容占位摘要不含查询词", "mtime": 1900000000,
+        }
+    write_frontmatter_cache(entries)
+
+    # tag-IDF 开启（默认）：df=100/n_docs=100 泛 tag 被降权，topical<min_topical_score(4)
+    # → 全被过滤 → 静默（关 fallback_hint 排除兜底提示对 stdout 的干扰）
+    _write_cfg(tmp_home, tmp_vault, relevance={"fallback_hint": False})
+    r_on = _run(Path("/tmp"), "broad zzzqqq")
+    assert r_on.stdout.strip() == "", f"tag-IDF 开启时应被过滤为静默，实际：{r_on.stdout}"
+
+    # tag-IDF 关闭：factor 恢复 1.0，topical=4=min_topical_score → 过闸、正常注入候选清单
+    _write_cfg(tmp_home, tmp_vault, relevance={"fallback_hint": False, "use_tag_idf": False})
+    r_off = _run(Path("/tmp"), "broad zzzqqq")
+    d = _parse(r_off)
+    assert d is not None, f"tag-IDF 关闭后应恢复满权重过闸注入，实际无输出（stderr={r_off.stderr}）"
+    ac = d["hookSpecificOutput"]["additionalContext"]
+    assert any(f"broad{i}.md" in ac for i in range(100)), ac
 
 
 def test_fallback_cooldown_suppresses_second_hint(tmp_home: Path, tmp_vault: Path,
