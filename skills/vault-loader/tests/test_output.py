@@ -57,6 +57,20 @@ def test_sanitize_keeps_tab_newline():
     assert sanitize_for_display("a\tb\nc") == "a\tb\nc"
 
 
+def test_sanitize_strips_full_c1_range():
+    """显示侧必须剥**完整** C1（\\x80-\\x9f），不能只剥 \\x9b。
+
+    C1 是否可被终端解释取决于输出编码：stdout 为 UTF-8 时它们编码成 2 字节（首字节 0xc2）
+    不构成向量；但 8-bit locale 下编码成裸单字节，0x9b=CSI / 0x9d=OSC / 0x90=DCS /
+    0x9e=PM / 0x9f=APC 全是有效转义引导符。守卫按完整范围断言，杜绝退回「只剥 CSI」。
+    """
+    for cp in range(0x80, 0xA0):
+        ch = chr(cp)
+        assert ch not in sanitize_for_display(f"前{ch}后"), f"U+{cp:04X} 未被剥离"
+    # 正常可见字符不受影响（边界两侧各取一个）
+    assert sanitize_for_display("\x7e中文\xa0") == "\x7e中文\xa0"
+
+
 def test_approx_size():
     assert approx_size_str("x" * 420) == "~420 字"
     assert approx_size_str("x" * 3200) == "~3.2k 字"
@@ -69,3 +83,41 @@ def test_emit_sanitizes_system_message(monkeypatch):
     d = json.loads(buf.getvalue())
     assert "\x1b" not in d["systemMessage"] and "\x07" not in d["systemMessage"]  # 兜底清洗
     assert "\x1b" in d["hookSpecificOutput"]["additionalContext"]                  # additionalContext 逐字保留
+
+
+def test_emit_is_single_shot(monkeypatch):
+    """emit 只允许写出一个 JSON 文档；第二次调用必须被拦下。
+
+    hook stdout 的契约是「一次进程执行产出一个 JSON 文档」。emit 是裸
+    sys.stdout.write(json.dumps(...))，调用两次就是两段拼接 JSON——Claude Code 侧
+    会因 JSON.parse 失败而把**整个原始 stdout**当 plainText 推进模型上下文，
+    使 systemMessage 里未经注入侧净化的 vault 派生文本绕过隔离声明。
+    """
+    import io
+    from scripts import _output
+
+    buf = io.StringIO()
+    monkeypatch.setattr(_output.sys, "stdout", buf)
+
+    _output.emit(None, "第一条", "UserPromptSubmit")
+    _output.emit("正文", "第二条", "UserPromptSubmit")     # 必须被拦
+
+    raw = buf.getvalue()
+    parsed = json.loads(raw)                               # 拦不住则 Extra data
+    assert parsed == {"systemMessage": "第一条"}, f"第二次 emit 未被拦下：{raw!r}"
+
+
+def test_emit_guard_resets_between_tests():
+    """守卫可被显式重置——否则同进程内的后续用例会拿到空 stdout 的假失败。"""
+    import io
+    from scripts import _output
+
+    _output.reset_emit_guard()
+    buf = io.StringIO()
+    old = _output.sys.stdout
+    try:
+        _output.sys.stdout = buf
+        _output.emit(None, "重置后仍可写", "SessionStart")
+    finally:
+        _output.sys.stdout = old
+    assert json.loads(buf.getvalue()) == {"systemMessage": "重置后仍可写"}

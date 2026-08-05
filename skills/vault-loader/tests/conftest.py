@@ -10,6 +10,21 @@ from typing import Callable
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_emit_guard():
+    """每个用例前重置 emit 的单次写出守卫。
+
+    生产上一个 hook 进程只跑一次 main()、只 emit 一次，守卫置位后不需要复位；
+    但单测在**同一进程**内会跨用例反复调用 emit，不复位的话第二个用例起就被守卫
+    静默拦掉，表现为「stdout 空」的假失败。
+    """
+    from scripts._output import reset_emit_guard
+
+    reset_emit_guard()
+    yield
+    reset_emit_guard()
+
+
 @pytest.fixture
 def tmp_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """临时 HOME，自动隔离 ~/.claude 和 ~/Vault。"""

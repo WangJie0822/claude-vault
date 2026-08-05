@@ -7,7 +7,7 @@
 __pycache__）。本守卫扫描所有分发的 skill markdown，命中即 fail，防止此类
 死路径回归。
 
-捕获两类死路径形式：
+捕获三类死路径形式：
 1. **退役源绝对路径** `~/.claude/skills/<skill>/scripts/`（含 `$HOME` 写法）——
    只锚定 `.../scripts/` 子路径，runtime 态引用（如 config.json，
    不含 `/scripts/`）天然不触发；cache-glob 定位器
@@ -15,6 +15,12 @@ __pycache__）。本守卫扫描所有分发的 skill markdown，命中即 fail�
    `.claude/skills/`）也不触发。
 2. **相对脚本调用** `python3 scripts/X.py`——假设 cwd 是脚本目录（cwd 不保证，
    在错误 cwd 跑必失败）。分发 skill 文档应统一用 cache-glob 定位器 `$SS`。
+3. **`cd` 进退役源 skill 目录** `cd ~/.claude/skills/<skill>`——不含 `/scripts/`，
+   形式 1 结构上不可能命中，需独立一条。这是实际发生过的回归：SKILL.md 的验收命令
+   曾写 `cd ~/.claude/skills/vault-loader && python3 -m pytest`，而该目录插件化后
+   只剩 runtime 态 `config.json`（31 字节），逐字执行收集不到任何用例、静默出 0 个测试。
+   `cd` 之后接什么命令都建立在错误前提上，故直接钉 `cd` 本身。
+   仅 `ls`/`cat` 该目录不触发——文档说明「那里只剩 config.json」是合法用途。
 
 约定：
 - 扫描范围限定 `skills/**/*.md`：不扫 docs/（MIGRATION.md 故意保留旧路径作迁移
@@ -38,6 +44,9 @@ _DEAD_SCRIPT_PATH = re.compile(r"(?:~|\$HOME)/\.claude/skills/[^/\s]+/scripts/")
 # 形式 2——相对脚本调用：`python3 scripts/X.py` / `python scripts/X.py`（假设 cwd
 # 是脚本目录，cwd 不保证）。不与 cache-glob 定位器 `python3 "$SS/X.py"` 冲突。
 _REL_SCRIPT_CALL = re.compile(r"\bpython3?\s+scripts/")
+# 形式 3——`cd` 进退役源 skill 目录：`cd ~/.claude/skills/<skill>`。末尾不锚定 `/scripts/`，
+# 所以形式 1 覆盖不到；只钉 `cd`，`ls`/`cat` 该目录（说明其已退役）仍合法。
+_DEAD_SKILL_CD = re.compile(r"\bcd\s+(?:~|\$HOME)/\.claude/skills/[^/\s]+")
 
 
 def _scan_md_files() -> list[Path]:
@@ -52,17 +61,47 @@ def test_no_retired_source_script_paths_in_skill_docs():
         rel = md.relative_to(ROOT).as_posix()
         text = md.read_text(encoding="utf-8", errors="replace")
         for lineno, line in enumerate(text.splitlines(), 1):
-            if _DEAD_SCRIPT_PATH.search(line) or _REL_SCRIPT_CALL.search(line):
+            if (_DEAD_SCRIPT_PATH.search(line)
+                    or _REL_SCRIPT_CALL.search(line)
+                    or _DEAD_SKILL_CD.search(line)):
                 violations.append(f"{rel}:{lineno}: {line.strip()[:120]}")
 
     assert not violations, (
-        "分发 skill 文档引用了退役源脚本目录 `~/.claude/skills/<x>/scripts/`"
-        "（插件化后该目录只剩 __pycache__，LLM 执行必 No such file）。"
+        "分发 skill 文档引用了退役源 skill 目录 `~/.claude/skills/<x>/`"
+        "（插件化后那里只剩 runtime 态 config.json，脚本执行必 No such file、"
+        "`cd` 进去跑 pytest 收集不到用例）。"
         "请改用 cache-glob 定位器 `SS=$(ls -d "
         "~/.claude/plugins/cache/*/claude-vault/*/skills/<skill>/scripts "
         "2>/dev/null | sort -V | tail -1)` + `python3 \"$SS/X.py\"`。\n命中：\n"
         + "\n".join(violations)
     )
+
+
+def test_patterns_actually_match_known_regressions():
+    """自证：三条正则对**真实发生过**的回归形式都命中，且不误伤正确写法。
+
+    没有这一条，正则写错（例如改坏成永不匹配）会让上面的扫描永远绿——
+    「测试存在」不等于「守卫有效」。
+    """
+    must_hit = [
+        ("python3 ~/.claude/skills/vault-loader/scripts/rebuild_index.py", _DEAD_SCRIPT_PATH),
+        ("$HOME/.claude/skills/summarize-session/scripts/x.py", _DEAD_SCRIPT_PATH),
+        ("python3 scripts/rebuild_index.py", _REL_SCRIPT_CALL),
+        ("cd ~/.claude/skills/vault-loader && python3 -m pytest", _DEAD_SKILL_CD),
+    ]
+    for line, pat in must_hit:
+        assert pat.search(line), f"正则失效，未命中已知回归形式：{line}"
+
+    # 正确写法与合法用途不得误报
+    must_not_hit = [
+        'SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts '
+        '2>/dev/null | sort -V | tail -1)',
+        'python3 "$SS/rebuild_index.py"',
+        "ls -la ~/.claude/skills/vault-loader/   # 那里只剩 runtime 态 config.json",
+    ]
+    for line in must_not_hit:
+        for pat in (_DEAD_SCRIPT_PATH, _REL_SCRIPT_CALL, _DEAD_SKILL_CD):
+            assert not pat.search(line), f"误报：/{pat.pattern}/ 命中了正确写法 {line}"
 
 
 def test_scan_actually_covers_known_files():

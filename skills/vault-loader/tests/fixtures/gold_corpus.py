@@ -5,7 +5,14 @@
 tag 幂律分布（少数泛 tag 覆盖大量笔记 + 大量 singleton tag）、代码块噪声、
 CJK bigram 碎片、时效差异。
 
-**四类干扰项**（每类对应四维评审实测到的真实病理）：
+**全合成不变量同样覆盖 NEGATIVE_QUERIES 与 D5**（分别见本文件末尾、`build_gold_corpus`
+内 D5 构造段）：负查询句子、D5 复合术语均为构造产物，不得复制任何真实 prompt 片段，
+仅词频分布对齐生产病理（「修改/显示/字段/一致/提交」等停用表拦不住的高频实词 +
+跨词界 bigram 碎片源）——用于 false-injection-rate 守卫（见 tests/test_false_injection.py），
+验证语料中存在「内嵌高频实词的无关复合术语」时闸门是否会被撑过精度阈值放行。
+
+**五类干扰项**（D1~D4 对应四维评审实测到的真实病理；D5 为 fix round 1 补入，
+对应 false-injection-rate 守卫评审 C1）：
   D1 泛 tag 干扰   —— 打高频 tag 但内容无关（真实 Vault: superpowers 142 篇 / Windows 45 篇）。
                     必须有查询命中 BROAD_TAGS 才能让这 80 篇真正参与排序竞争（见下方
                     query 列表末尾两条「superpowers 流程」「plan 文档」query，评审 Finding 1）——
@@ -22,6 +29,12 @@ CJK bigram 碎片、时效差异。
                     D4 现无实际消费者。若未来消费方改用含 mtime 的 `score()` 路径，或需要 D4 真正
                     生效，必须由调用方注入可控时钟（而非在本模块引入 `time.time()`——那会破坏
                     本语料「两次调用 `build_gold_corpus()` 产物完全一致」的确定性硬约束）。
+  D5 复合术语内嵌泛词 —— 8 篇笔记的 tags/keywords 含内嵌高频实词的无关复合术语
+                    （真实 Vault R2 旁路实例：「字段」⊂ keywords「病历字段」），镜像
+                    CJK 子串匹配（非分词）下「泛词作为复合术语子串」误放行的病理，供
+                    tests/test_false_injection.py 的 false-injection-rate 基线测出真实
+                    压力（而非负查询在语料里天然零信号的假 0）。与 23 条正查询关键词
+                    集合零交集（已用脚本核对全字段），不参与排序基线竞争。
 """
 from __future__ import annotations
 
@@ -116,6 +129,36 @@ def build_gold_corpus() -> tuple[list[Entry], list[GoldQuery]]:
     corpus.append(_entry("主题/timeliness-new-low.md", ["时效测试"],
                          "时效测试主题的一句话备忘", age_days=1))
 
+    # ---- D5 复合术语内嵌泛词干扰（fix round 1，评审 C1）：镜像生产 R2 旁路病理 ----
+    # 病理形态：CJK 关键词走子串匹配（_kw_in_text），负查询里的高频实词（字段/一致/
+    # 显示/颜色/修改/提交）作为「复合术语」的子串出现在笔记 tags/keywords 里时，即使
+    # 笔记主题与负查询完全无关，也会被 has_keyword_hit/tag 命中判定为「话题相关」而放行
+    # ——真实 Vault 实例：「字段」⊂ keywords「病历字段」、「一致」⊂ keywords「金额一致性」。
+    # D1~D4 干扰项的措辞均不含这几个高频实词，故 fix round 1 之前 test_false_injection.py
+    # 的基线是「无压力测出的 0」而非「闸门真扛住了压力」（reviewer 探针：min_topical 放松到
+    # 2 时 7/8 条查询仍无变化）。D5 逐条按真实 df 比例植入这些实词的复合术语（每词 2 处
+    # 出现面，8 篇覆盖 字段/一致/显示 各 2 篇 + 颜色/修改/提交 各 1 篇合并态），使基线转为
+    # 「测出真实病理压力」的非零值。**已用脚本核对**（fix round 1 实测）：D5 全部 8 条术语
+    # 与 23 条正查询提取的关键词集合零交集（含 tags/summary/keywords 全字段扫描），不侵入
+    # 排序基线（test_gold_ranking.py 三项基线、test_gold_corpus.py D1 计数不受影响）。
+    # ⚠️ D5 是 false-injection 基线（26）的**唯一**压力来源：整组移除后基线掉到 0，
+    # 而 test_false_injection.py 的上界断言 `total <= 26` 仍会全绿（fix 批 C 实测）。
+    # 故改动本组（篇数、tags/keywords 里的复合术语）前先看
+    # tests/test_false_injection.py 的 MIN_D5_ENTRIES / D5_PRESSURE_WORD_FACES，
+    # 那三条结构守卫会钉住这里的形态；NEGATIVE_QUERIES 同理（MIN_NEGATIVE_QUERIES）。
+    d5_specs = [
+        ("干扰/d5-01.md", ["D5-病历维护"], "病历系统模块的一次常规维护记录", ["病历字段维护"]),
+        ("干扰/d5-02.md", ["D5-财务对账"], "账目核对模块的一次功能验证记录", ["金额一致性校验"]),
+        ("干扰/d5-03.md", ["报销显示逻辑"], "报销单据模块的一次功能梳理记录", []),
+        ("干扰/d5-04.md", ["D5-UI状态"], "界面主题状态模块的一次配置调整记录", ["颜色修改状态核对"]),
+        ("干扰/d5-05.md", ["D5-变更管理"], "常规变更管理模块的一次操作记录", ["变更提交记录"]),
+        ("干扰/d5-06.md", ["D5-表单引擎"], "表单引擎模块的一次校验规则说明", ["表单字段核对规则"]),
+        ("干扰/d5-07.md", ["表格显示样式"], "数据展示模块的一次样式梳理记录", []),
+        ("干扰/d5-08.md", ["D5-跨部门协作"], "跨部门核对工作的一次常规记录", ["跨部门一致性核对"]),
+    ]
+    for path, tags, summ, kws in d5_specs:
+        corpus.append(_entry(path, tags, summ, kws, age_days=15))
+
     # ---- 补足到 200+ 篇的背景噪声 ----
     for i in range(60):
         corpus.append(_entry(f"背景/bg-{i:03d}.md", [f"bgtag-{i}"],
@@ -169,3 +212,20 @@ def build_gold_corpus() -> tuple[list[Entry], list[GoldQuery]]:
                   {"主题/worktree-idx-high.md": 2, "主题/worktree-idx-mid.md": 1}),
     ]
     return corpus, queries
+
+
+# 任务指令型负查询：语料中不存在相关笔记，期望零注入或极少注入。
+# 全合成不变量：句子为构造产物，仅词频分布对齐生产病理（修改/显示/字段/一致/提交 等
+# 停用表拦不住的高频实词 + 跨词界 bigram 碎片源）。
+# ⚠️ 条数是 false-injection 总数的直接乘数（实测截到 1 条时基线由 26 掉到 6，上界断言
+# 仍全绿）。删改前先看 tests/test_false_injection.py 的 MIN_NEGATIVE_QUERIES 守卫。
+NEGATIVE_QUERIES = [
+    "把标题行的显示颜色改成蓝色，字段顺序调一下再提交",
+    "第一行和第二行的间距不一致，修改后统一显示",
+    "删掉这个字段后面的空格，然后把修改提交上去",
+    "界面上这一块的显示位置往下移动一点",
+    "把这三个文件的名字改成一致的格式",
+    "表格第二列宽度调大，显示不全的部分省略",
+    "按钮颜色改深一点，点击后的状态也要一致",
+    "把注释里的错别字修改掉重新提交一次",
+]

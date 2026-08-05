@@ -7,3 +7,12 @@ config.json
 *.log
 docs/superpowers/
 packaging/
+# subagent-driven 开发的 task 简报 / 多维评审草稿：本地开发产物，含源机路径与私人引用。
+# CLAUDE.md 早已声明二者不分发，但此前 `.superpowers/` 实际未被任何 gitignore 规则覆盖
+# （唯一保护是 superpowers 工具自己写的 `.superpowers/sdd/.gitignore`，只覆盖一层），
+# `.full-review/` 则只被 per-clone 的 `.git/info/exclude` 挡着、新 clone 完全没有。
+.superpowers/
+.full-review/
+# git worktree 的物理目录（EnterWorktree 默认落在这里）：纯运行时产物，且里面是另一份
+# 完整工作树，误 add 会把整个仓库副本连同其 .full-review/.superpowers 一起提交进来。
+.claude/

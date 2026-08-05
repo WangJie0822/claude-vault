@@ -77,19 +77,23 @@ def save_injected(
     p = state_path_for_cwd(cwd)
     p.parent.mkdir(parents=True, exist_ok=True)
 
+    existing: dict = {}
     existing_paths: set[str] = set()
     existing_fulltext: set[str] = set()
-    existing_fallback_ts: float = 0.0
     if p.exists():
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            old_paths = data.get("paths", [])
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            # isinstance 守卫：旧代码直接 loaded.get(...)，state.json 内容若是数组会抛
+            # AttributeError，而它不在下面的 except 元组里，异常一路冒到 hook 顶层兜底、
+            # 本轮 state 静默丢失。
+            if isinstance(loaded, dict):
+                existing = loaded
+            old_paths = existing.get("paths", [])
             if isinstance(old_paths, list):
                 existing_paths = {x for x in old_paths if isinstance(x, str)}
-            old_ft = data.get("fulltext_paths", [])
+            old_ft = existing.get("fulltext_paths", [])
             if isinstance(old_ft, list):
                 existing_fulltext = {x for x in old_ft if isinstance(x, str)}
-            existing_fallback_ts = data.get("fallback_ts", 0)
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -98,16 +102,26 @@ def save_injected(
 
     merged_ft = sorted(existing_fulltext | new_ft)
     merged_paths = sorted(existing_paths | new_paths | new_ft)  # 不变量：paths ⊇ fulltext
-    payload = {
+    # 读-改-写：保留本函数不认识的键。旧实现从零构造 payload、只显式搬运 fallback_ts，
+    # 于是任何其他写入方新增的字段（如诊断冷却 diag_ts）会在下一次成功注入时被静默抹掉
+    # ——冷却窗口归零、提示每轮重发。与 save_fallback_ts 的写法对齐。
+    payload = dict(existing)
+    payload.update({
         "timestamp": time.time(),
         "paths": merged_paths,
         "fulltext_paths": merged_ft,
-        "fallback_ts": existing_fallback_ts,
-    }
+    })
+    payload.setdefault("fallback_ts", 0)
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
     if len(merged_paths) > MAX_STATE_PATHS or len(serialized.encode("utf-8")) > TRIM_STATE_BYTES:
         # 写端护栏：撞读端 100KB 上限前主动裁剪为「本轮注入 ∪ 全部已知全文」重置
         # （fulltext 集小且最值得保留——防同篇全文重注）
+        # OBS-8：此前完全静默——去重集被丢弃，用户会看到已注入过的笔记再次注入却无从知情。
+        print(
+            f"[vault-loader] state.json 达上限（{len(merged_paths)} paths），"
+            f"去重集已裁剪为本轮注入 ∪ 已知全文",
+            file=sys.stderr,
+        )
         merged_ft = sorted(existing_fulltext | new_ft)
         merged_paths = sorted(new_paths | set(merged_ft))
         payload["paths"] = merged_paths
@@ -123,6 +137,10 @@ def load_fallback_ts(cwd: Path) -> float:
         return 0.0
     try:
         if p.stat().st_size > MAX_STATE_BYTES:
+            # OBS-8：与 _load_path_field:36-38 的同一条件行为对齐——那边打 stderr、
+            # 这边此前静默，同一个超限的 state 文件会得到两种待遇。诊断通道建成后
+            # 这两处应一并改走 notify。
+            print("[vault-loader] state.json 异常膨胀，兜底冷却按未提示处理", file=sys.stderr)
             return 0.0
         data = json.loads(p.read_text(encoding="utf-8"))
         ts = data.get("fallback_ts", 0) if isinstance(data, dict) else 0
@@ -155,3 +173,68 @@ def save_fallback_ts(cwd: Path) -> None:
     data.setdefault("paths", [])
     data.setdefault("fulltext_paths", [])
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ── 诊断冷却（按 code 分别计） ────────────────────────────────────────────────
+#
+# 为什么不复用 fallback_ts：它是**标量**，且已被「本轮未匹配到强相关笔记」的兜底提示
+# 占用（prompt_submit_load 用它 gate、用它写）。共用会让二者互相压制——一条失效诊断
+# 能把兜底提示静默满 TTL，反之亦然。诊断按 code 分表存，互不干扰。
+#
+# 本组函数依赖 save_injected 的「读-改-写保留未知键」语义：否则每次成功注入都会把
+# diag_ts 整个抹掉，冷却窗口归零、诊断每轮重发。
+
+def load_diag_ts(cwd: Path) -> dict[str, float]:
+    """读诊断冷却表 `{code: ts}`；缺失/损坏/超限 → 空表（等效允许提示，fail-open）。"""
+    p = state_path_for_cwd(cwd)
+    if not p.exists():
+        return {}
+    try:
+        if p.stat().st_size > MAX_STATE_BYTES:
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        table = data.get("diag_ts", {})
+        if not isinstance(table, dict):
+            return {}
+        return {k: float(v) for k, v in table.items()
+                if isinstance(k, str) and isinstance(v, (int, float))}
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+
+
+def diag_cooldown_expired(cwd: Path, code: str, ttl_hours: int) -> bool:
+    """该条诊断是否已过冷却窗口（缺失即视为已过期 → 允许提示）。"""
+    return time.time() - load_diag_ts(cwd).get(code, 0.0) > ttl_hours * 3600
+
+
+def save_diag_ts(cwd: Path, codes: list[str]) -> None:
+    """记录这些诊断的提示时间。读-改-写，不动其余字段（同 save_fallback_ts）——
+    尤其不得刷新 paths 的 timestamp，否则会变相续命注入去重 TTL。"""
+    if not codes:
+        return
+    p = state_path_for_cwd(cwd)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {}
+    if p.exists():
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (json.JSONDecodeError, OSError):
+            pass
+    table = data.get("diag_ts")
+    if not isinstance(table, dict):
+        table = {}
+    now = time.time()
+    for code in codes:
+        table[code] = now
+    data["diag_ts"] = table
+    data.setdefault("timestamp", 0)
+    data.setdefault("paths", [])
+    data.setdefault("fulltext_paths", [])
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass  # fail-open：冷却写不下去只会让诊断多出现一次，不能因此中断 hook

@@ -18,18 +18,51 @@ def _config_path(home: Path) -> Path:
 
 
 def test_missing_file_returns_default_and_writes(tmp_home: Path) -> None:
+    """P0 升级链治理（spec §8.1）：缺失时不再把全量 DEFAULT_CONFIG 写盘（会让默认值
+    演进对物化窗口用户永久失效），改写最小占位；但 load_config 返回值仍是完整
+    merge 后 dict，且不得残留 `_config_version`/`_comment` 杂键。"""
     cfg_path = _config_path(tmp_home)
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     assert not cfg_path.exists()
 
     cfg = load_config(cfg_path)
 
+    # 返回值仍等于 DEFAULT 合并结果（结构不变）
     assert cfg["enabled"] is True
     assert cfg["session_start"]["max_notes"] == 5
     assert cfg["session_start"]["max_commits"] == 5
     assert cfg["session_start"]["include_tag_matched_notes"] is True
     assert cfg["user_prompt_submit"]["fulltext_threshold"] == 10
-    assert cfg_path.exists(), "缺失时应自动写出默认配置"
+    assert cfg_path.exists(), "缺失时应自动写出配置占位"
+    assert cfg == DEFAULT_CONFIG, "load_config 返回值应仍等于 DEFAULT 合并结果"
+    assert "_config_version" not in cfg, "返回 dict 不得含内部标记键"
+    assert "_comment" not in cfg
+
+    # 盘上文件应为最小占位，而非全量 DEFAULT_CONFIG——默认值演进才能对新用户即时生效
+    on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert on_disk.get("_config_version") == 1
+    assert "_comment" in on_disk
+    assert "enabled" not in on_disk, "首跑不应把全量默认写盘，否则默认值演进对旧用户静默失效"
+    assert "session_start" not in on_disk
+    assert "scoring" not in on_disk
+    assert "relevance" not in on_disk
+
+
+def test_minimal_stub_on_disk_merges_back_to_full_default(tmp_home: Path) -> None:
+    """新格式盘上文件（仅含 _config_version/_comment 占位）经 merge 应还原为完整
+    默认值，且返回 dict 不得残留 _config_version/_comment 杂键（边界自查）。"""
+    cfg_path = _config_path(tmp_home)
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({
+        "_config_version": 1,
+        "_comment": "完整可配键见 SKILL.md；默认值随版本演进自动生效，显式写入的键才会覆盖默认",
+    }, ensure_ascii=False), encoding="utf-8")
+
+    cfg = load_config(cfg_path)
+
+    assert cfg == DEFAULT_CONFIG
+    assert "_config_version" not in cfg
+    assert "_comment" not in cfg
 
 
 def test_full_override(tmp_home: Path) -> None:
@@ -57,6 +90,30 @@ def test_corrupted_json_returns_default_keeps_file(tmp_home: Path) -> None:
 
     assert cfg == DEFAULT_CONFIG
     assert cfg_path.read_text() == "{not valid json", "损坏文件不得被覆盖"
+
+
+def test_bom_config_is_parsed_not_silently_discarded(tmp_home: Path) -> None:
+    """UTF-8 BOM 不得让整份 config 被静默丢弃（P4-3）。
+
+    PowerShell 5.1 的 `Out-File -Encoding utf8` 与多个编辑器默认写出带 BOM 的 UTF-8，
+    Windows 上是真实路径。读取端用 `utf-8` 解码会把 BOM 留在首字符 → json 解析失败 →
+    走 except 分支回退**全默认**，`vault_path` 一并丢失，vault-loader 转去读不存在的
+    默认 vault，唯一信号是用户看不到的一行 stderr。`utf-8-sig` 对无 BOM 输入同样正确。
+    """
+    cfg_path = _config_path(tmp_home)
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({
+        "vault_path": "/my/vault",
+        "relevance": {"min_topical_score": 9},
+    }, ensure_ascii=False), encoding="utf-8-sig")
+    assert cfg_path.read_bytes().startswith(b"\xef\xbb\xbf"), "前置条件：文件确实带 BOM"
+
+    cfg = load_config(cfg_path)
+
+    assert cfg["vault_path"] == "/my/vault", "带 BOM 时用户 vault_path 不得被静默丢弃"
+    assert cfg["relevance"]["min_topical_score"] == 9, "带 BOM 时用户调参不得被静默丢弃"
+    # 未覆盖字段仍走默认（证明是正常 deep-merge，而非"整份原样返回"）
+    assert cfg["relevance"]["tag_idf_floor"] == DEFAULT_CONFIG["relevance"]["tag_idf_floor"]
 
 
 def test_deep_merge_nested_dict(tmp_home: Path) -> None:
@@ -206,6 +263,26 @@ def test_check_inconsistent_paths_warns(tmp_home: Path, capsys) -> None:
     assert "other-vault" in captured.err
 
 
+def test_check_bom_ss_config_still_compared(tmp_home: Path, capsys) -> None:
+    """summarize-session config 带 BOM 时，跨 skill 一致性自检不得被静默跳过——
+    否则两侧 vault 路径已经分叉却完全无告警（与 test_check_corrupted_ss_config_is_silent
+    的"真损坏时静默"不同：BOM 文件是合法内容，只是编码前缀）。"""
+    ss_path = _ss_cfg_path(tmp_home)
+    ss_path.parent.mkdir(parents=True, exist_ok=True)
+    ss_path.write_text(
+        json.dumps({"default_vault_path": str(tmp_home / "other-vault")}),
+        encoding="utf-8-sig",
+    )
+    assert ss_path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+    vl_cfg = {"vault_path": str(tmp_home / ".claude" / "knowledge-vault")}
+    check_vault_path_consistency(vl_cfg, tmp_home)
+
+    captured = capsys.readouterr()
+    assert "[vault-loader] 警告：vault 路径不一致" in captured.err
+    assert "other-vault" in captured.err
+
+
 def test_check_corrupted_ss_config_is_silent(tmp_home: Path, capsys) -> None:
     """summarize-session config 损坏时静默（fail-open）。"""
     ss_path = _ss_cfg_path(tmp_home)
@@ -319,3 +396,48 @@ def test_relevance_non_dict_list_falls_back_to_default(tmp_path) -> None:
     p.write_text(json.dumps({"relevance": ["x"]}), encoding="utf-8")
     rel = load_config(p)["relevance"]  # 不应抛异常
     assert rel == DEFAULT_CONFIG["relevance"]
+
+
+def test_load_config_ex_distinguishes_fresh_install_from_corrupt(tmp_path):
+    """D1(b)：load_config_ex 必须把「零配置新装」与「config 损坏回退」分开。
+
+    两者在 load_config 的返回值上完全同形（都是 DEFAULT_CONFIG），而后者是全用户级的
+    静默失效单点：丢的不只 vault_path，scoring/relevance/keyword_to_tags/opt_out_paths
+    的用户调参全部作废。若把「文件不存在」也判为失效，则每个新装用户第一次会话就会
+    被误报——这是本方案最大的误报面。
+    """
+    from scripts._config_loader import load_config_ex
+
+    # ① 文件不存在 = 零配置新装 → 不置位
+    fresh = tmp_path / "fresh" / "config.json"
+    r1 = load_config_ex(fresh)
+    assert r1.fallback_reason is None, "零配置新装不得判为失效"
+    assert r1.detail == ""
+    assert fresh.exists(), "应写入最小占位"
+
+    # ② 内容合法 = 正常 → 不置位
+    ok = tmp_path / "ok.json"
+    ok.write_text('{"vault_path": "D:/V"}', encoding="utf-8")
+    r2 = load_config_ex(ok)
+    assert r2.fallback_reason is None
+    assert r2.config["vault_path"] == "D:/V"
+
+    # ③ 解析失败 = 真失效 → 置位 corrupt，且带可诊断细节
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"vault_path": "D:/V", }', encoding="utf-8")   # 尾逗号
+    r3 = load_config_ex(bad)
+    assert r3.fallback_reason == "corrupt", "config 损坏必须置位"
+    assert r3.detail, "应带异常文本供诊断"
+    assert r3.config["vault_path"] == DEFAULT_CONFIG["vault_path"], "损坏时确实回退了默认"
+    assert bad.read_text(encoding="utf-8") == '{"vault_path": "D:/V", }', "损坏文件不得被覆盖"
+
+
+def test_detail_does_not_leak_config_contents(tmp_path):
+    """诊断细节不得回显 config 文件内容——它会进用户可见通道。"""
+    from scripts._config_loader import load_config_ex
+
+    bad = tmp_path / "secret.json"
+    bad.write_text('{"vault_path": "D:/V", "token": "ghp_deadbeef", }', encoding="utf-8")
+    r = load_config_ex(bad)
+    assert r.fallback_reason == "corrupt"
+    assert "ghp_deadbeef" not in r.detail, f"异常文本泄露了 config 内容：{r.detail!r}"

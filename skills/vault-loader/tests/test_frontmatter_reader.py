@@ -159,3 +159,74 @@ def test_overlong_tag_dropped_within_cap_window(tmp_path) -> None:
     # 长度过滤生效后超长 tag 被剔除，剩余 31 条有效 tag 全部保留（未触发条数截断）
     assert len(tags) == 31
     assert tags == tuple(f"t{i}" for i in range(31))
+
+
+def _write_cache(vault: Path, text: str) -> None:
+    meta = vault / ".meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "frontmatter-cache.json").write_text(text, encoding="utf-8")
+
+
+def test_cache_status_separates_healthy_empty_from_failure(tmp_path):
+    """P-2：五种「空索引」成因必须可区分，其中三种是健康态。
+
+    这是 P3 诊断的地基。若照 `not entries` 判定失效，会误报两类人群：
+      - 每个零配置新装用户的第一次会话（ABSENT）
+      - 下次 CACHE_VERSION bump 后的全部存量用户（VERSION_MISMATCH，:10 注释原文
+        写着「静默丢弃旧 cache」「这是预期行为」）
+    而这两态在 tests/conftest.py 的 fixture 里**结构上不存在**（它恒写 _version:1），
+    故本用例专门构造，不复用 fixture。
+    """
+    from scripts._frontmatter_reader import CacheStatus, load_cache_status
+
+    vault = tmp_path / "v"
+    vault.mkdir()
+
+    # ① 文件不存在 = 零配置新装
+    entries, st = load_cache_status(vault)
+    assert (entries, st) == ({}, CacheStatus.ABSENT)
+    assert not st.is_failure(), "新装不得判为失效"
+
+    # ② 版本不符 = 预期过渡态
+    _write_cache(vault, json.dumps({"_version": 999, "entries": {"a.md": {}}}))
+    entries, st = load_cache_status(vault)
+    assert (entries, st) == ({}, CacheStatus.VERSION_MISMATCH)
+    assert not st.is_failure(), "版本过渡态不得判为失效——否则 bump 当天全量用户误报"
+
+    # ③ 解析正常但 0 条目 = vault 里确实没笔记
+    _write_cache(vault, json.dumps({"_version": 1, "entries": {}}))
+    entries, st = load_cache_status(vault)
+    assert (entries, st) == ({}, CacheStatus.EMPTY)
+    assert not st.is_failure()
+
+    # ④ JSON 损坏 = 真失效
+    _write_cache(vault, '{"_version": 1, "entries": {,}}')
+    entries, st = load_cache_status(vault)
+    assert (entries, st) == ({}, CacheStatus.CORRUPT)
+    assert st.is_failure(), "JSON 损坏必须判为失效"
+
+    # ⑤ entries 结构不对 = 真失效
+    _write_cache(vault, json.dumps({"_version": 1, "entries": [1, 2]}))
+    entries, st = load_cache_status(vault)
+    assert (entries, st) == ({}, CacheStatus.CORRUPT)
+    assert st.is_failure()
+
+    # ⑥ 正常
+    _write_cache(vault, json.dumps({"_version": 1, "entries": {"a.md": {"tags": ["x"]}}}))
+    entries, st = load_cache_status(vault)
+    assert st == CacheStatus.OK and set(entries) == {"a.md"}
+    assert not st.is_failure()
+
+
+def test_load_cache_thin_wrapper_unchanged(tmp_path):
+    """薄封装 load_cache 的行为必须与改造前逐字一致（18+ 处既有调用零改动）。"""
+    from scripts._frontmatter_reader import load_cache, load_cache_status
+
+    vault = tmp_path / "v2"
+    vault.mkdir()
+    assert load_cache(vault) == {}                       # 缺失
+    _write_cache(vault, json.dumps({"_version": 999, "entries": {"a.md": {}}}))
+    assert load_cache(vault) == {}                       # 版本不符
+    _write_cache(vault, json.dumps({"_version": 1, "entries": {"a.md": {"summary": "s"}}}))
+    assert load_cache(vault) == load_cache_status(vault)[0]
+    assert set(load_cache(vault)) == {"a.md"}

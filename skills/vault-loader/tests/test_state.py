@@ -213,3 +213,52 @@ def test_fallback_cooldown_rearms_after_ttl(tmp_path, monkeypatch) -> None:
     p.write_text(json.dumps({"fallback_ts": fresh, "timestamp": fresh,
                              "paths": [], "fulltext_paths": []}), encoding="utf-8")
     assert not fallback_cooldown_expired(cwd, 24)    # 仍冷却
+
+
+def test_save_injected_preserves_unknown_keys(tmp_path, monkeypatch) -> None:
+    """P-3：save_injected 必须保留它不认识的键。
+
+    旧实现从零构造 payload、只显式搬运 fallback_ts，于是任何其他写入方新增的字段
+    （诊断冷却 diag_ts 就是本轮要加的）会在下一次成功注入时被静默抹掉——冷却窗口
+    归零、提示每轮重发。这条守卫钉住「读-改-写」语义；退回字面量重建即红。
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    from scripts._state import save_injected, state_path_for_cwd
+
+    cwd = Path(str(tmp_path / "proj"))
+    p = state_path_for_cwd(cwd)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({
+        "timestamp": time.time(), "paths": ["old.md"], "fulltext_paths": [],
+        "fallback_ts": 12345.0,
+        "diag_ts": {"CONFIG_CORRUPT": 999.0},     # 本函数不认识的键
+        "some_future_field": "keep me",
+    }), encoding="utf-8")
+
+    save_injected(cwd, ["new.md"])
+
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data.get("diag_ts") == {"CONFIG_CORRUPT": 999.0}, "诊断冷却字段被抹掉"
+    assert data.get("some_future_field") == "keep me", "未知字段被抹掉"
+    assert data.get("fallback_ts") == 12345.0, "fallback_ts 未保留"
+    assert set(data["paths"]) == {"old.md", "new.md"}, "本函数自己的键应正常合并"
+
+
+def test_save_injected_survives_non_dict_state(tmp_path, monkeypatch) -> None:
+    """state.json 内容是数组时 save_injected 不得抛。
+
+    旧实现直接 loaded.get(...)，数组会抛 AttributeError——而它不在 except 元组
+    (JSONDecodeError, OSError) 里，异常会一路冒到 hook 顶层兜底，本轮 state 静默丢失。
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    from scripts._state import save_injected, load_already_injected, state_path_for_cwd
+
+    cwd = Path(str(tmp_path / "proj2"))
+    p = state_path_for_cwd(cwd)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps([1, 2, 3]), encoding="utf-8")   # 非 dict
+
+    save_injected(cwd, ["a.md"])                            # 不得抛
+    assert load_already_injected(cwd, 24) == {"a.md"}

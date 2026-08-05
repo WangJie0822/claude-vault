@@ -5,6 +5,7 @@ import json
 import sys
 from copy import deepcopy
 from pathlib import Path
+from typing import NamedTuple
 
 DEFAULT_CONFIG: dict = {
     "enabled": True,
@@ -98,6 +99,20 @@ DEFAULT_CONFIG: dict = {
     },
 }
 
+# P0 升级链治理（spec §8.1）：首跑落盘用最小占位而非全量 DEFAULT_CONFIG。
+# 全量物化会让盘上旧值在 deep-merge 中永久覆盖后续版本的新默认——0.5.0 的权重
+# 演进对物化窗口用户静默失效。占位仅含版本标记与说明，不含任何可配键，
+# 故默认值演进对新装用户即时生效（未显式写入的键永远走当前 DEFAULT_CONFIG）。
+_MINIMAL_STUB: dict = {
+    "_config_version": 1,
+    "_comment": "完整可配键见 SKILL.md；默认值随版本演进自动生效，显式写入的键才会覆盖默认",
+}
+
+# 内部标记键（字面量精确匹配，非前缀）：不是真实配置键，deep-merge 前必须剔除
+# （否则会作为杂键泄漏给下游消费者——它们不在 DEFAULT_CONFIG 里，_deep_merge 会
+# 把 override 里的陌生键原样塞进 result）。
+_CONFIG_META_KEYS = ("_config_version", "_comment")
+
 
 def _deep_merge(default: dict, override: dict) -> dict:
     """递归合并：override 优先，dict 类型字段做深度合并。"""
@@ -141,39 +156,75 @@ def _ensure_relevance_normalized(result: dict) -> dict:
     return result
 
 
+class ConfigLoad(NamedTuple):
+    """`load_config_ex` 的返回：配置本体 + 本次是否发生了**非预期**回退。
+
+    `fallback_reason` 的取值只有两种：
+      - `None`  —— 正常。**含「文件不存在」这一支**：那是零配置新装，写最小占位后用默认值
+        是设计行为，不是失效，绝不能报警（否则每个新装用户第一次会话就被吓一跳）。
+      - `"corrupt"` —— config 存在但解析失败，整份回退 `DEFAULT_CONFIG`。这是真失效：
+        丢的不只是 `vault_path`，`scoring` 权重、`relevance` 全部阈值、`keyword_to_tags`、
+        `opt_out_paths` 的用户调参**全部静默作废**，而唯一信号是没人会看的一行 stderr。
+
+    `detail` 只在 `corrupt` 时非空，内容是异常文本。已核实 `json.JSONDecodeError` 的
+    `str()` 只含错误描述与偏移（如「Illegal trailing comma before end of object:
+    line 1 column 58」），**不回显文档内容**，故不构成敏感信息泄露；但它可能含文件路径
+    （`OSError`），进用户可见通道前仍须折叠 home。
+    """
+    config: dict
+    fallback_reason: str | None
+    detail: str
+
+
 def load_config(path: Path | None = None) -> dict:
-    """加载配置。
-    - 缺失：写默认值到 path，返回默认值
-    - 损坏：保留原文件，stderr 警告，返回默认值
-    - 正常：与默认值深合并
+    """加载配置（薄封装，签名与行为完全不变）。
+
+    新代码应优先用 `load_config_ex`——它能区分「零配置新装」与「config 损坏静默回退」。
+    这两者在本函数的返回值上**完全同形**，而后者是全用户级的静默失效单点。
+    """
+    return load_config_ex(path).config
+
+
+def load_config_ex(path: Path | None = None) -> ConfigLoad:
+    """加载配置，并回报本次是否发生非预期回退。
+    - 缺失：写最小占位到 path（不物化全量默认，见 `_MINIMAL_STUB`），返回默认值，**不置位**
+    - 损坏：保留原文件，stderr 警告，返回默认值，置位 `corrupt`
+    - 正常：与默认值深合并（`_config_version`/`_comment` 等内部标记键会被剔除）
     """
     if path is None:
         path = Path.home() / ".claude" / "skills" / "vault-loader" / "config.json"
 
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(_MINIMAL_STUB, ensure_ascii=False, indent=2), encoding="utf-8")
         result = deepcopy(DEFAULT_CONFIG)
         _ensure_relevance_normalized(result)
-        return result
+        # 零配置新装不是失效——不置位。
+        return ConfigLoad(result, None, "")
 
     try:
-        text = path.read_text(encoding="utf-8")
+        # utf-8-sig 而非 utf-8：PowerShell 5.1 的 `Out-File -Encoding utf8` 与多个编辑器
+        # 默认写出带 BOM 的 UTF-8，用 utf-8 解码会把 BOM 留在首字符 → json 解析失败 →
+        # 走下面的 except 回退**全默认**，用户的 vault_path 一并丢失（loader 转去读不存在
+        # 的默认 vault），唯一信号是用户看不到的一行 stderr。utf-8-sig 对无 BOM 输入同样
+        # 正确。写入端保持 utf-8（不写出 BOM）。
+        text = path.read_text(encoding="utf-8-sig")
         override = json.loads(text)
         if not isinstance(override, dict):
             raise ValueError("config root 必须为 object")
+        override = {k: v for k, v in override.items() if k not in _CONFIG_META_KEYS}
         result = _deep_merge(DEFAULT_CONFIG, override)
         _ensure_relevance_normalized(result)
-        return result
+        return ConfigLoad(result, None, "")
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         print(f"[vault-loader] config 损坏，回退默认值：{exc}", file=sys.stderr)
         result = deepcopy(DEFAULT_CONFIG)
         _ensure_relevance_normalized(result)
-        return result
+        return ConfigLoad(result, "corrupt", str(exc))
 
 
-def check_vault_path_consistency(vl_config: dict, home: Path | None = None) -> None:
-    """启动自检：若 summarize-session config 可读且 vault 路径不一致，打印 stderr 告警。
+def compare_vault_paths(vl_config: dict, home: Path | None = None) -> tuple[str, str] | None:
+    """比较两个 skill 的 vault 路径。一致 / 无法比较 → `None`；不一致 → `(vl, ss)`。
 
     完全 fail-open：任何异常静默吞掉，绝不抛出、绝不影响调用方正常流程。
     不引入硬性跨 skill 导入依赖——仅 best-effort 读 JSON 文件。
@@ -183,27 +234,45 @@ def check_vault_path_consistency(vl_config: dict, home: Path | None = None) -> N
             home = Path.home()
         ss_cfg_path = home / ".claude" / "skills" / "summarize-session" / "config.json"
         if not ss_cfg_path.exists():
-            return  # 未配置 summarize-session，静默跳过
+            return None  # 未配置 summarize-session，静默跳过
         try:
-            ss_raw = json.loads(ss_cfg_path.read_text(encoding="utf-8"))
+            # utf-8-sig：同 load_config，BOM 不得让本自检静默失效（两侧路径已分叉却无告警）
+            ss_raw = json.loads(ss_cfg_path.read_text(encoding="utf-8-sig"))
         except (json.JSONDecodeError, OSError):
-            return  # 读取或解析失败，静默跳过
+            return None  # 读取或解析失败，静默跳过
         if not isinstance(ss_raw, dict):
-            return
+            return None
         ss_vault_str = ss_raw.get("default_vault_path")
         if not ss_vault_str:
-            return  # 字段缺失或空值，无法比较
+            return None  # 字段缺失或空值，无法比较
         # 解析两侧路径（expanduser + resolve，忽略符号链接差异）
         try:
             vl_resolved = Path(vl_config.get("vault_path", "")).expanduser().resolve()
             ss_resolved = Path(ss_vault_str).expanduser().resolve()
         except (OSError, ValueError):
-            return
+            return None
         if vl_resolved != ss_resolved:
+            return str(vl_resolved), str(ss_resolved)
+        return None
+    except Exception:  # noqa: BLE001 — fail-open，静默吞掉一切异常
+        return None
+
+
+def check_vault_path_consistency(vl_config: dict, home: Path | None = None) -> None:
+    """启动自检的 stderr 版（保留给不走诊断通道的调用方）。
+
+    ⚠️ 这里的固定建议「运行 /summarize-session --set-default」在 **config 回退**场景下
+    是**错的**：那时 `vl_config["vault_path"]` 是默认值而非用户配置，照做会把写端指针
+    也改到那个错误路径上。走诊断通道的调用方请用 `compare_vault_paths` +
+    `_diagnostics.vault_path_mismatch(..., config_fell_back=...)`，它会据此翻转文案。
+    """
+    try:
+        pair = compare_vault_paths(vl_config, home)
+        if pair:
             print(
                 f"[vault-loader] 警告：vault 路径不一致——"
-                f"vault-loader.vault_path={vl_resolved} vs "
-                f"summarize-session.default_vault_path={ss_resolved}；"
+                f"vault-loader.vault_path={pair[0]} vs "
+                f"summarize-session.default_vault_path={pair[1]}；"
                 f"请运行 /summarize-session --set-default 或手动对齐。",
                 file=sys.stderr,
             )

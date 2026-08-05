@@ -11,6 +11,7 @@ import pytest
 
 from scripts.session_start_load import build_injection_text_ss, build_summary_ss
 from scripts._frontmatter_reader import Entry
+from tests._neutral import NEUTRAL_CWD
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "session_start_load.py"
 
@@ -95,14 +96,14 @@ def test_empty_signals_silent(tmp_home: Path, tmp_vault: Path) -> None:
 
 
 def test_opt_out_disable_via_env(tmp_home: Path) -> None:
-    r = _run_hook(Path("/tmp"), env_extra={"VAULT_LOADER_DISABLE": "1"})
+    r = _run_hook(NEUTRAL_CWD, env_extra={"VAULT_LOADER_DISABLE": "1"})
     assert r.returncode == 0
     assert r.stdout.strip() == ""
 
 
 def test_opt_out_disable_via_flag_file(tmp_home: Path) -> None:
     (tmp_home / ".claude" / ".vault-loader-disabled").write_text("")
-    r = _run_hook(Path("/tmp"))
+    r = _run_hook(NEUTRAL_CWD)
     assert r.returncode == 0
     assert r.stdout.strip() == ""
 
@@ -347,6 +348,35 @@ def test_special_chars_valid_json_and_verbatim(
 
 
 # ---------------------------------------------------------------------------
+# 不变量 #3：vault-loader 对 Vault 只读——不得代建用户显式配置的路径
+# ---------------------------------------------------------------------------
+
+def test_configured_missing_vault_is_not_created(tmp_home: Path) -> None:
+    """SessionStart 侧同 UPS：用户显式配置的 vault_path 不存在时不得代建，
+    直接走「vault 路径不可达」分支（详见 test_prompt_submit 同名用例的理由）。"""
+    missing = tmp_home / "not-my-vault"
+    cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(missing)}),
+                   encoding="utf-8")
+    r = _run_hook(tmp_home)
+    assert r.returncode == 0                      # fail-open 不变量
+    assert not missing.exists(), "显式配置的 vault 路径不得由只读的 vault-loader 代建"
+
+
+def test_default_vault_path_still_auto_created(tmp_home: Path) -> None:
+    """零配置新装场景保留：vault_path 等于 DEFAULT_CONFIG 默认值且缺失 → 仍自动创建。"""
+    default_vault = tmp_home / ".claude" / "knowledge-vault"
+    cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"dry_run": False}), encoding="utf-8")   # 不写 vault_path
+    assert not default_vault.exists()
+    r = _run_hook(tmp_home)
+    assert r.returncode == 0
+    assert default_vault.is_dir() and (default_vault / ".meta").is_dir()
+
+
+# ---------------------------------------------------------------------------
 # helper
 # ---------------------------------------------------------------------------
 
@@ -391,7 +421,7 @@ def test_build_summary_ss_compact_format():
 def test_build_injection_text_ss_golden() -> None:
     """注入正文逐字等价旧格式（模型侧零回归守护）。
     Task 5.1：头部含 INJECTION_NOTICE 隔离声明（intentional update）。"""
-    from scripts.prompt_submit_load import INJECTION_NOTICE
+    from scripts._output import INJECTION_NOTICE
 
     notes = [Entry(path="项目笔记/repo/design.md", summary="项目设计",
                    mtime=1900000000, updated="2026-06-20")]

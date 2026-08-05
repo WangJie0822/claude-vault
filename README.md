@@ -139,7 +139,16 @@ hook 通过一个 polyglot 包装脚本运行，按以下顺序探测 Python 解
 - **tag 命中改按 IDF 加权**：泛 tag（很多笔记共有）权重降低，精确信号更易胜出；`keywords` 命中权重从 3 提到 5。回退旧行为：config `relevance.use_tag_idf: false`、`scoring.prompt_keyword_hit: 3`。
 - **写端补齐 keywords 覆盖**：summarize-session 把 keywords 要求移进执行路径，rebuild_index 统计覆盖率并在过低时 stderr 告警。
 - **安全**：笔记路径解析收敛到带容器校验的单点，堵住 cache 中被篡改的越界 path 读到 Vault 外文件。
-- ⚠️ **存量用户升级须知**：已运行过旧版的用户，`config.json` 持久化的旧值会压制新默认，需手动把 `scoring.prompt_keyword_hit` 改为 `5`（或删 config 重建）。详见 [docs/MIGRATION.md](docs/MIGRATION.md)。
+- ⚠️ **存量用户升级须知**：已运行过旧版的用户，`config.json` 里旧版首跑物化的默认值会压制新默认，修复只生效一半。用插件自带的收敛脚本一次性处理（先 dry-run 预览，确认后 `--apply`，可 `--restore` 撤销）：
+
+  ```bash
+  VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+  python3 "$VL/migrate_config.py"          # dry-run 预览；确认后再加 --apply
+  ```
+
+  > ⚠️ **与上面的定向回退有冲突**：若你按本节第一条设过 `scoring.prompt_keyword_hit: 3`，`--apply` 会把它删掉——判据是「值等于历史默认」（该键历史默认为 `3`），脚本无从区分「旧版残留的 3」和「你刻意设的 3」。dry-run 输出会列出该键，看到就别 apply，或事后 `--restore` 回滚。布尔开关（`use_tag_idf: false` 等）不参与判定，不受影响。
+
+  **不要删除 `config.json`**——那会连同 `vault_path` 一起丢失且不报错，知识库将静默不再被注入。使用限制与撤销方式详见 [docs/MIGRATION.md](docs/MIGRATION.md)。
 
 ---
 

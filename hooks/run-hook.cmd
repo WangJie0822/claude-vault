@@ -12,7 +12,8 @@ BATCH
 ROOT="${CLAUDE_PLUGIN_ROOT:-$(CDPATH= cd "$(dirname "$0")/.." && pwd)}"
 SCRIPT="$ROOT/$1"
 [ -f "$SCRIPT" ] || exit 0
-if command -v python3 >/dev/null 2>&1; then PY=python3
+if command -v py >/dev/null 2>&1; then PY=py
+elif command -v python3 >/dev/null 2>&1; then PY=python3
 elif command -v python >/dev/null 2>&1; then PY=python
 else exit 0
 fi

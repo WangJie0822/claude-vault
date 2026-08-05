@@ -39,15 +39,75 @@
 
 ## ⚠️ 从旧版升级到「召回质量修复版」的须知（面向所有升级用户）
 
+### 症状：盘上旧值压制新默认，修复只生效一半
+
 本版本把 `scoring.prompt_keyword_hit` 默认值从 3 提到 5（让精确 keywords 命中能胜过泛 tag），并新增 tag-IDF 加权（`relevance.use_tag_idf`）。
 
-**但已运行过一次旧版的存量用户须注意**：你的 `~/.claude/skills/vault-loader/config.json` 已持久化旧值 `prompt_keyword_hit: 3`，升级后经 deep-merge **会压制新默认 5**；而同批新增的 `use_tag_idf` 作为**新键**会补默认 `true` 生效。净结果是「tag-IDF 收窄候选集、但 keywords 权重仍是 3」的**半套组合**，召回可能**不如修复前**。
+**已运行过旧版的存量用户须注意**：旧版首跑会把当时的全量默认值**物化**写进 `~/.claude/skills/vault-loader/config.json`，其中就包含 `prompt_keyword_hit: 3`。升级后 deep-merge 把盘上这个 3 当成「用户显式覆盖」，优先于新默认 5；而同批新增的 `use_tag_idf` 因为是**新键**、盘上没有，正常取到默认 `true`。净结果是「tag-IDF 已收窄候选集、但 keywords 权重仍停在 3」的**半套组合**，召回可能**不如修复前**。
 
-**`/plugin update` 不会修复这一点**（它不触碰用户态 `config.json`）。存量用户须二选一让修复完整生效：
-1. 删除 `~/.claude/skills/vault-loader/config.json` 让其按新默认重建（会丢失你的自定义配置，重建后需重新设置 `vault_path` 等）；
-2. 手动把该文件里 `scoring.prompt_keyword_hit` 改为 `5`。
+`/plugin update` 不会修复这一点——它不触碰用户态 `config.json`。
 
-全新安装用户不受影响（config 按新默认生成）。上一条「config 无需搬动」是就**路径延续**而言，不含本次的默认值变更。
+> 同一机制影响**所有**被物化过的调参键，不止 `prompt_keyword_hit`：任何键只要盘上值等于旧默认，该键未来的默认值演进对你都静默失效。全新安装用户不受影响——本版本起首跑只写最小占位（`_config_version` + 一行说明），不再物化全量默认。
+
+### 推荐做法：用收敛脚本 `migrate_config.py`
+
+插件自带的 `skills/vault-loader/scripts/migrate_config.py` 正是为此场景而生。它只删除「盘上值恰好等于该键**历史上任一版本**默认值」的数值调参键，删除后 deep-merge 自动回落到当前版本的最新默认；`vault_path`、`keyword_to_tags`、`opt_out_paths`、`display`、`enabled` / `dry_run` 等一律不动，你显式调过的非默认值也不动。
+
+**第 1 步 · dry-run 预览**（默认行为，只读扫描，不改动任何文件）：
+
+```bash
+VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+python3 "$VL/migrate_config.py"
+```
+
+> 若报 `No such file or directory`，说明你装的插件版本早于本脚本引入的版本——先 `/plugin update` 再重跑（`ls -d` 的 glob 取的是 cache 里版本号最大的那份）。
+
+输出逐条列出将被删除的键与当前值，形如：
+
+```
+[migrate_config] dry-run：<...>/config.json 发现 9 个物化残留键（加 --apply 执行清理，不加不会改动任何文件）：
+  将删除 scoring.prompt_keyword_hit=3
+  将删除 relevance.min_topical_score=4
+  ...
+```
+
+**逐条核对这份清单**（为什么必须核对见下方「使用限制」第 1 条），确认没有你刻意设成该值的键。
+
+**第 2 步 · 确认无误后 apply**（先备份，再原子写回清理后的 config）：
+
+```bash
+VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+python3 "$VL/migrate_config.py" --apply
+```
+
+脚本会先把改动前的 config 完整备份出去并打印备份路径，然后打印实际删除的键，末行给出撤销命令。
+
+**第 3 步 · 如需撤销**（把第 2 步打印的备份路径填进去）：
+
+```bash
+VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+python3 "$VL/migrate_config.py" --restore ~/.claude/projects/vault-loader-backups/config-<时间戳>.json
+```
+
+`--restore` 覆盖前同样会先把**当前**内容备份出去，所以 apply 之后手工做的调参也有恢复路径。`--restore` 只接受顶层键属于 vault-loader schema 的备份文件（防止把任意 JSON 还原成 config）。`--apply` 与 `--restore` 互斥，同时传会直接报 usage 错误。
+
+指定非默认 config 路径用 `--path <路径>`。若 config 路径经符号链接 / NTFS junction 重定向，脚本为防越权写入会整体放弃；确属你自己的 dotfiles 软链布局时可加 `--force`（`-y`）放行。
+
+### 使用限制（三条，用前必读）
+
+1. **判据是「值等于历史默认」，不是「用户没改过」。** 脚本无法区分「旧版物化残留的 3」和「你手动设成 3」——两者盘上完全一样。若你曾刻意把某个键设成恰好等于某个历史默认值，它会被当成残留删掉。**这就是第 1 步 dry-run 必须逐条核对的原因**；真被误删也可用 `--restore` 整份回滚。
+2. **只处理数值键（int/float）。** 布尔开关（`use_tag_idf`、`use_keywords`、`split_cjk_bigram` 等）、列表（`exclude_note_tags`）、字符串一律不参与判定——开关值的语义是「你要不要这个行为」，等值判定法对它不适用。好处是你显式关过的止血开关绝不会被误清；代价是旧版物化的布尔残留也不会被清理，如需回到默认请手工删除该键。
+3. **备份目录不受 `--path` 影响。** 备份恒落真实 HOME 下的 `~/.claude/projects/vault-loader-backups/`，即使你用 `--path` 指定了别处的 config。该目录与 `config.json` 物理隔离，也不落在插件仓库或任何项目工作树内。
+
+   > ⚠️ **不保证「在任何 git 仓之外」**（此前本文档如此断言，现撤回）：把 `~/.claude` 整体纳入版本管理是常见做法，那样备份目录就落在该仓库内，是否被跟踪完全取决于它自己的 `.gitignore`。备份内容是 config 全文（含 `vault_path` 等本机绝对路径），推送到公开仓库前请自行确认。
+
+### ❌ 不要删除 `config.json`
+
+本文档此前建议「删除 `config.json` 让其按新默认重建」，**该建议已撤回**。删除会连同 `vault_path` 一起丢失：重建后 `vault_path` 回落到默认的 `~/.claude/knowledge-vault`，`keyword_to_tags` / `opt_out_paths` / `display` 等自定义配置一并清零，而且**全程不报错**——你的知识库从此静默不再被注入，唯一征兆是"怎么没有注入了"。
+
+手动把 `scoring.prompt_keyword_hit` 改成 `5` 仍然可行，但只治这一个键；上面的收敛脚本是完整解法。
+
+上一条「config 无需搬动」是就**路径延续**而言，不含本次的默认值变更。
 
 ## 单源工作流（--plugin-dir）
 
