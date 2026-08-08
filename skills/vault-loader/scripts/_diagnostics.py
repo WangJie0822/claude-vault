@@ -39,6 +39,7 @@ CODE_CONFIG_CORRUPT = "config_corrupt"
 CODE_VAULT_UNREACHABLE = "vault_unreachable"
 CODE_CACHE_BROKEN = "cache_broken"
 CODE_VAULT_PATH_MISMATCH = "vault_path_mismatch"
+CODE_NEAR_MISS_NUDGE = "near_miss_nudge"
 
 # 外部可控文本的长度上限。诊断进 systemMessage，过长会淹没终端。
 _MAX_FIELD = 200
@@ -228,4 +229,24 @@ def vault_path_mismatch(vl_path: object, ss_path: object, config_fell_back: bool
             f"summarize-session={safe_field(ss_path, 80)}"
         ),
         hint="写入与读取会落在不同目录。运行 /summarize-session --set-default 或手动对齐。",
+    )
+
+
+def near_miss_nudge(paths: list[str]) -> Diagnosis:
+    """某些笔记反复接近召回闸门却始终未入选——可能是打分或其 frontmatter 需要调。
+
+    path 来自 frontmatter-cache.json 的 dict key（`_frontmatter_reader.py` 只校验
+    `isinstance(str)` 与长度上限，不校验内容），属外部可控数据，必须走 `safe_field`
+    而非 `sanitize_for_display`——后者按设计保留 `\\r`/`\\n`（见模块 docstring 第 46-49
+    行），折叠换行是 `safe_field`/`_NEWLINE_RE` 的职责。用错会让笔记路径里嵌的换行在
+    systemMessage 里伪造出第二行、冒充 Claude Code 自身的提示，与 SEC-1（摘要标题净化）
+    同型的漏洞。
+    """
+    shown = "、".join(safe_field(p.split("/")[-1], 40) for p in paths[:3])
+    more = f" 等 {len(paths)} 篇" if len(paths) > 3 else ""
+    return Diagnosis(
+        code=CODE_NEAR_MISS_NUDGE,
+        level=LEVEL_DEGRADED,
+        message=f"有笔记反复接近召回闸门却未入选：{shown}{more}",
+        hint="运行 `analyze_metrics.py --review` 标注，或检查这些笔记的 tags/keywords",
     )

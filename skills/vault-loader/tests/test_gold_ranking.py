@@ -117,8 +117,14 @@ def test_tag_idf_improves_or_holds_baseline() -> None:
 
 def test_tag_idf_measurably_beats_flat_on_gold() -> None:
     """tag-IDF 必须在 gold 集上可测量地优于 flat 权重（tag_df=None）。
-    否则 tag-IDF 退化成 no-op 时无红测——test_tag_idf_*_baseline 只测 >=地板、
-    对 +0.009 的实际贡献盲。delta 阈值 0.005 < 实测 0.009，留余量但足以杀 no-op。"""
+
+    判据用「delta 占剩余改进空间 (1 - flat) 的比例」而非绝对差值：
+    绝对阈值对基线位移不鲁棒。BUG-1 修复把 flat 从 0.9290 推到 0.9812，
+    剩余空间从 0.0710 压到 0.0188，绝对 delta 从 0.0092 掉到 0.0040 跌破
+    旧阈值 0.005——但相对效率其实从 13.0% 升到 21.5%，tag-IDF 变好了而非变差。
+    实测四档：修复前 13.0% / 修复后 21.5% / floor=0.9 21.5% / no-op 0.0%。
+    阈值 10% 让真实实现两侧都绿，no-op 仍被杀死。
+    """
     from scripts._scorer import build_tag_df
 
     corpus, queries = build_gold_corpus()
@@ -137,9 +143,17 @@ def test_tag_idf_measurably_beats_flat_on_gold() -> None:
         return sum(ndcg_at_k(rank_with(fn, corpus, q.prompt), q.relevant, 10)
                    for q in queries) / len(queries)
 
-    d = nd(with_idf) - nd(flat)
-    print(f"\n[tag-idf delta] with_idf={nd(with_idf):.4f} flat={nd(flat):.4f} delta={d:.4f}")
-    assert d > 0.005, f"tag-IDF 须可测量优于 flat 权重，实际 delta={d:.4f}（no-op 会使其≈0）"
+    flat_ndcg = nd(flat)
+    idf_ndcg = nd(with_idf)
+    d = idf_ndcg - flat_ndcg
+    headroom = 1.0 - flat_ndcg
+    ratio = d / headroom if headroom > 0 else 0.0
+    print(f"\n[tag-idf delta] with_idf={idf_ndcg:.4f} flat={flat_ndcg:.4f} "
+          f"delta={d:.4f} headroom={headroom:.4f} ratio={ratio:.1%}")
+    assert d > 0, f"tag-IDF 不得劣于 flat 权重，实际 delta={d:.4f}"
+    assert ratio > 0.10, (
+        f"tag-IDF 须可测量优于 flat：delta 应占剩余改进空间 (1-flat) 的 10% 以上，"
+        f"实际 {ratio:.1%}（no-op 会使其≈0）")
 
 
 def test_report_gold_metrics() -> None:

@@ -441,3 +441,38 @@ def test_detail_does_not_leak_config_contents(tmp_path):
     r = load_config_ex(bad)
     assert r.fallback_reason == "corrupt"
     assert "ghp_deadbeef" not in r.detail, f"异常文本泄露了 config 内容：{r.detail!r}"
+
+
+# ── Task 8：顶层 metrics 配置段 ─────────────────────────────────────────────
+
+def test_metrics_section_defaults_off_and_top_level():
+    from scripts._config_loader import DEFAULT_CONFIG, load_config
+    assert DEFAULT_CONFIG["metrics"]["enabled"] is False
+    assert "metrics" not in DEFAULT_CONFIG["user_prompt_submit"]
+    assert "metrics" not in DEFAULT_CONFIG["relevance"]
+
+
+# ── Task 13：near-miss 提示阈值与冷却默认值 ──────────────────────────────────
+
+def test_near_miss_nudge_defaults_match_documented_evidence():
+    """钉住 task-13-brief 标注「有实测依据、勿自行放宽」的两个默认值。
+
+    fix round 1 变异实测：把 `nudge_threshold` 改成 5（对应 77 轮真实 prompt 实测的
+    43 个候选、约每 1.8 轮打扰一次，与 `_diagnostics.py` 判据偏向沉默的原则冲突）后
+    全量跑 484 passed 无一变红——`test_near_miss_nudge.py` 的阈值断言全部显式传参
+    `threshold=10`，测的是「给定阈值时行为对不对」，没有任何用例测「配置默认值确实
+    是 10」。本用例专门堵住这个盲区：默认值被静默改小，必须有测试变红。
+    """
+    from scripts._config_loader import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["metrics"]["nudge_threshold"] == 10
+    assert DEFAULT_CONFIG["metrics"]["nudge_ttl_hours"] == 168
+
+
+def test_doctor_uses_deep_merge(tmp_path, monkeypatch):
+    """--doctor 用浅合并会对只写了部分 metrics 对象的用户把 enabled 报成 None
+    ——即对它专职诊断的开关给出错误答案。"""
+    from scripts import migrate_config
+    raw = {"metrics": {"retention_days": 30}}
+    merged = migrate_config._doctor_merge(raw)
+    assert merged["metrics"]["enabled"] is False
+    assert merged["metrics"]["retention_days"] == 30

@@ -195,7 +195,9 @@ def decide_injection(active_entries: dict, signals: Signals, weights: dict,
         # (prompt_keyword_hit=5 ≥ min_topical=4) 下已由 t >= min_topical 直接放行、且**高于**
         # 被 IDF 降权的泛 tag（非低排名）；下面的 has_keyword_hit 旁路仅当用户把
         # prompt_keyword_hit 调到 <min_topical 时才复活（默认下是死分支，保留以守护自定义低权重 config）。
-        # 与打分共用 has_keyword_hit 单点（含 tag 去重），口径一致、防漂移。
+        # 与打分共用 has_keyword_hit 单点，口径一致、防漂移。
+        # （BUG-1 前该函数还会做「命中 tag 的词不计 keyword」的去重，已删除——
+        #  双命中是最强相关性信号，去重反而让它得分最低。）
         if t < min_topical and not has_keyword_hit(entry, prompt_keywords, use_kw):
             # 性能护栏：不为该 excluded 分支调 score()/_hit_keywords()——这是大语料下
             # 数量占绝对主体的分支，逐篇多算一遍会把 O(N) 打分主循环单趟开销翻倍，顶穿

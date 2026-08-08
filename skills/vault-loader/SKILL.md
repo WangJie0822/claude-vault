@@ -35,6 +35,10 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入到
 - 同一类失效在 `state_ttl_hours` 窗口内最多提示一次，不会逐条 prompt 刷屏。
 - 受 `display.user_visible` 约束（设 `false` 即完全不显示）；不受 `display.verbosity` 约束——那个控制的是注入摘要的详略，不是「要不要告诉你坏了」。
 
+### near-miss 提示（需先开启 `metrics.enabled`）
+
+与上面「失效告知」的四类**真实故障**不同，这条提示的是**效果**而非故障——默认不出现，只有 `metrics.enabled: true`（见下方「本地数据」）时才可能触发：某篇笔记在单会话内「话题分达标却始终没通过闸门入选」累计到 `metrics.nudge_threshold`（默认 10）次，同样经 `systemMessage` 出现一行说明，提示你跑 `analyze_metrics.py --review` 标注或检查该笔记的 tags/keywords。冷却是**全局**的（`metrics.nudge_ttl_hours`，默认 168 小时 = 一周），不是逐篇/逐 cwd，避免刷屏。
+
 ### 全文升级判据
 
 全文注入的资格是**两个条件同时成立**（`scripts/_decision.py::select_fulltext`，决策层与渲染层共用的唯一实现）：
@@ -150,6 +154,19 @@ vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取
 | `relevance.tag_idf_floor` | `0.5` | 泛 tag 的保底加权因子，值域下界。设 `0` 会让泛 tag 归零、行为剧变；调高（如 `0.7`）减弱降权强度 |
 
 > ⚠️ **阈值与权重耦合**：`relevance` 的三个阈值（`min_topical_score` / `fulltext_topical_threshold` / `confidence_bands.high`）是按当前 `scoring` 权重标定的——默认权重（tag 4 / summary 2 / keywords 5、floor 0.5）下话题分上界为 11。**改 `scoring` 权重后必须同步复核这三个阈值**，否则闸门会整体偏松或偏紧（例如把 `prompt_tag_hit` 提到 8，单个泛 tag 命中就能越过全文阈值）。
+
+### `metrics.*`（决策面指标落盘）
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `metrics.enabled` | `false` | 落盘总开关，**opt-in**：默认关，避免对存量用户在 `/plugin update` 后静默启用新的按提问逐条落盘 |
+| `metrics.near_miss_k` | `10` | 每轮记录 excluded 候选中 topical 分最高的 K 条（near-miss，用于事后评估召回边界） |
+| `metrics.admitted_k` | `20` | 每轮落盘 `admitted` 按 `total` 降序保留的展示样本条数上限；真实 Vault 实测单轮 admitted 可达 58~156 条，未截断落盘体积远超预期。截断只影响展示样本，`n_admitted`/`arm_counts` 统计口径基于截断前全量计算，不受影响 |
+| `metrics.retention_days` | `90` | 超过此天数的**月份事件目录**（`<YYYY-MM>/*.jsonl`）自动清理，按「每天至多一次」的频率闸门在正常使用时自动触发，无需手动操作；**只清理这部分**——`.salt`/`near_miss_counts.json`/`nudge_ts.json`/`prune_ts.json`/`annotations.jsonl` 都不受它约束，会一直留到你手动 `--purge` |
+| `metrics.nudge_threshold` | `10` | 某篇笔记累计 near-miss 次数达到此阈值才提示（77 轮真实 prompt 实测标定，判据偏向沉默，勿放宽） |
+| `metrics.nudge_ttl_hours` | `168` | near-miss 提示的**全局**冷却窗口（小时），窗口内所有笔记合计最多提示一次 |
+
+数据落 `~/.claude/vault-loader-metrics/`；跑 `--purge` **无二次确认**，单条命令立即不可逆清空——**含 `--review` 产生的人工标注**。
 
 ### 升级后：清理旧版物化残留
 

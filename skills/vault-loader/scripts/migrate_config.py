@@ -373,6 +373,20 @@ def _do_restore(backup_path: Path, config_path: Path, force: bool = False) -> in
     return 0
 
 
+def _doctor_merge(raw: dict) -> dict:
+    """doctor 侧的配置合并。**必须与生产的 _deep_merge 同语义**——旧实现是
+    `dict(DEFAULT_CONFIG)` + `update(...)` 浅合并，用户只写部分子对象时整段被替换，
+    doctor 会把未写的键报成 None。
+
+    注意保留元键过滤：旧实现用 `{k: v for k, v in raw.items() if k not in _CONFIG_META_KEYS}`
+    排除 `_config_version` / `_comment`，深合并后必须保持同样的排除，否则元键会混进
+    诊断输出。
+    """
+    from scripts._config_loader import DEFAULT_CONFIG, _deep_merge
+    cleaned = {k: v for k, v in (raw or {}).items() if k not in _CONFIG_META_KEYS}
+    return _deep_merge(DEFAULT_CONFIG, cleaned)
+
+
 def _do_doctor(config_path: Path) -> int:
     """健康自检：把散落在 stderr（无人读）的诊断集中成一次用户可读的输出。
 
@@ -385,7 +399,7 @@ def _do_doctor(config_path: Path) -> int:
     `keyword_to_tags` / `opt_out_paths` / 任何 config 原始值——doctor 的输出会被贴进
     issue、被模型读进 transcript，里面全是用户的本机路径与项目代号。
     """
-    from scripts._config_loader import DEFAULT_CONFIG, compare_vault_paths
+    from scripts._config_loader import compare_vault_paths
     from scripts._diagnostics import fold_home
     from scripts._frontmatter_reader import CACHE_VERSION, CacheStatus, load_cache_status
 
@@ -423,8 +437,7 @@ def _do_doctor(config_path: Path) -> int:
     elif raw:
         print("  旧版默认值残留   : ✅ 无")
 
-    merged = dict(DEFAULT_CONFIG)
-    merged.update({k: v for k, v in raw.items() if k not in _CONFIG_META_KEYS})
+    merged = _doctor_merge(raw)
     vault_path = Path(str(merged.get("vault_path", ""))).expanduser()
 
     print(f"  vault 路径       : {fold_home(vault_path)}")
@@ -456,6 +469,8 @@ def _do_doctor(config_path: Path) -> int:
     display = merged.get("display", {})
     if isinstance(display, dict):
         print(f"  display.user_visible: {display.get('user_visible', True)}")
+    print(f"  metrics.enabled      = {merged['metrics']['enabled']}")
+    print(f"  metrics.retention_days = {merged['metrics']['retention_days']}")
 
     return 0
 

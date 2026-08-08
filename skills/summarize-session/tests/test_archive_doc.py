@@ -1,6 +1,7 @@
 """tests for scripts/archive_doc.py (T1-T23 spec)"""
 import os
 import sys
+import datetime
 import pathlib
 import json
 import re
@@ -60,7 +61,12 @@ def test_T1_first_archive_no_frontmatter(tmp_path):
     vault = tmp_path / 'Vault'
     vault.mkdir()
     entry = _make_pending_entry(str(src))
+    # vault_archived_at 取「归集时刻」的当天日期（archive_doc.py 用
+    # datetime.date.today()），与 entry['created'] 无关。夹住调用前后两个日期，
+    # 跨零点时二者不同，取其一即可，避免引入偶发红。
+    before = datetime.date.today().isoformat()
     result = archive_doc(entry, vault_root=str(vault))
+    after = datetime.date.today().isoformat()
 
     assert result['status'] == 'new_archived'
     vp = pathlib.Path(result['vault_path'])
@@ -70,7 +76,13 @@ def test_T1_first_archive_no_frontmatter(tmp_path):
     assert 'vault_source_path' in fm
     assert fm.get('vault_source_hash', '').startswith('sha256:')
     assert fm.get('vault_content_hash', '').startswith('sha256:')
-    assert fm.get('vault_archived_at') == '2026-05-28'  # YYYY-MM-DD
+    archived_at = fm.get('vault_archived_at')
+    # 先钉形态再钉取值：只比对当天日期的话，实现若退化成写死某常量、
+    # 而那常量恰好是今天，本用例仍会绿——形态断言让「不是日期」也无处可藏
+    assert re.fullmatch(r'\d{4}-\d{2}-\d{2}', archived_at or ''), \
+        f'vault_archived_at 不是 YYYY-MM-DD：{archived_at!r}'
+    assert archived_at in (before, after), \
+        f'vault_archived_at 应为归集当天，实际 {archived_at!r}（当天 {before}）'
     assert fm.get('tags') == '[spec, archived]'
 
 

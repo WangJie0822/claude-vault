@@ -1,15 +1,15 @@
-"""防复发守卫：SKILL.md 必须文档化 `relevance` 段的每一个可配键。
+"""防复发守卫：SKILL.md 必须文档化 `_SECTIONS` 列出的每个配置段的每一个可配键。
 
 背景：Task 6 停止首跑全量物化 DEFAULT_CONFIG 后，新装用户盘上只剩
 `_MINIMAL_STUB` 两键占位——「打开生成的 config.json 就能看到全部可配键」这个
 affordance 随之消失。占位里的 `_comment` 明确写着「完整可配键见 SKILL.md」，
 而 SKILL.md 是**分发物中唯一**能承载该责任的文档（spec / plan 在
-`docs/superpowers/`，被 gitignore、不随插件走）。故新增 relevance 键却不写进
+`docs/superpowers/`，被 gitignore、不随插件走）。故新增可配键却不写进
 SKILL.md，等于该键对所有用户不可发现。
 
-只守 `relevance` 段：它是本轮召回质量调参的集中地、键最多且新增最频繁，
-也是 F8 实际漏文档的那一段（16 个键只写了 3 个）。其它段如需同等守护，
-按同一模式扩展 `_SECTIONS` 即可。
+当前守 `relevance`（本轮召回质量调参的集中地、键最多且新增最频繁，也是 F8
+实际漏文档的那一段——16 个键只写了 3 个）与 `metrics`（Task 8 新增的顶层落盘
+开关）。其它段如需同等守护，按同一模式扩展 `_SECTIONS` 即可。
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from scripts._config_loader import DEFAULT_CONFIG
 SKILL_MD = Path(__file__).resolve().parents[1] / "SKILL.md"
 
 # 需要被 SKILL.md 逐键文档化的配置段
-_SECTIONS = ("relevance",)
+_SECTIONS = ("relevance", "metrics")
 
 
 def _skill_text() -> str:

@@ -159,6 +159,57 @@ def build_gold_corpus() -> tuple[list[Entry], list[GoldQuery]]:
     for path, tags, summ, kws in d5_specs:
         corpus.append(_entry(path, tags, summ, kws, age_days=15))
 
+    # ---- D6 灰区条目（Task 4）：能过闸门、但与任何 ground truth 都不相关 ----
+    # 病理来源：真实 Vault 实测每条 prompt 有 **20.6%** 的 active 笔记越过
+    # min_topical_score 闸门，而本语料在加入本组之前 median 只有 **2/220（0.9%）**。
+    # 差距的后果不是"数字不好看"：`admitted_k=20` 的落盘截断、`arm_counts` 的
+    # 截断前聚合，在 admitted 恒为个位数的语料上**一次都触发不到**——那两条逻辑
+    # 的 gold 侧覆盖是空的。
+    #
+    # 机制：**只让 tag 命中**（`prompt_tag_hit` 4 × IDF 1.0 = 4.0），summary 与
+    # keywords 都不命中。于是灰区条目恒为 **4.0 = 闸门值本身**：
+    #   >= 闸门 4（进得来，撑起 admitted 规模）
+    #   <  任何真正相关条目（实测各查询 ground truth 最低 5 分，多数 6~11 分）
+    # 这正是 D5 记录的生产病理在**正向查询**上的形态：真实笔记的 tag 与 prompt 共享
+    # 一个术语就够越过闸门，尽管主题毫不相关。
+    #
+    # ⚠️ 走 tag 而不是 keywords，是**实测倒逼**的：初版用 keywords 命中（+5），
+    # nDCG@10 从 0.90 掉到 0.855、tag-IDF 相对 flat 的改进比从 >10% 掉到 2.7%，
+    # 三条排序基线全红。探针查出根因——5 分并非「稳稳低于相关条目」：
+    # 「MSYS_NO_PATHCONV 是干什么的」「fail-open 容错设计」「prompt injection 防护」
+    # 三条查询的 ground truth 本身只有 **5 分**，灰区与它们同分、把它们挤出前排。
+    # 4.0 才是真正的「灰区」——恰好卡在闸门线上，严格低于每一条相关笔记。
+    #
+    # tag 一律构造成 singleton（嵌入条目序号保证全局唯一）：`tag_idf_factor` 在
+    # df=1 时恒为 1.0（公式自消，与 n_docs 无关），故本组既不稀释既有 tag 的 IDF、
+    # 也不让自己因互相重复而掉到闸门以下。多 tag 命中取 **max 不累加**，所以一条
+    # 挂 5 个 tag 仍然只得 4.0。
+    # summary 刻意保持中性、keywords 留空：任一蹭到查询词都会加 2 或 5 分，
+    # 直接反超相关条目（守卫见 test_gold_corpus.py 的 D6 上界断言）。
+    #
+    # ⚠️ **未能对齐到 20.6%，这是算术上的硬约束，不是没做完**：设灰区条目数 G、
+    # 每条对全部查询都命中，则占比 = (2+G)/(220+G)，要到 20% 需 G≈53 且**每条都得
+    # 覆盖全部 10 个主题的词汇**（≈20 个 keywords/篇），那种笔记现实中不存在。
+    # 若每条只覆盖部分主题，占比随覆盖面单调下降。本组取「每条 5 个主题、10 个
+    # keywords」这一仍属可信的密度，把 median 从 0.9% 抬到实测约 14%，并**确保超过
+    # admitted_k=20**——后者才是这组的硬指标。完全对齐需要重构查询与条目的词汇密度，
+    # 属 plan 层议题，不在本组范围。
+    # 词池含 D4 的两个术语：不含它们时「时效权衡 recency」是唯一 admitted 仍为 2 的
+    # 查询（实测），留着会在分布里形成一个与语料构造无关的离群点。
+    kw_pool = [k for _, _, kws, _ in topics for k in kws] + ["时效权衡", "recency"]
+    D6_TOPICS_PER_ENTRY = 5                                     # 每条覆盖 5 个主题
+    span = D6_TOPICS_PER_ENTRY * 2
+    for i in range(80):
+        start = (i * 3) % len(kw_pool)                          # 步长 3 与词池长度互质，均匀铺开
+        # 术语嵌进 tag 名，并缀上条目序号保证 df=1；CJK 走子串匹配、ASCII 走词边界，
+        # 两类术语都能被 `-灰区NNN` 后缀之前的部分命中。
+        tags = [f"{kw_pool[(start + j) % len(kw_pool)]}-灰区{i:03d}" for j in range(span)]
+        corpus.append(_entry(
+            f"干扰/gray-{i:03d}.md", tags,
+            "本篇是一次例行事务的存档，不含任何技术结论。",
+            (), age_days=i % 100,
+        ))
+
     # ---- 补足到 200+ 篇的背景噪声 ----
     for i in range(60):
         corpus.append(_entry(f"背景/bg-{i:03d}.md", [f"bgtag-{i}"],

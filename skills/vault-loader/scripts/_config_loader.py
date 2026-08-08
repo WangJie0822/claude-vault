@@ -97,6 +97,20 @@ DEFAULT_CONFIG: dict = {
         "use_tag_idf": True,
         "tag_idf_floor": 0.5,       # 泛 tag 的保底因子；0 会让泛 tag 归零、行为剧变
     },
+
+    "metrics": {
+        "enabled": False,        # opt-in：默认关，避免对存量用户静默启用新落盘
+        "near_miss_k": 10,       # 每轮记录 excluded 中 topical 最高的 K 条
+        "admitted_k": 20,        # 每轮落盘 admitted 按 total 降序保留的展示样本条数上限；
+                                  # 真实 Vault 实测单轮 admitted 可达 58~156 条，未截断落盘
+                                  # 体积超 README 声称上界 3.7~9.4 倍。截断只影响展示样本，
+                                  # 统计口径见 build_record 落盘的 n_admitted/arm_counts。
+        "retention_days": 90,    # 超期月份目录自动清理
+        # Task 13：near-miss 提示阈值与全局冷却。77 轮真实 prompt 实测：阈值 ≥10
+        # 才产出可控的候选数（4 个）；判据一律偏向沉默，不得自行放宽。
+        "nudge_threshold": 10,
+        "nudge_ttl_hours": 168,  # 全局冷却：一周最多提示一次
+    },
 }
 
 # P0 升级链治理（spec §8.1）：首跑落盘用最小占位而非全量 DEFAULT_CONFIG。
@@ -181,6 +195,14 @@ def load_config(path: Path | None = None) -> dict:
 
     新代码应优先用 `load_config_ex`——它能区分「零配置新装」与「config 损坏静默回退」。
     这两者在本函数的返回值上**完全同形**，而后者是全用户级的静默失效单点。
+
+    ⚠️ **刻意不给这一行加 try 保护**（full-review D3，2026-08-06 用户拍板「不修，
+    记为已知」）。评审曾建议在此兜底 `load_config_ex` 抛出的异常，controller 实测
+    该改动**不改变任何可观测行为**：修改前后同为 rc=0、stdout 为空。原因是下游
+    `take_user_visible` 同样要读 `~/.claude`、会以同样的方式失败，调用链最终落到
+    `emit(None, None)` 静默返回——异常在这里被吃掉与在那里被吃掉，对外完全等价。
+    属「看起来更稳妥但实际无效」的改动，加了只会多一层遮蔽真实故障点的 except。
+    记在这里是为了避免后人再花一轮去尝试同一个想法。
     """
     return load_config_ex(path).config
 

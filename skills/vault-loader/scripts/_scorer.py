@@ -90,16 +90,20 @@ def _keyword_hits_keywords(keyword: str, entry: Entry) -> bool:
 
 
 def has_keyword_hit(entry: Entry, prompt_keywords, use_keywords: bool = True) -> bool:
-    """是否有「未命中任何 tag」的查询词命中 entry.keywords。
-    打分（_prompt_topical_hits）与候选闸门（prompt_submit_load）共用此单点判定，
-    避免逻辑漂移。去重语义：既命中 tag 又命中 keyword 的词只算 tag、不计 keyword。"""
+    """entry.keywords 是否被任一 prompt 关键词命中。
+
+    打分（_prompt_topical_hits）与候选闸门（prompt_submit_load / _decision）共用此单点判定，
+    避免逻辑漂移。
+
+    **BUG-1（2026-08-06）**：此前语义为「既命中 tag 又命中 keyword 的词只算 tag、不计
+    keyword」。该去重在 prompt_keyword_hit=3 < prompt_tag_hit=4 时合理，但权重调为 5 后
+    产生惩罚性反转——tag 与 keywords 双命中（作者既打标签又列检索词，是最强相关性信号）
+    反而只拿 tag 的 4×IDF≤4，比仅 keywords 单命中的 5 分更低。实测该反转正是真实案例中
+    目标笔记落后 Top1 恰好 1.20 分（5−3.80）的唯一成因。故取消去重、允许双计。
+    """
     if not (use_keywords and entry.keywords and prompt_keywords):
         return False
-    return any(
-        _keyword_hits_keywords(kw, entry)
-        for kw in prompt_keywords
-        if not _keyword_hits_tags(kw, entry)
-    )
+    return any(_keyword_hits_keywords(kw, entry) for kw in prompt_keywords)
 
 
 def build_tag_df(entries) -> dict[str, int]:

@@ -59,12 +59,17 @@ def large_vault(tmp_home: Path) -> Path:
     subprocess.run(
         [sys.executable, str(FIXTURE_BUILDER), str(vault), "500"],
         check=True,
+        # builder 卡住时不设上限会让整个测试跑静默挂死到 CI 超时，无堆栈可看
+        timeout=300,
     )
     return vault
 
 
-def _run_script(script_name: str, cwd: Path, prompt: str = "") -> tuple[float, str]:
-    hook_input = json.dumps({"cwd": str(cwd), "prompt": prompt})
+def _run_script(script_name: str, cwd: Path, prompt: str = "",
+                extra: dict | None = None) -> tuple[float, str]:
+    payload = {"cwd": str(cwd), "prompt": prompt}
+    payload.update(extra or {})
+    hook_input = json.dumps(payload)
     env = os.environ.copy()
     # 子进程强制 UTF-8（镜像生产；Windows 默认 GBK 会令 hook 输出 emoji/中文失败）
     env.setdefault("PYTHONUTF8", "1")
@@ -129,3 +134,64 @@ def test_prompt_submit_under_300ms(tmp_home: Path, large_vault: Path) -> None:
     # 超支主导项是解释器启动 + O(N) 打分主循环 + 进程 spawn。此处保持 500 篇是为避免
     # 更大规模在内存压力下 flaky；真正的 scaling 天花板需要倒排索引，属独立议题。
     assert p95 < 0.3, f"UserPromptSubmit 性能超标: {p95:.3f}s（500 笔记参考基线）"
+
+
+def test_prompt_submit_with_metrics_enabled_stays_within_budget(
+        tmp_home: Path, large_vault: Path) -> None:
+    """metrics 开启后 UPS 仍须在预算内，且必须证明**真的**写了 metrics。
+
+    此前性能守卫从未在 `metrics.enabled=True` 下跑过——决策面落盘（`stage()`/
+    `flush()`、读盐、`near_miss_counts` 取锁、prune 频率闸门）全都加在 UPS 热路径
+    上，却没有任何性能门禁覆盖它们。
+
+    预算给到 0.5s（关闭态是 0.3s）而非卡死在 0.3s：这条守卫要拦的是「每次 flush
+    都去扫整个月份目录」「prune 退化成每次都跑」这类**量级**回归，不是几毫秒抖动。
+    卡太死只会得到一条常年偶发红、然后被无视的用例——那等于没有守卫。
+
+    **落盘断言是本用例的关键**：没有它，metrics 若因任何原因静默没启用（配置键
+    写错、opt-in 判定改动、import 失败被 fail-open 吞掉），这里测到的其实是关闭态
+    的耗时，照样绿。一条测不到目标路径的性能守卫比没有更糟——它提供虚假的安全感。
+    """
+    from scripts import _metrics
+
+    cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({
+        "dry_run": False,
+        "vault_path": str(large_vault),
+        "metrics": {"enabled": True, "near_miss_k": 10, "admitted_k": 20,
+                    "retention_days": 90, "nudge_threshold": 10,
+                    "nudge_ttl_hours": 168},
+    }))
+
+    prompt = "召回 扩展词 相关性打分 回归测试 语义检索 关键词匹配 怎么优化实现"
+    sid = "sess-perf-metrics"
+    total = 0
+    for _ in range(WARMUP):
+        _run_script("prompt_submit_load.py", NEUTRAL_CWD, prompt=prompt,
+                    extra={"session_id": sid, "prompt_id": f"pid-w{total}"})
+        total += 1
+    samples = []
+    for i in range(SAMPLES):
+        elapsed, _ = _run_script(
+            "prompt_submit_load.py", NEUTRAL_CWD, prompt=prompt,
+            extra={"session_id": sid, "prompt_id": f"pid-{i}"})
+        samples.append(elapsed)
+        total += 1
+
+    # 先证明测的是 metrics 开启态，再谈耗时——顺序刻意如此：落盘断言不过时，
+    # 耗时数字毫无意义，不该让它先被读到。
+    lines = 0
+    for d in _metrics.event_month_dirs(tmp_home):
+        for f in d.glob("*.jsonl"):
+            lines += sum(1 for ln in f.read_text(encoding="utf-8").splitlines()
+                         if ln.strip())
+    assert lines == total, (
+        f"metrics 未按预期落盘：期望 {total} 条记录（{WARMUP} 预热 + {SAMPLES} 采样），"
+        f"实际 {lines} 条。本用例测的可能根本不是 metrics 开启态。")
+
+    observed = statistics.median(samples)
+    assert observed < 0.5, (
+        f"metrics 开启态 UserPromptSubmit 性能超标: median {observed:.3f}s"
+        f"（{SAMPLES} 样本，500 笔记 fixture，关闭态预算 0.3s）\n"
+        f"全部样本: {[f'{s:.3f}' for s in sorted(samples)]}")

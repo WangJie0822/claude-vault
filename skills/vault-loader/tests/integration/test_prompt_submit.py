@@ -62,7 +62,7 @@ def test_build_summary_ups_list_format():
         items, {"hook", "skill"}, None, injection_text,
         {"verbosity": "list", "show_size": True}, rel_cfg,
     )
-    assert out.startswith("📚 vault-loader · 提问注入 · 1 笔记 · 关键词[hook, skill] · ~1.5k 字")
+    assert out.startswith("📚 vault-loader · 提问注入 · 1 笔记 · 命中[hook, skill] · ~1.5k 字")
     assert "- hook  [高置信]" in out
 
 
@@ -74,7 +74,7 @@ def test_build_summary_ups_compact_format():
         items, {"hook"}, None, injection_text,
         {"verbosity": "compact", "show_size": True}, rel_cfg,
     )
-    assert out == "📚 vault-loader(提问): 1笔记[hook] 关键词[hook] · ~300 字 · /vault 展开"
+    assert out == "📚 vault-loader(提问): 1笔记[hook] 命中[hook] · ~300 字 · /vault 展开"
 
 
 def test_build_injection_text_ups_list_golden() -> None:

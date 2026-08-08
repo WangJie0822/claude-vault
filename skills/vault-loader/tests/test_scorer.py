@@ -250,11 +250,13 @@ def test_keyword_only_hit_scores_keyword_weight():
     assert topical_score(e, sigs, _default_weights()) == 3
 
 
-def test_keyword_hit_deduped_against_tag():
-    # 同一查询词既命中 tag 又命中 keyword → 只计 tag(4)，不双计(不 +3)
+def test_tag_and_keyword_double_count():
+    # BUG-1 修复后：同一查询词既命中 tag 又命中 keyword → 双计 4+3=7。
+    # 旧语义「只计 tag(4)」是缺陷本体——双命中是最强相关性信号，
+    # 反而因去重丢掉 keyword 分，实测让目标笔记从 Top3 掉到第 16。
     e = Entry(path="x.md", tags=("vault-loader",), keywords=("vault-loader",))
     sigs = Signals(prompt_keywords={"vault-loader"})
-    assert topical_score(e, sigs, _default_weights()) == 4
+    assert topical_score(e, sigs, _default_weights()) == 7
 
 
 def test_tag_and_distinct_keyword_sum():
@@ -285,11 +287,11 @@ def test_score_keyword_only_path():
     assert score(e, sigs, _default_weights()) == 3
 
 
-def test_has_keyword_hit_dedups_and_gates():
+def test_has_keyword_hit_gates():
     from scripts._scorer import has_keyword_hit
     e = Entry(path="x.md", tags=("vault-loader",), keywords=("vault-loader", "召回"))
-    # "vault-loader" 既命中 tag 又命中 keyword → 去重后不算；"召回" 仅命中 keyword → 算
-    assert has_keyword_hit(e, {"vault-loader"}) is False
+    # BUG-1：tag 与 keywords 双命中不再去重——它是最强信号，两份权重都要计
+    assert has_keyword_hit(e, {"vault-loader"}) is True
     assert has_keyword_hit(e, {"召回"}) is True
     # 门控：use_keywords=False / 空 keywords / 空 prompt → False
     assert has_keyword_hit(e, {"召回"}, use_keywords=False) is False

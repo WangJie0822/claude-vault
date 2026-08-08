@@ -52,7 +52,7 @@ except Exception as _import_exc:  # noqa: BLE001 — fail-open 优先于一切
 # 它加载失败会让整轮召回一起没了；这里退化成「没有诊断」，召回照常。
 try:
     from scripts._diagnostics import (
-        cache_broken, config_corrupt, notify, take_user_visible,
+        cache_broken, config_corrupt, near_miss_nudge, notify, take_user_visible,
         vault_path_mismatch, vault_unreachable,
     )
 except Exception as _diag_exc:  # noqa: BLE001
@@ -75,6 +75,43 @@ except Exception as _diag_exc:  # noqa: BLE001
 
     def vault_path_mismatch(*_a, **_k):  # type: ignore[misc]
         return None
+
+    def near_miss_nudge(*_a, **_k):  # type: ignore[misc]
+        return None
+
+# metrics 模块单独兜底：与诊断模块同理，是**增强**、不是召回的前提——_metrics.py 后续
+# 任务（8/9/13）还会持续改动，任何导入期问题（语法错误、分发缺文件、依赖缺失）都不能
+# 让每次提问的召回全部失效（那会是「stdout 空、exit 0、零告警」这种最隐蔽的失败模式，
+# 与 test_fail_open.py 钉死的"核心模块导入失败即静默 exit 0"契约同构，但 metrics 本
+# 不该占用那道防线——它连"没有本轮指标"的代价都不该让召回一起赔上）。
+try:
+    from scripts import _metrics
+except Exception as _metrics_exc:  # noqa: BLE001
+    print(f"[vault-loader] metrics 模块不可用，本轮不落盘指标：{_metrics_exc}", file=sys.stderr)
+
+    class _MetricsStub:  # type: ignore[misc]
+        """metrics 导入失败时的零功能替身，覆盖全部被调用接口
+        （stage/flush/build_record/get_salt）——调用点无需改成 `if _metrics is not None`
+        分支即可正常工作。即便未来漏补某个新接口，各调用点自身仍有独立 try/except 兜底
+        （见 main() 的 stage 块与 _finish_with_metrics），不依赖这层替身作唯一防线。"""
+
+        @staticmethod
+        def stage(record: dict) -> None:
+            return None
+
+        @staticmethod
+        def flush(home: Path, retention_days: int | None = None) -> None:
+            return None
+
+        @staticmethod
+        def build_record(*_a, **_k) -> dict:
+            return {}
+
+        @staticmethod
+        def get_salt(home: Path) -> bytes:
+            return b""
+
+    _metrics = _MetricsStub()
 
 # 「未传」哨兵：fulltext_path=None 是有意义的取值（决策层判定本轮**不**注入全文），
 # 故不能用 None 区分"调用方没传"。没传 → 渲染层按 select_fulltext 自行回退计算
@@ -337,7 +374,8 @@ def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, di
     conf_high = rel_cfg["confidence_bands"]["high"]
     show_size = display_cfg.get("show_size", True)
     size = f" · {approx_size_str(injection_text)}" if show_size else ""
-    # S1：「关键词」只展示 items（本轮实际展示的笔记）命中的词并集，与正文头部同源；
+    # S1：这里是「本轮展示的笔记各自命中词的并集」，**不是**从 prompt 提取的关键词全集
+    # （BUG-2：旧标签写作「关键词」，导致用户把排序失准误诊为分词失准）。
     # 逐条 hit_list 复用（既做摘要头并集来源，又做置信度判定），不重复计算。
     _hits = _make_hits_getter(prompt_keywords, hits_by_path)
     hit_lists = [_hits(e) for _, _, e in items]
@@ -364,8 +402,8 @@ def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, di
         titles = "·".join(_title(e.path) for _, _, e in items[:3])
         more = "…" if n > 3 else ""
         return (f"📚 vault-loader(提问): {n}笔记[{titles}{more}] "
-                f"关键词[{kw}]{size}{ft} · /vault 展开")
-    head = f"📚 vault-loader · 提问注入 · {n} 笔记 · 关键词[{kw}]{size}{ft}"
+                f"命中[{kw}]{size}{ft} · /vault 展开")
+    head = f"📚 vault-loader · 提问注入 · {n} 笔记 · 命中[{kw}]{size}{ft}"
     body = [f"- {_title(e.path)}  [{_confidence_label(top, hit_list, conf_high)}置信]"
             for (_, top, e), hit_list in zip(items, hit_lists)]
     return "\n".join([head, *body, "💡 /vault <关键词> 展开全文"])
@@ -396,6 +434,29 @@ def _finish(
         system_message = f"{diag_text}\n{system_message}" if system_message else diag_text
     emit(additional_context, system_message, "UserPromptSubmit")
     return 0
+
+
+def _finish_with_metrics(config: dict, cwd: Path,
+                         additional_context: str | None = None,
+                         system_message: str | None = None) -> int:
+    """先走原出口完成 emit，再写 metrics。
+
+    顺序不可颠倒：emit 之前抛出的任何异常都会被入口 try/except 吞成 exit 0，
+    使 stdout 变空、本轮注入静默全丢（退出码仍为 0，无任何告警）。
+    metrics 写盘失败只降级为「这条指标没记上」，绝不连累召回。
+
+    `retention_days` 只在 `metrics.enabled` 为真时才传给 `flush()`——H2 修复的
+    超期清理与其余全部 metrics 副作用（落盘、near-miss 计数、nudge 提示）同一
+    opt-in 前提：未开启时不落盘也不做任何 metrics 目录相关 IO，维持零足迹。
+    """
+    rc = _finish(config, cwd, additional_context, system_message)
+    try:
+        mcfg = config.get("metrics", {}) or {}
+        retention_days = mcfg.get("retention_days", 90) if mcfg.get("enabled", False) else None
+        _metrics.flush(Path.home(), retention_days=retention_days)
+    except Exception as exc:  # noqa: BLE001 — 指标绝不阻断召回
+        print(f"[vault-loader] metrics 写入失败：{exc}", file=sys.stderr)
+    return rc
 
 
 def main() -> int:
@@ -434,6 +495,34 @@ def main() -> int:
     if cfg_fallback == "corrupt":
         notify(config_corrupt(cfg_detail))
 
+    # Task 13：near-miss 提示。metrics 默认关闭（config.get 缺键时恒 False），
+    # 仅开发者手动开启后才可能触发；`_metrics.nudge_due` 自带全局冷却，不会
+    # 每轮都提示。任何异常只降级为「本轮无提示」，绝不连累召回。
+    if config.get("metrics", {}).get("enabled", False):
+        try:
+            mcfg = config["metrics"]
+            due = _metrics.nudge_due(Path.home(),
+                                     threshold=mcfg.get("nudge_threshold", 10),
+                                     ttl_hours=mcfg.get("nudge_ttl_hours", 168))
+            if due:
+                notify(near_miss_nudge(due))
+                # fix round 1：刻意接受的取舍，不是遗漏。`notify()` 只把诊断登记进
+                # `_diagnostics._PENDING`——「登记了」不等于「用户看到了」：真正是否
+                # 渲染进 systemMessage 取决于本轮末尾 `take_user_visible()` 的两道
+                # 独立门禁（`display.user_visible` 开关、按 code+cwd 的 TTL 冷却）。
+                # 正常路径下这两道门禁不构成风险：全局 168h 冷却远大于 per-cwd 默认
+                # 24h TTL，不会被拦；`display.user_visible=false` 时用户本就主动关掉
+                # 了全部诊断，看不到是预期行为。真正的残余风险只有一种——`_finish`
+                # 里 `take_user_visible()` 抛异常会被吞掉、降级为「没有诊断」（诊断
+                # 绝不能阻断召回），此时这一周的提示机会已被 `mark_nudged` 消耗且
+                # 不可逆、且无任何痕迹。这里不额外加 `display.user_visible` 前置检查
+                # ——那只会让代码看起来解决了比实际更多的问题（`take_user_visible`
+                # 内部的门禁逻辑仍可能变、双份判断反而是新的不一致来源），真正的洞
+                # （渲染期异常）加这个检查也堵不住。
+                _metrics.mark_nudged(Path.home())
+        except Exception as exc:  # noqa: BLE001 — 提示绝不阻断召回
+            print(f"[vault-loader] near-miss 提示失败：{exc}", file=sys.stderr)
+
     vault_path = Path(config["vault_path"]).expanduser()
     # 零配置：非 dry-run 且 vault_path 仍是默认值时才自动建目录（幂等；失败由顶层
     # fail-open 兜底）。用户**显式配置**过的路径不存在时不代建——见 ensure_vault_if_default
@@ -449,13 +538,13 @@ def main() -> int:
             pass
     if not vault_path.exists():
         notify(vault_unreachable(vault_path))
-        return _finish(config, cwd)
+        return _finish_with_metrics(config, cwd)
 
     rel_cfg = config["relevance"]
     # 拦截非用户手输 prompt（后台 task-notification / 系统注入）——其文本含 UUID/tool-id/路径碎片，
     # 当关键词会污染注入（实证：会话 a9ee6be0 后台命令完成通知被处理、切出 cashbook 假强命中）。
     if rel_cfg.get("skip_non_user_prompts", True) and _is_system_injected_prompt(hook_input, prompt):
-        return _finish(config, cwd)
+        return _finish_with_metrics(config, cwd)
 
     # 信号 J（剥 slash + 英文切分 + CJK bigram + 头尾截断均由 relevance 控制）
     prompt_keywords = collect_signal_j_prompt_keywords(
@@ -471,7 +560,7 @@ def main() -> int:
     # 保持旧时机——不因抽出决策纯函数而推迟早退、令热路径多背两次 state 读 + 一次 cache 读。
     gate_reason, _ = gate_keywords(prompt_keywords, config)
     if gate_reason == "too_few_keywords":
-        return _finish(config, cwd)
+        return _finish_with_metrics(config, cwd)
 
     target_tags = set(i_result.tags) | collect_signal_b_keyword_map(
         cwd, config.get("keyword_to_tags", {})
@@ -492,7 +581,7 @@ def main() -> int:
         # 都是健康态，对它们告警会命中每个新装用户和下次 bump 后的全部存量用户。
         if cache_status.is_failure():
             notify(cache_broken(cache_status.value, vault_path))
-        return _finish(config, cwd)
+        return _finish_with_metrics(config, cwd)
 
     ttl = ups_cfg["state_ttl_hours"]
     all_injected = load_already_injected(cwd, ttl)
@@ -513,6 +602,26 @@ def main() -> int:
     # return 0（见上方），本调用点 prompt_keywords/config 与该早退判定完全同源，
     # decide_injection 内部复算的 gate_keywords 结果必然一致，不会再触发 too_few_keywords。
 
+    # metrics 落盘：默认关闭（config 无 "metrics" 键时 .get 恒返回 False），仅开发者
+    # 手动开启。stage 零 IO，真正写盘延后到 _finish_with_metrics 的 flush；此处任何
+    # 异常只降级为「这条指标没记上」，绝不连累召回（下面 admitted/not admitted 两分支
+    # 共用同一出口，near-miss 与命中都要能被记录）。
+    if config.get("metrics", {}).get("enabled", False):
+        try:
+            # session_id/prompt_id/salt/near_miss_k/admitted_k 一律按关键字传参——
+            # build_record 已把 session_id/prompt_id 收紧为 keyword-only（M3 修复），
+            # 相邻同类型位置参数一旦被上游误对调会静默错位（session 决定落盘文件名）。
+            _metrics.stage(_metrics.build_record(
+                decision, prompt_keywords, cwd,
+                session_id=hook_input.get("session_id", ""),
+                prompt_id=hook_input.get("prompt_id", ""),
+                salt=_metrics.get_salt(Path.home()),
+                near_miss_k=config["metrics"].get("near_miss_k", 10),
+                admitted_k=config["metrics"].get("admitted_k", 20),
+            ))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vault-loader] metrics 构造失败：{exc}", file=sys.stderr)
+
     if not decision.admitted:
         # 触发点2：关键词足够但 topical 全失配。relaxed 静默；非 relaxed 加 state 冷却
         # （TTL 窗口内最多提示一次），确无相关篇（非"已注入过"）才出。
@@ -522,14 +631,14 @@ def main() -> int:
                 and display_cfg.get("verbosity") != "off"
                 and fallback_cooldown_expired(cwd, ups_cfg["state_ttl_hours"])):
             save_fallback_ts(cwd)
-            return _finish(
+            return _finish_with_metrics(
                 config, cwd,
                 system_message="📚 vault-loader：本轮提问未匹配到强相关笔记，"
                                "可运行 /vault <关键词> 手动检索",
             )
         if config.get("verbose_on_skip"):
-            return _finish(config, cwd, system_message="📚 vault-loader: 本轮 prompt 无强相关笔记")
-        return _finish(config, cwd)
+            return _finish_with_metrics(config, cwd, system_message="📚 vault-loader: 本轮 prompt 无强相关笔记")
+        return _finish_with_metrics(config, cwd)
 
     # 渲染层沿用 (total, topical, entry) 三元组形态：由 EntryDecision + active_entries 还原。
     scored = [(ed.total, ed.topical, active_entries[ed.path]) for ed in decision.admitted]
@@ -552,7 +661,7 @@ def main() -> int:
 
     if dry_run:
         # dry-run 下诊断并入同一条 systemMessage（由 _finish 置顶），不另起一次 emit。
-        return _finish(
+        return _finish_with_metrics(
             config, cwd,
             system_message=(f"[DRY-RUN] 本应注入：\n{summary}" if summary else None),
         )
@@ -567,7 +676,7 @@ def main() -> int:
     except Exception as exc:
         print(f"[vault-loader] state 写入失败：{exc}", file=sys.stderr)
 
-    return _finish(config, cwd, additional_context=injection_text, system_message=summary)
+    return _finish_with_metrics(config, cwd, additional_context=injection_text, system_message=summary)
 
 
 if __name__ == "__main__":
