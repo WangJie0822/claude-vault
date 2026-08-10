@@ -450,3 +450,77 @@ def test_T26_source_not_exist_returns_original_missing(tmp_path):
                          vault_root=str(vault))
     assert result['status'] == 'original_missing'
     assert 'not exist' in result['reason'].lower()
+
+
+# ========== T27-T30 keywords 透传（pending-docs → frontmatter） ==========
+#
+# 背景：spec/plan 源文档没有 frontmatter，Vault 副本的 frontmatter 全部由本模块
+# 生成，而此前它从不写 keywords —— 于是每归集一篇就留一个召回空洞，只能靠事后
+# 手动跑 enrich_keywords.py 补。keywords 走与 summary 相同的通路（entry 字段，
+# 由 LLM 写 pending-docs 时一并填），零额外模型调用。
+
+_NO_KW = object()   # 与 None 区分：None 是「显式填了 null」，本哨兵是「键根本不存在」
+
+
+def _archive_with_keywords(base, keywords, name='spec.md'):
+    """建仓 + 归集一篇带指定 keywords 的 entry，返回 (副本全文, frontmatter dict)。"""
+    base.mkdir(parents=True, exist_ok=True)
+    repo = base / 'project'
+    repo.mkdir()
+    _make_git_repo(repo)
+    src = repo / 'docs' / name
+    src.parent.mkdir(parents=True)
+    src.write_text('# Body\n\nbody', encoding='utf-8')
+    vault = base / 'Vault'
+    vault.mkdir()
+    entry = _make_pending_entry(str(src))
+    if keywords is not _NO_KW:
+        entry['keywords'] = keywords
+    result = archive_doc(entry, vault_root=str(vault))
+    assert result['status'] == 'new_archived'
+    vp = pathlib.Path(result['vault_path'])
+    return vp.read_text(encoding='utf-8'), _read_frontmatter_kv(vp)
+
+
+def test_T27_keywords_passthrough_to_frontmatter(tmp_path):
+    """T27: entry 带合法 keywords → 落进 frontmatter，YAML inline 数组风格。"""
+    text, fm = _archive_with_keywords(
+        tmp_path, ['召回打分', 'recall scoring', 'tag-IDF'])
+    assert 'keywords' in fm, 'entry 带 keywords 时必须落进 frontmatter'
+    assert fm['keywords'] == '[召回打分, recall scoring, tag-IDF]'
+    # 钉形态而非仅钉子串：必须是 YAML inline 数组，不能是 Python repr（['a', 'b']）
+    assert re.search(r'^keywords: \[[^\]\n]*\]$', text, re.M), \
+        'keywords 必须是单行 inline 数组，否则读端解析不到'
+
+
+def test_T28_no_keywords_key_when_entry_lacks_it(tmp_path):
+    """T28: entry 无 keywords → frontmatter 不得出现该键（不写空数组）。
+
+    这是存量 pending-docs 条目的实际形态，必须零行为变化——写空数组会让
+    rebuild_index 的覆盖率统计把它算成「已有 keywords」，把缺口藏起来。
+    """
+    text, fm = _archive_with_keywords(tmp_path, _NO_KW)
+    assert 'keywords' not in fm
+    assert 'keywords' not in text
+
+
+def test_T29_illegal_keywords_are_sanitized(tmp_path):
+    """T29: 入参是 LLM 手填的，任何形态都可能出现，必须过 sanitize 再落盘。
+
+    直接透传的话，`a: b` 这类值会就地破坏 frontmatter 的 YAML 结构。
+    """
+    text, fm = _archive_with_keywords(
+        tmp_path, ['正常词', 'a: b', 'x', 'has\nnewline', 123, '正常词'])
+    # 合法的留下、非法的剔除、重复的去重
+    assert fm['keywords'] == '[正常词]'
+    # 元字符没有以任何形式漏进 frontmatter 区
+    fm_block = text.split('---')[1]
+    assert 'a: b' not in fm_block
+    assert 'newline' not in fm_block
+
+
+def test_T30_non_list_keywords_ignored(tmp_path):
+    """T30: keywords 是字符串/dict/None/数字等非 list → 当作没填，不写该键、不崩。"""
+    for i, bad in enumerate(('召回, 打分', {'a': 1}, None, 42)):
+        text, fm = _archive_with_keywords(tmp_path / f'case{i}', bad)
+        assert 'keywords' not in fm, f'非 list 输入 {bad!r} 不应写入 keywords'

@@ -473,6 +473,7 @@ summary: "2026-03-19 工作记录"
    - `stale_indexes`：磁盘上存在但本次未写入的孤立索引文件列表（旧名 INDEX.md 或未更新的 {category} 索引.md）
    - `specplan_no_backlink`：已归集 spec/plan 无任何 `[[wikilink]]` 指向的数量（窄化检测，P4）
    - `unresolved_links`：正文 `[[target]]` 指向 Vault 内不存在目标的悬空链接数
+   - `keywords_missing` / `keywords_coverage`：缺 `keywords` 的知识笔记数与覆盖率（工作日志豁免，分子分母同口径）。覆盖率 <80% 时脚本在 stderr 告警。缺口的处置见下一步
 
    若 `category_with_slash + project_field + folder_subcat_missing > 0`：在第五步输出中明确告知用户，建议追加跑一次：
    ```bash
@@ -487,13 +488,33 @@ summary: "2026-03-19 工作记录"
    归档目标 `.meta/archived-indexes/<date>/`，可回收。
 
    **不要**在 skill 流程内自动跑 `--fix-frontmatter`——动笔记原文件需用户明确授权。
-5. 如果新建了笔记，检查是否需在 CLAUDE.md 或其他笔记中添加 `[[wikilink]]` 引用（无需文件夹路径）
-6. 标记当前会话为已总结（避免 `--catch-up` 重复处理）：
+5. **补全 keywords 缺口**——`keywords` 是 vault-loader 的精确召回通路（权重 5，最强信号），缺失即该篇在提问时召不回来：
+
+   ```bash
+   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   python3 "$SS/keywords_gap.py" --vault "$VAULT" --list --limit 10
+   ```
+
+   - 输出 `{"total": N, "missing": [...]}`：`total` 是全量缺口，`missing` 是本次要处理的（受 `--limit` 截断）。**必须在上一步的 `rebuild_index` 之后跑**，它读的是那一步刷新的 cache
+   - `total == 0` → 跳过本步，不必输出任何提示
+   - 否则**逐篇 Read 笔记正文**，自己生成 3-8 个中文/英文检索扩展词（同义词、别名、跨语言术语），再写回：
+     ```bash
+     SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+     python3 "$SS/keywords_gap.py" --vault "$VAULT" \
+       --set "<missing 数组里的路径>" --keywords "词1,词2,词3"
+     ```
+   - **零额外模型调用**：你本来就在会话里跑，读笔记自己想词即可。**不要**改调 `enrich_keywords.py`——那个每篇 spawn 一次付费 haiku，是清存量专用、手动 opt-in 的
+   - 词的质量约束同 `references/note-format.md`：CJK ≥2 字、ASCII ≥3 字；禁单字与"性能/优化/设计"这类超宽通用词（子串匹配会刷命中无关提问）。非法词由 `--set` 静默剔除，返回值里的 `keywords` 才是实际写入的
+   - `--limit 10` 是**刻意限流**：存量缺口大时不要一次补完拖垮会话，剩下的下次会话继续；`total` 始终如实报全量
+   - 每次 `--set` 返回 `cache_synced`：为 `false` 时该篇召回要等下次 rebuild 才生效，在第五步输出中如实提示，不要当作成功
+   - 归集进来的 spec/plan 正常情况下不该出现在这里——它们的 keywords 由 `archive_doc` 从 pending-docs 条目透传（见「文档归集」）。若持续出现，说明写 pending-docs 时漏填了该字段
+6. 如果新建了笔记，检查是否需在 CLAUDE.md 或其他笔记中添加 `[[wikilink]]` 引用（无需文件夹路径）
+7. 标记当前会话为已总结（避免 `--catch-up` 重复处理）：
    ```bash
    SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
    python3 "$SS/scan_sessions.py" --mark-current "$PWD"
    ```
-7. **提交知识库改动（git commit）**——默认开启，`--no-commit` 跳过：
+8. **提交知识库改动（git commit）**——默认开启，`--no-commit` 跳过：
    ```bash
    SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
    python3 "$SS/git_commit_vault.py" --vault "$VAULT" --title "<本次会话标题>"

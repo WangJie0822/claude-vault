@@ -20,6 +20,27 @@ python3 .../sync_pending_docs.py --vault "$VAULT" --mode backfill --output-json 
 # 输出 dry-run 报告，等用户加 --apply 才写
 ```
 
+## 条目字段契约（谁填什么）
+
+`pending-docs.json` 是一个 JSON 数组。**生成文档的一方**（写 spec/plan 的那次会话）只填下表前几项，其余一律由 `sync_pending_docs.py` 自动维护，手填会被覆盖或导致状态错乱。
+
+| 字段 | 谁填 | 说明 |
+|---|---|---|
+| `path` | 生产方 | 文档的**绝对路径**。相对路径会被判 `path_invalid` 永久跳过、不归集 |
+| `type` | 生产方 | `spec` / `plan` / `memory` / `note` / `other`，决定 Vault 内的落点子目录 |
+| `context` | 生产方 | 一行描述。归集时截 200 字写进 frontmatter 的 `summary` |
+| `keywords` | 生产方（可选，强烈建议填） | 字符串数组，3-8 个检索扩展词。归集时经 sanitize 写进 frontmatter |
+| `created` | 生产方 | ISO 时间 |
+| 其余全部 | `sync_pending_docs.py` | `vault_path` / `*_hash` / `*_mtime` / `archived_at` / `wikilink_form` / `path_invalid` / `denied_sensitive` … **禁止手填** |
+
+**`keywords` 为什么必须在这里填**：spec/plan 源文档本身没有 frontmatter，Vault 副本的 frontmatter 全部由 `archive_doc` 生成。它此前不写 `keywords`，于是每归集一篇就留一个精确召回空洞——那篇笔记在提问时召不回来——只能靠事后手动跑付费的 `enrich_keywords.py` 补。而归集是自动的、补齐是手动的，两者速率不匹配，缺口必然随时间线性增长（作者本机实测：一次 backfill 之后 12 天累积 37 篇，覆盖率 99% → 96%）。
+
+在条目里一并填上就没有这个问题，且**零额外模型调用**——写 `context` 时本来就在写。
+
+词的质量约束见 `note-format.md`；非法词（YAML 元字符、单字、非字符串）由 `archive_doc` 静默剔除，不会破坏 frontmatter。全部非法或没填时**不写该键**，而不是写空数组——写空数组会让覆盖率统计把它算作「已有」，把缺口藏起来。
+
+漏填也不会永久丢：`/summarize-session` 收尾时用 `keywords_gap.py` 检测缺口并补上（见 SKILL.md 第四步第 5 项）。
+
 ## 模式
 
 | 模式 | 处理范围 | 默认 apply |

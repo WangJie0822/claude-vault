@@ -58,8 +58,10 @@ summary: "一行摘要"
 
 写/更新笔记时为 `keywords` 产出 3-8 个**检索扩展词**：
 - 收录：核心概念的同义词/近义词、英文↔中文对译、常见别名与缩写、用户可能换的说法。
-- 质量约束（与 `enrich_keywords.py::sanitize_keywords` 同口径）：CJK 词 ≥2 字、ASCII 词 ≥3 字；禁单字与超宽通用词（"性能/优化/设计"——子串匹配会刷命中无关提问）；禁含换行与 YAML 元字符；每篇 ≤8 条。
-  > 注：上述 CJK≥2/ASCII≥3 的完整口径由**写期** `enrich_keywords.py::sanitize_keywords` 强制；**读端** `_frontmatter_reader.load_cache` 只做更粗的「≥2 字」防御网（剔单字），不强制 ASCII≥3——主写路径（手写 frontmatter）的质量仍依赖本规则。
+- 质量约束（与 `_keywords.py::sanitize_keywords` 同口径）：CJK 词 ≥2 字、ASCII 词 ≥3 字；禁单字与超宽通用词（"性能/优化/设计"——子串匹配会刷命中无关提问）；禁含换行与 YAML 元字符；每篇 ≤8 条。
+  > 注：该口径的唯一实现在 `scripts/_keywords.py`，**三条写入路径共用**——`enrich_keywords.py`（付费 backfill，清存量）、`archive_doc.py`（归集时从 pending-docs 条目透传）、`keywords_gap.py`（`/summarize-session` 流程内零调用补全）。
+  > **读端** `_frontmatter_reader.load_cache` 刻意**不复用**它，只做更粗的「≥2 字」防御网（剔单字），不强制 ASCII≥3：读端要能容忍任意历史写入，不能因写端口径演进就把存量笔记判为非法。
+  > 手写 frontmatter 是第四条路径，不经任何脚本，其质量只能依赖本规则。
 - 内联数组写法：`keywords: [扩展词召回, 相关性打分, recall]`。
 
 ### frontmatter 强约束（rebuild_index.py 强制）

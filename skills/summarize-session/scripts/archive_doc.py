@@ -30,6 +30,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from _frontmatter import upsert_fields
+from _keywords import sanitize_keywords
 from _path_resolver import (
     resolve_project_root,
     resolve_vault_target,
@@ -338,6 +339,17 @@ def archive_doc(entry: dict, vault_root: str,
     summary = entry.get('context', '')[:200]
     if summary:
         fm_updates['summary'] = summary
+
+    # keywords（vault-loader 的精确召回通路）：走与 summary 完全相同的通路——
+    # 由 LLM 写 pending-docs 条目时一并填，归集时透传，零额外模型调用。
+    # 入参是手填的，任何类型都可能出现，故必须过 sanitize_keywords（与
+    # enrich_keywords / keywords_gap 同口径）：非 list、YAML 元字符、过短词、
+    # 重复项都在那里剔掉，避免 `a: b` 这类值就地破坏 frontmatter 结构。
+    # 无合法词时**不写该键**——写空数组会让 rebuild_index 的覆盖率统计把它
+    # 算作「已有 keywords」，把缺口藏起来而不是暴露出来。
+    kws = sanitize_keywords(entry.get('keywords'))
+    if kws:
+        fm_updates['keywords'] = kws
 
     # created
     fm_updates['created'] = today_iso

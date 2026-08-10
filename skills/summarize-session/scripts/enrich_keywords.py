@@ -17,42 +17,14 @@ import re
 import shutil
 import subprocess
 import sys
-import unicodedata
 from pathlib import Path
 
-_YAML_META = set(":[]{}#&*!|>'\"%@`\\,")
-_MAX_KEYWORDS = 8
+# sanitize / frontmatter 写入的权威实现在 _keywords.py——归集（archive_doc）与
+# 流程补全（keywords_gap）共用同一口径。此处导入同时起 re-export 作用，保持
+# `enrich_keywords.sanitize_keywords` 这一既有引用面（含测试）不变。
+from _keywords import build_frontmatter_with_keywords, sanitize_keywords
+
 _TIMEOUT = 60
-_CJK = re.compile(r"[一-鿿]")
-
-
-def _is_unsafe_char(c: str) -> bool:
-    """YAML 元字符 / 控制字符（C*，含 \\n \\r \\t \\x00）/ 行段分隔符（U+2028 Zl、U+2029 Zp）一律拒。
-    普通空格（Zs）不拒——它不破坏 YAML flow 标量。"""
-    cat = unicodedata.category(c)
-    return c in _YAML_META or cat[0] == "C" or cat in ("Zl", "Zp")
-
-
-def sanitize_keywords(raw) -> list[str]:
-    """质量+安全校验：剔非法字符/换行，长度约束（CJK≥2、ASCII≥3），去重，上限 8。"""
-    out: list[str] = []
-    if not isinstance(raw, list):
-        return out
-    for item in raw:
-        if not isinstance(item, str):
-            continue
-        k = item.strip()
-        if not k or any(_is_unsafe_char(c) for c in k):
-            continue
-        has_cjk = bool(_CJK.search(k))
-        min_len = 2 if has_cjk else 3
-        if len(k) < min_len:
-            continue
-        if k not in out:
-            out.append(k)
-        if len(out) >= _MAX_KEYWORDS:
-            break
-    return out
 
 
 def _call_claude(content: str) -> str | None:
@@ -78,21 +50,6 @@ def _call_claude(content: str) -> str | None:
     if r.returncode != 0:
         return None
     return r.stdout
-
-
-def _build_frontmatter_with_keywords(text: str, keywords: list[str]) -> str | None:
-    """把 keywords 安全序列化进现有 frontmatter（已有则替换）。无 frontmatter 返回 None。
-    容忍 CRLF（\\r\\n）与 LF 两种行尾，避免 CRLF 笔记被静默跳过。"""
-    m = re.match(r"^(---\r?\n)(.*?)(\r?\n---\r?\n?)", text, re.DOTALL)
-    if not m:
-        return None
-    head, body, tail = m.group(1), m.group(2), m.group(3)
-    rest = text[m.end():]
-    nl = "\r\n" if head.endswith("\r\n") else "\n"
-    kw_line = "keywords: [" + ", ".join(keywords) + "]"
-    body_no_kw = re.sub(r"^keywords:.*$", "", body, flags=re.MULTILINE).rstrip("\r\n")
-    new_body = body_no_kw + nl + kw_line
-    return head + new_body + tail + rest
 
 
 def _extract_json(text) -> str | None:
@@ -125,7 +82,7 @@ def enrich_note(note_path: Path, model_output: str) -> bool:
         text = note_path.read_text(encoding="utf-8")
     except OSError:
         return False
-    new_text = _build_frontmatter_with_keywords(text, keywords)
+    new_text = build_frontmatter_with_keywords(text, keywords)
     if new_text is None or new_text == text:
         return False
     try:

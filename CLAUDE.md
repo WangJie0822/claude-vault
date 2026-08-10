@@ -47,6 +47,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模式：正常 / `-f`（强制，跳确认）/ `--catch-up` / `--quick`。Vault 内资源优先经 `scripts/obsidian_cli.py` 封装，Obsidian CLI 不可用时降级文件 I/O。
 
+#### keywords 缺口的三条防线
+
+`keywords` 是 vault-loader 的精确召回通路（权重 5，最强信号），缺失即该篇在提问时召不回来。写期口径的**唯一实现**在 `scripts/_keywords.py::sanitize_keywords`（CJK ≥2 / ASCII ≥3、去重、上限 8、剔 YAML 元字符），三条写入路径共用——口径分裂过一次就再也对不齐：
+
+1. **源头**：`archive_doc.py` 归集 spec/plan 时从 pending-docs 条目透传 `keywords`，走与 `summary`←`context` 完全相同的通路，**零额外模型调用**（写 `context` 时本来就在写）。生产方契约见 `references/doc-collection.md`。
+2. **兜底**：`keywords_gap.py --list/--set`，接在 `SKILL.md` 第四步 `rebuild_index` 之后，由会话里的 LLM 读笔记自己生成再写回，同样零调用。缺口判定**复用 `rebuild_index._health_check`**，不另写判据（否则会出现「报告说缺 5 篇、补全只看到 3 篇」这种查不出来的漂移，`test_list_total_matches_rebuild_index_coverage_numerator` 是这条契约的守卫）。
+3. **清存量**：`enrich_keywords.py`，**付费**（每篇 spawn 一次 `claude -p --model haiku`）、手动 opt-in、不接自动管线。
+
+> **为什么需要三条**：归集是自动的、补齐原先只有付费手动一条，两者速率不匹配 ⇒ 缺口必然随时间线性增长。作者本机实测：最后一次 backfill（2026-07-27）之后 12 天累积 37 篇，覆盖率 99%→96%，且 37/37 全部是归集进来的 spec/plan。2026-08-10 补齐后为 **100%**（applicable 973）。
+
+> ⚠️ **`--set` 必须同步 cache，这不是优化而是正确性必需**：`rebuild_index` 的增量判据是秒级 `int(st_mtime)`（`rebuild_index.py:163`），而「补全 → rebuild」在流程里必然落在同一秒内 ⇒ rebuild 判定文件未变、跳过重读，cache 永远停在「无 keywords」。后果不是慢一拍而是**补了等于白补**——vault-loader 读的是 cache，召回拿不到 keywords，下次会话还会把同一篇再列一遍。实测：mtime `…860.0094`→`…860.1227`，`int()` 同为 `1786345860`。故 `set_keywords` 写完文件后直接改 cache 对应 entry（fail-open，结果在返回值 `cache_synced` 里如实报出）。同一根因也影响 `enrich_keywords.py`，只是它每篇要调一次 haiku、跨秒概率大，不易触发。
+
 ## 分发边界（重要）
 
 并非所有目录都随插件分发。**git 跟踪 = 分发**：`.claude-plugin/`、`hooks/`、`skills/`、`commands/`、`scripts/`、`tests/`、`images/`、`docs/MIGRATION.md`、README。
@@ -102,7 +114,7 @@ python -m pytest packaging/
 
 **发布前一次跑完全部门禁**（DO-M1）：`python packaging/run_gates.py` 串起上面四个 pytest 根 + 脱敏闸门 + 推送守卫安装态 + commit message 脱敏，共 7 项，逐项报、有一项红则整体红（`--list` 只列不跑）。各 gate 的 cwd 必须不同——三个 skill 根的导入约定不兼容，共用 rootdir 会 import 失败，这正是它们容易被漏跑的原因。
 
-已实测（2026-08-08 更新，`--collect-only` 口径）：`tests/` **49**、vault-loader **519**、summarize-session **282**、packaging **23** 个用例可正常收集。此前记的「`tests/` 69」是陈旧值——`29b77f6`（2026-06-30）删除 auto-mode 整套时一并删掉 6 个测试文件后未同步。近几轮增量：召回机制选型（P0）+ full-review 整改 `tests/` 35→41、vault-loader 277→330；P3 失效可观测性 41→45、330→368；full-review 整改 vault-loader 368→439（opt_out 归一 38、cache 畸形输入 25、标题伪造 5、doctor 残留 3）。
+已实测（2026-08-10 更新，`--collect-only` 口径）：`tests/` **49**、vault-loader **519**、summarize-session **300**、packaging **23** 个用例可正常收集。summarize-session 本轮 282→300：keywords 缺口三条防线（archive_doc 透传 T27-T30 共 4 条 + `test_keywords_gap.py` 14 条）。此前记的「`tests/` 69」是陈旧值——`29b77f6`（2026-06-30）删除 auto-mode 整套时一并删掉 6 个测试文件后未同步。近几轮增量：召回机制选型（P0）+ full-review 整改 `tests/` 35→41、vault-loader 277→330；P3 失效可观测性 41→45、330→368；full-review 整改 vault-loader 368→439（opt_out 归一 38、cache 畸形输入 25、标题伪造 5、doctor 残留 3）。
 
 本轮（效果评估机制，2026-08-06）vault-loader 439→498（+59）：gold 语料排序判据改用「tag-IDF 相对天花板占比」（`test_gold_ranking.py`）；新增决策面指标落盘全链路——`_metrics.py` 写入/隐私契约/fail-open 隔离、`analyze_metrics.py` 报表/opt-out/purge、near-miss 抽样标注与提示（`test_analyze_metrics.py`、`test_metrics_writer.py`、`test_metrics_optout.py`、`test_metrics_privacy_and_failopen.py`、`test_metrics_wiring.py`、`test_near_miss_nudge.py` 等 10 个文件新增/改动）。**full-review 整改阶段又改了三处**：`tests/` 45→49（+4，推送守卫存在性门禁 `test_push_guard_installed.py`，DO-H1）；packaging 10→23（+13，脱敏闸门扫描根守卫 5 条 + 推送守卫安装脚本 8 条，DO-C1/DO-H1）；summarize-session 计数不变但修掉一条硬编码日期用例（`c6ef0a3`，详见下方环境性失败那条的订正）。**原 plan 的 gold 语料噪声比例对齐真实分布（Task 4）因前提数字有误被 BLOCKED**（实测 excluded 占比 98.4%，与 plan 假设的「当前 15%」不吻合，需要 plan 层重新设计候选池构造方式），未产出任何代码/测试改动，不计入以上数字，待用户对三个候选方案（加灰区条目 / 保证 median admitted 下限 / 记为已知限制）拍板。
 
@@ -110,7 +122,7 @@ python -m pytest packaging/
 
 - **环境相关的既有失败（改动前后一致，非回归）**：summarize-session `tests/test_obsidian_cli.py` **11 例**，根因是本机未安装 obsidian-cli（`FileNotFoundError` / CLI 不可用致返回错误 dict）。`tests/test_wrapper.py` 全量跑时偶发 `WinError 6/50` 句柄失效。
   > 此前本节记的是「obsidian_cli 9 例」，后改 10，现实测 11；判定「与本次改动无关」的硬证据是 `git status -- skills/summarize-session/` 为空（该目录零改动），而不是数字对得上。
-  > ⚠️ **本节此前把 `test_archive_doc.py` 那 1 例一并归为「未安装 obsidian-cli」，是错的**。实测其根因是用例把写测试当天的日期钉死（断言 `vault_archived_at == '2026-05-28'`，而实现取 `datetime.date.today()`），自那天起每天必红，与 obsidian-cli 毫无关系。已在 `c6ef0a3` 修复（夹住调用前后当天日期 + 形态断言），summarize-session 现为 **11 failed / 269 passed / 2 skipped**。
+  > ⚠️ **本节此前把 `test_archive_doc.py` 那 1 例一并归为「未安装 obsidian-cli」，是错的**。实测其根因是用例把写测试当天的日期钉死（断言 `vault_archived_at == '2026-05-28'`，而实现取 `datetime.date.today()`），自那天起每天必红，与 obsidian-cli 毫无关系。已在 `c6ef0a3` 修复（夹住调用前后当天日期 + 形态断言），summarize-session 当时为 11 failed / 269 passed / 2 skipped；2026-08-10 keywords 三防线后为 **11 failed / 287 passed / 2 skipped**（failed 数不变，全部集中在 `test_obsidian_cli.py`，逐条报错为 `FileNotFoundError: [WinError 2]` 或 Windows 路径分隔符断言）。
   > 教训与 perf 那条同构且更严重：**归因写错比数字记错有害得多**——数字对不上会被追查，而一条真实缺陷被贴上「环境噪声」标签后，就再没人看它了。凡把失败归为「环境性」，必须逐条拿到该条自己的报错原文，不能按文件名整批归类。
   > ⚠️ `test_wrapper.py` 此前还有一条被**误归为「环境性」**的常驻失败（「Git Bash `sh` 下 wrapper 探测到 Microsoft Store python stub」）。机制描述是对的，但归类误导——它是真实产品缺陷（OBS-7）在本机的显形：`run-hook.cmd` 的 sh 段探测顺序是 `python3 → python`，二者在本机都是 Store stub（`command -v` 成功但 `-c pass` 退出码 49），而唯一可用的 `py` **只在 batch 段探测、不在 sh 段**。补上 `py` 后该用例转绿。教训与 perf 那条同构：「环境性失败」这类排除性结论必须做根因分析才能下。
 - **性能守卫 `tests/integration/test_perf.py::test_prompt_submit_under_300ms` 属另一类，历史上曾被误记为「既有失败」**：2026-08-04 基线对照实测（同 fixture、同 tmp HOME、交替 8 轮）`d9c964b` median p95 = 0.179s vs 决策面抽取后 0.207s，**median 与 min 同步位移 ⇒ 确定性回归而非噪声**，根因是渲染层重复计算 `_hit_keywords`（决策层结果被丢弃）。该回归已在 `63e784d` 修复——渲染层重复调用实测由 203 次降为 **0 次**。但本用例判据是「3 次 spawn 取最差值」，最差值由偶发解释器启动/调度尖峰主导，**本机仍会偶发越界**（尤其并发跑测试时）。故：**它偶发红不等于没回归，也不等于有回归——要判定性能问题必须做基线对照，不能靠单次观测下「既有失败」的结论。**
