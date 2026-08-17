@@ -85,6 +85,7 @@ def summarize(records: Iterable[dict]) -> dict:
     ——彼时 `admitted` 未截断，等价于全量，遍历口径与新字段口径一致，不会算错。
     """
     arm, gate, near = Counter(), Counter(), Counter()
+    near_dedup: Counter = Counter()
     n_admitted = ft = n = 0
     for r in records:
         gate[r.get("gate") or "ok"] += 1
@@ -100,10 +101,18 @@ def summarize(records: Iterable[dict]) -> dict:
             ft += 1
         for nm in r.get("near_miss") or []:
             near[nm.get("path", "?")] += 1
+            # 三态必须分清：缺键=写于加字段之前；""=打分不够；其余=被去重抑制
+            # （即其实已经成功召回过，不该算「擦肩而过」）。用 `in` 而非真值判断
+            # ——"" 是合法取值，真值判断会把它并进「未知」。
+            if "dedup" not in nm:
+                near_dedup["未知(旧记录)"] += 1
+            else:
+                near_dedup[nm["dedup"] or "打分不够"] += 1
         n += 1               # 边遍历边计数：records 现在是生成器，len() 不再适用
     return {"n_events": n, "n_admitted": n_admitted, "arm_dist": dict(arm),
             "gate_dist": dict(gate), "fulltext_rate": (ft / n) if n else 0.0,
-            "near_miss_top": near.most_common(20)}
+            "near_miss_top": near.most_common(20),
+            "near_miss_dedup_dist": dict(near_dedup)}
 
 
 def _stable_path_id(p: str) -> str:
@@ -126,7 +135,8 @@ def render_report(s: dict, show_paths: bool = False) -> str:
     lines = [INJECTION_NOTICE, "", "📊 vault-loader 指标报表", "",
              f"事件数 {s['n_events']} · 累计入选 {s['n_admitted']} 篇 · "
              f"全文注入率 {s['fulltext_rate']:.1%}", "",
-             f"闸门分布: {s['gate_dist']}", f"入选臂分布: {s['arm_dist']}", "",
+             f"闸门分布: {s['gate_dist']}", f"入选臂分布: {s['arm_dist']}",
+             f"near-miss 成因分布: {s.get('near_miss_dedup_dist', {})}", "",
              "near-miss（最常擦肩而过的笔记）:"]
     for p, c in s["near_miss_top"]:
         shown = sanitize_injected_text(p, keep_newlines=False)[:80] if show_paths \
@@ -138,6 +148,12 @@ def render_report(s: dict, show_paths: bool = False) -> str:
 
 
 VERDICTS = ("relevant", "irrelevant", "unsure")
+
+# 三类标注：near_miss 问「该不该被召回」；两个 admitted_* 问「召回得对不对」。
+# 分开是因为代价不对等——全文注入单篇上限 8192 字节，清单条目只有一行 summary，
+# 混成一个桶之后「全文错了 30%」与「清单错了 30%」在数据里长得一模一样。
+KINDS = ("near_miss", "admitted_fulltext", "admitted_list")
+DEFAULT_KIND = "near_miss"   # 旧记录（写于加字段之前）一律归此类
 
 
 def annotations_path(home: Path) -> Path:
@@ -158,19 +174,90 @@ def sample_near_miss(records: Iterable[dict], k: int = 20) -> list[dict]:
     return sorted(agg.values(), key=lambda x: (-x["count"], -x["topical_max"]))[:k]
 
 
-def save_annotation(home: Path, path: str, verdict: str) -> None:
-    """追加一条标注。后写覆盖先写（读取时按行序合并）。"""
+# 人类可归因来源。事件级实测（259 条）：typed 113 / sdk 93 / 无字段 37 /
+# suggestion_accepted 12 / queued 1，人类合计 126 = 48.6%。
+_HUMAN_SRC = ("typed", "queued", "suggestion_accepted")
+
+
+def sample_admitted(records: Iterable[dict], k: int = 20) -> list[dict]:
+    """按出现次数降序取 Top-K **已注入**条目，供精度侧人工标注。纯函数、无 IO。
+
+    与 `sample_near_miss` 互补：那边问「该不该被召回」（漏召回），这边问
+    「召回得对不对」（精度）。改动前只有前者，于是「注入了不相关笔记」这类
+    问题在数据上完全不可见。
+
+    评判对象是**用户实际看到的**——全文主候选 + top-3 清单，不是 admitted 全集
+    （实测 n_admitted 中位数 66，而渲染出去的只有 max_notes=3 条 + 至多 1 篇全文，
+    对全集标注 95% 的条目从未进过模型上下文）。
+
+    有界聚合：按 (kind, path) 累加标量，**绝不物化 records**——`load_records`
+    是生成器，物化会重演已修复的 574MB 峰值回归。
+    """
+    agg: dict[tuple[str, str], dict] = {}
+
+    def _bump(kind: str, path: str, topical: float) -> None:
+        if not path:
+            return
+        cur = agg.setdefault((kind, path),
+                             {"path": path, "kind": kind,
+                              "count": 0, "topical_max": 0.0})
+        cur["count"] += 1
+        cur["topical_max"] = max(cur["topical_max"], float(topical or 0))
+
+    for r in records:
+        # src 缺失=写于加字段之前，无法归因，保守跳过（宁可少标，不可标错对象）
+        if r.get("src") not in _HUMAN_SRC:
+            continue
+        ft_path = (r.get("ft") or {}).get("path") or ""
+        admitted = r.get("admitted") or []
+        by_path = {a.get("path"): a for a in admitted}
+        if ft_path:
+            # ft 按 topical 选、admitted 按 total 截断到 admitted_k，实测 12/170
+            # 的 ft 不在落盘样本内 ⇒ 取不到 topical 时按 0 记，不要假定能 join 上
+            _bump("admitted_fulltext", ft_path,
+                  (by_path.get(ft_path) or {}).get("topical") or 0)
+        # 清单侧：全文那篇已单列，其余取前 3（admitted 已按 total 降序落盘，
+        # 顺序即渲染顺序）。取 3 而非 max_notes-1，以覆盖有/无全文两种形态。
+        shown = 0
+        for a in admitted:
+            if a.get("path") == ft_path:
+                continue
+            _bump("admitted_list", a.get("path") or "", a.get("topical") or 0)
+            shown += 1
+            if shown >= 3:
+                break
+    return sorted(agg.values(),
+                  key=lambda x: (-x["count"], -x["topical_max"]))[:k]
+
+
+def save_annotation(home: Path, path: str, verdict: str, *,
+                    kind: str = DEFAULT_KIND) -> None:
+    """追加一条标注。后写覆盖先写（读取时按 (kind, path) 合并）。
+
+    `kind` 强制 keyword-only：它与 `path`/`verdict` 是相邻同类型字符串，位置
+    传参一旦对调会静默错位——同 `_metrics.build_record` 的 session_id/prompt_id，
+    那处已实证「对调后 84 个既有测试全绿，类型系统与既有断言都拦不住」。
+    """
     if verdict not in VERDICTS:
         raise ValueError(f"verdict 必须是 {VERDICTS} 之一，收到 {verdict!r}")
+    if kind not in KINDS:
+        raise ValueError(f"kind 必须是 {KINDS} 之一，收到 {kind!r}")
     p = annotations_path(home)
     p.parent.mkdir(parents=True, exist_ok=True)
-    rec = {"_schema": _metrics.SCHEMA, "path": path, "verdict": verdict}
+    rec = {"_schema": _metrics.SCHEMA, "path": path,
+           "verdict": verdict, "kind": kind}
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def load_annotations(home: Path) -> dict[str, str]:
-    """读取全部人工标注。**坏行必须计数并经 stderr 报出，不能静默跳过**——与
+def load_annotations(home: Path) -> dict[tuple[str, str], str]:
+    """读取全部人工标注，返回 `{(kind, path): verdict}`。
+
+    **键是 (kind, path) 而非裸 path**：同一篇笔记「作为擦肩候选该不该被召回」
+    与「作为已注入内容召回得对不对」是两个独立判断，共用 path 键会让两者互相
+    覆盖（`--review` 的去重也会因此漏抽）。缺 `kind` 的旧记录归 `near_miss`。
+
+    **坏行必须计数并经 stderr 报出，不能静默跳过**——与
     `load_records`（`:27-58`）同一约定，且标注比普通 metrics 更该有可见性：
     `_metrics.purge` 的 docstring 把它定性为「用户逐条投入时间标出的、删了
     不可重新生成」的数据，静默丢一条，用户永远不知道自己的标注没了。
@@ -179,7 +266,7 @@ def load_annotations(home: Path) -> dict[str, str]:
     的 dict——结构本身不像一条标注）、`bad_verdict`（结构合法但 verdict 不在
     `VERDICTS` 内，例如手工改坏文件、或未来 schema 演进遗留的旧值）。
     """
-    out: dict[str, str] = {}
+    out: dict[tuple[str, str], str] = {}
     p = annotations_path(home)
     if not p.exists():
         return out
@@ -208,7 +295,14 @@ def load_annotations(home: Path) -> dict[str, str]:
             if verdict not in VERDICTS:
                 bad_verdict += 1
                 continue
-            out[r["path"]] = verdict      # 后写覆盖
+            # kind 缺失=写于加字段之前，一律归 near_miss（已完成的 20 条正属此类）。
+            # 未知 kind 与非法 verdict 同等处理，计入 bad_record——手工编辑或未来
+            # schema 演进都可能留下它，静默接受会让两类标注的统计悄悄混淆。
+            kind = r.get("kind", DEFAULT_KIND)
+            if kind not in KINDS:
+                bad_record += 1
+                continue
+            out[(kind, r["path"])] = verdict      # 后写覆盖
     except OSError:
         pass
     if bad_record or bad_verdict:
@@ -238,7 +332,12 @@ def main() -> int:
         n = _metrics.purge(home)
         msg = f"已清空 {n} 个数据文件"
         if n_ann:
-            msg += f"（其中 {n_ann} 条人工标注已删除，不可恢复）"
+            # 按非空行数计，不解析 JSON、不去重、不分类：near-miss 与精度两类
+            # 混在同一个数里。刻意保持不解析——test_count_annotations_tolerates_
+            # invalid_utf8 钉住了「文件损坏时仍能报出数量」，而这是不可逆删除前
+            # 的最后一道知情提示，此时最不该因一行坏 JSON 报错或少报。
+            msg += (f"（其中 {n_ann} 条人工标注已删除，不可恢复；"
+                    f"含 near-miss 与精度两类，未去重）")
         print(msg)
         return 0
     if args.review:
@@ -258,9 +357,17 @@ def main() -> int:
                   file=sys.stderr)
             return 2
         done = load_annotations(home)
-        todo = [x for x in sample_near_miss(load_records(home)) if x["path"] not in done]
+        todo = [x for x in sample_near_miss(load_records(home))
+                if ("near_miss", x["path"]) not in done]
+        for x in todo:
+            x["kind"] = "near_miss"
+        # 第二趟：精度侧。两类各自 k 条上限、不合并计数。
+        # load_records 是生成器、只能迭代一次，所以这里**刻意**再扫一遍文件——
+        # 用 IO 换内存，绝不改成一趟物化（会重演 574MB 峰值那个已修的回归）。
+        todo += [x for x in sample_admitted(load_records(home))
+                 if (x["kind"], x["path"]) not in done]
         if not todo:
-            print("没有待标注的 near-miss 条目")
+            print("没有待标注的条目")
             return 0
         print(f"待标注 {len(todo)} 条。输入 r=相关 / i=不相关 / u=不确定 / q=退出")
         code = {"r": "relevant", "i": "irrelevant", "u": "unsure"}
@@ -274,7 +381,8 @@ def main() -> int:
                 #                     必须与上面的护栏一致（2），否则调用方按
                 #                     返回码判断「是否成功中止」会拿到错误信号
                 #   已保存过至少一条 -> 用户交互到一半按 Ctrl-D 正常退出，维持 0
-                ans = input(f"[{item['count']}次 topical≤{item['topical_max']:.1f}] "
+                ans = input(f"[{item['kind']}] [{item['count']}次 "
+                            f"topical≤{item['topical_max']:.1f}] "
                             f"{shown} > ").strip().lower()
             except EOFError:
                 if saved == 0:
@@ -286,7 +394,7 @@ def main() -> int:
             if ans == "q":
                 break
             if ans in code:
-                save_annotation(home, item["path"], code[ans])
+                save_annotation(home, item["path"], code[ans], kind=item["kind"])
                 saved += 1
         print(f"已标注，结果在 {annotations_path(home)}")
         return 0

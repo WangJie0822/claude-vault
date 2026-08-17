@@ -19,6 +19,9 @@ def _seed(home):
             "gate": "" if i else "too_few_keywords", "relaxed": False,
             "admitted": [{"path": "n/a.md", "topical": 7.0, "total": 9.0,
                           "arm": "topical", "dedup": "", "hits": ["内存"]}] if i else [],
+            # near_miss 刻意不带 dedup、记录整体刻意不带 src —— 本 fixture 充当
+            # 「旧记录」回归覆盖（本机已积累 259 条这种形态），补齐了就等于删掉
+            # 新旧混读那几条测试的对照组。
             "near_miss": [{"path": "n/b.md", "topical": 5.8}],
             "n_excluded": 100, "ft": {"path": "n/a.md" if i == 2 else "", "arm": ""},
         })
@@ -119,7 +122,9 @@ def test_annotations_roundtrip_and_last_write_wins(tmp_path):
     save_annotation(tmp_path, "b.md", "irrelevant")
     save_annotation(tmp_path, "a.md", "unsure")
     got = load_annotations(tmp_path)
-    assert got == {"a.md": "unsure", "b.md": "irrelevant"}
+    # 键是 (kind, path)：缺 kind 的旧记录与显式 near_miss 归同一键
+    assert got == {("near_miss", "a.md"): "unsure",
+                   ("near_miss", "b.md"): "irrelevant"}
     assert annotations_path(tmp_path).parent.name == "vault-loader-metrics"
 
 
@@ -148,7 +153,7 @@ def test_load_annotations_reports_bad_lines_not_silent(tmp_path, capsys):
         f.write("{broken\n")                                                # 解析失败 #2
         f.write(json.dumps({"path": "b.md", "verdict": "maybe"}) + "\n")    # verdict 非法 #1
     got = load_annotations(tmp_path)
-    assert got == {"a.md": "relevant"}          # 坏行不进结果，好行不受影响
+    assert got == {("near_miss", "a.md"): "relevant"}   # 坏行不进结果，好行不受影响
     err = capsys.readouterr().err
     assert "2 行解析/结构异常" in err, f"应报出 2 行解析/结构异常，实际 stderr={err!r}"
     assert "1 行 verdict 非法" in err, f"应报出 1 行 verdict 非法，实际 stderr={err!r}"
@@ -174,8 +179,12 @@ def test_load_annotations_rejects_non_string_path(tmp_path, capsys):
         f.write(json.dumps({"path": "   ", "verdict": "relevant"}) + "\n")      # 空白串
 
     got = load_annotations(tmp_path)                 # 不得抛异常
-    assert got == {"good.md": "relevant"}, f"坏行污染了结果：{got}"
-    assert all(isinstance(k, str) for k in got), "结果里混入了非字符串键"
+    assert got == {("near_miss", "good.md"): "relevant"}, f"坏行污染了结果：{got}"
+    # 键必须是 (kind, path) 二元组且两半都是字符串——非串 path 会让键悄悄变形，
+    # 之后与真实标注永不相等，等于标注凭空消失（L-SEC-2 的同源风险）。
+    assert all(isinstance(k, tuple) and len(k) == 2
+               and all(isinstance(x, str) for x in k) for k in got), \
+        f"结果里混入了非法键：{got}"
     assert "3 行解析/结构异常" in capsys.readouterr().err
 
 
@@ -285,7 +294,7 @@ def test_review_eof_after_saving_one_returns_0(tmp_home, monkeypatch):
     rc = am.main()
     assert rc == 0
     from scripts.analyze_metrics import load_annotations
-    assert load_annotations(tmp_home) == {"notes/foo.md": "relevant"}
+    assert load_annotations(tmp_home) == {("near_miss", "notes/foo.md"): "relevant"}
 
 # ===== P3（full-review High）：load_records 全量物化 =====
 
@@ -299,8 +308,14 @@ def _seed_bulk(home, n_sessions, per_session, admitted_n):
             "arm_counts": {"topical": admitted_n},
             "admitted": [{"path": f"notes/very/long/path/segment/{i}-{'x'*40}.md",
                           "topical": 1.0, "total": 2.0, "arm": "topical",
-                          "dedup": False, "hits": ["kw1", "kw2", "kw3"]}
+                          # 生产值域是 "" | "fulltext_injected" | "candidate_injected"
+                          # 三种字符串（_decision.py:34），原先写 False 会让按 dedup
+                          # 分桶的统计产出一个 False 桶。
+                          "dedup": "", "hits": ["kw1", "kw2", "kw3"]}
                          for i in range(admitted_n)],
+            # near_miss 刻意不带 dedup —— 本 fixture 充当「旧记录」回归覆盖，
+            # 补齐了就等于删掉 test_summarize_buckets_near_miss_by_dedup_and_
+            # tolerates_legacy 的对照组。
             "near_miss": [{"path": f"notes/nm/{i}.md", "topical": 3.0}
                           for i in range(10)],
             "ft": {"path": ""},
@@ -346,3 +361,120 @@ def test_load_records_peak_memory_does_not_scale_with_corpus(tmp_path):
     # 留足余量取磁盘量的 1/4：全量物化时峰值 >= 磁盘量同阶（终审实测 105MB -> 574MB）。
     assert peak < disk / 4, (
         f"峰值内存 {peak} 字节 vs 磁盘 {disk} 字节 —— 疑似全量物化")
+
+
+def test_summarize_buckets_near_miss_by_dedup_and_tolerates_legacy():
+    """报表按 dedup 分桶；且必须容忍旧记录（259 条已落盘的 near_miss 无该键）。
+
+    旧记录一律归入「未知」桶，不能 KeyError，也不能与真实的 "" 值混为一谈——
+    前者是「这条记录写于加字段之前」，后者是「打分不够」，含义不同。
+    """
+    recs = [
+        {"_schema": _metrics.SCHEMA, "gate": "", "ft": {"path": "", "arm": ""},
+         "n_admitted": 0, "arm_counts": {},
+         "near_miss": [{"path": "a.md", "topical": 9.0, "dedup": "fulltext_injected"},
+                       {"path": "b.md", "topical": 8.0, "dedup": ""}]},
+        # 旧记录：near_miss 无 dedup 键
+        {"_schema": _metrics.SCHEMA, "gate": "", "ft": {"path": "", "arm": ""},
+         "n_admitted": 0, "arm_counts": {},
+         "near_miss": [{"path": "c.md", "topical": 7.0}]},
+    ]
+    s = summarize(recs)
+    assert s["near_miss_dedup_dist"]["fulltext_injected"] == 1
+    assert s["near_miss_dedup_dist"]["打分不够"] == 1
+    assert s["near_miss_dedup_dist"]["未知(旧记录)"] == 1
+    # 渲染不得崩，且要把分桶显示出来
+    out = render_report(s)
+    assert "fulltext_injected" in out
+
+
+def test_annotations_separate_by_kind(tmp_path):
+    """同一篇笔记在两类标注里互不顶掉。
+
+    「作为擦肩候选该不该被召回」与「作为已注入内容召回得对不对」是两个独立
+    判断；改动前 load_annotations 按 path 去重，两者会互相覆盖。
+    """
+    from scripts.analyze_metrics import save_annotation, load_annotations
+    save_annotation(tmp_path, "n/x.md", "irrelevant", kind="near_miss")
+    save_annotation(tmp_path, "n/x.md", "relevant", kind="admitted_fulltext")
+    got = load_annotations(tmp_path)
+    assert got[("near_miss", "n/x.md")] == "irrelevant"
+    assert got[("admitted_fulltext", "n/x.md")] == "relevant"
+
+
+def test_legacy_annotation_without_kind_reads_as_near_miss(tmp_path):
+    """已完成的 20 条标注没有 kind 键，必须视为 near_miss——它们正是那一类。"""
+    from scripts.analyze_metrics import annotations_path, load_annotations
+    p = annotations_path(tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"_schema": _metrics.SCHEMA,
+                             "path": "old.md", "verdict": "relevant"}) + "\n",
+                 encoding="utf-8")
+    assert load_annotations(tmp_path) == {("near_miss", "old.md"): "relevant"}
+
+
+def test_save_annotation_rejects_unknown_kind(tmp_path):
+    from scripts.analyze_metrics import save_annotation
+    with pytest.raises(ValueError):
+        save_annotation(tmp_path, "n/x.md", "relevant", kind="bogus")
+
+
+def test_save_annotation_kind_is_keyword_only(tmp_path):
+    """kind 与 path/verdict 是相邻同型字符串，位置传参会静默错位。
+
+    用 inspect.signature 钉形态而非 pytest.raises(TypeError)——后者是弱断言，
+    再加一个位置参数时仍会因「参数过多」抛 TypeError、照样绿，
+    但它宣称守护的那件事已经变了。
+    """
+    import inspect
+    from scripts.analyze_metrics import save_annotation
+    params = inspect.signature(save_annotation).parameters
+    positional = [n for n, p in params.items()
+                  if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD]
+    assert positional == ["home", "path", "verdict"]
+    assert params["kind"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_sample_admitted_only_human_sources():
+    """精度抽样只取人类可归因来源。
+
+    sdk 事件的输入是 `Branch:/Range:` 提交元信息模板，无语义可判相关与否
+    （实测 93/93 如此），放进抽样池只会浪费判断力。
+    """
+    from scripts.analyze_metrics import sample_admitted
+    recs = [
+        {"_schema": _metrics.SCHEMA, "src": "typed",
+         "ft": {"path": "n/full.md", "arm": "topical>=6+strong_evidence"},
+         "admitted": [{"path": "n/full.md", "topical": 11.0, "total": 12.0},
+                      {"path": "n/a.md", "topical": 7.0, "total": 8.0},
+                      {"path": "n/b.md", "topical": 6.0, "total": 7.0}],
+         "near_miss": []},
+        {"_schema": _metrics.SCHEMA, "src": "sdk",
+         "ft": {"path": "n/sdk.md", "arm": "topical>=6+strong_evidence"},
+         "admitted": [{"path": "n/sdk.md", "topical": 11.0, "total": 12.0}],
+         "near_miss": []},
+        # 旧记录：无 src 键，无法归因 ⇒ 保守跳过
+        {"_schema": _metrics.SCHEMA,
+         "ft": {"path": "n/legacy.md", "arm": ""},
+         "admitted": [{"path": "n/legacy.md", "topical": 9.0, "total": 9.0}],
+         "near_miss": []},
+    ]
+    got = sample_admitted(recs, k=20)
+    paths = {x["path"] for x in got}
+    assert "n/sdk.md" not in paths, "sdk 来源不得进入精度抽样池"
+    assert "n/legacy.md" not in paths, "无 src 的旧记录应保守跳过"
+    kinds = {x["path"]: x["kind"] for x in got}
+    assert kinds["n/full.md"] == "admitted_fulltext"
+    assert kinds["n/a.md"] == "admitted_list"
+    assert kinds["n/b.md"] == "admitted_list"
+
+
+def test_sample_admitted_respects_k():
+    from scripts.analyze_metrics import sample_admitted
+    recs = [{"_schema": _metrics.SCHEMA, "src": "typed",
+             "ft": {"path": "", "arm": ""},
+             "admitted": [{"path": f"n/{i}.md", "topical": 6.0, "total": 7.0}
+                          for i in range(50)],
+             "near_miss": []}]
+    # 每轮最多取 top-3 清单条目，故 50 条 admitted 只产出 3 个候选
+    assert len(sample_admitted(recs, k=20)) == 3

@@ -128,7 +128,8 @@ def test_build_record_hashes_all_keywords_but_keeps_hit_words(tmp_path):
         any_relevant=True, relaxed=False, gate_reason="",
     )
     r = _metrics.build_record(d, {"内存", "泄露", "重启"}, Path("D:/secret/proj"),
-                              session_id="sess-A", prompt_id="pid-1", salt=salt)
+                              session_id="sess-A", prompt_id="pid-1", salt=salt,
+                              src="typed")
     assert r["_schema"] == _metrics.SCHEMA
     assert r["n_kw"] == 3
     blob = json.dumps(r, ensure_ascii=False)
@@ -164,7 +165,8 @@ def test_build_record_truncates_admitted_to_k_but_keeps_full_aggregates(tmp_path
     d = Decision(admitted=admitted, excluded=[], fulltext_path=None, fulltext_arm="",
                 any_relevant=True, relaxed=False, gate_reason="")
     r = _metrics.build_record(d, {"内存"}, Path("D:/proj"),
-                              session_id="s", prompt_id="p", salt=salt, admitted_k=10)
+                              session_id="s", prompt_id="p", salt=salt,
+                              src="typed", admitted_k=10)
     assert len(r["admitted"]) == 10
     # 截断后仍是按 total 降序的前 10 条（total 30..21 → path n/0.md..n/9.md）
     assert [a["path"] for a in r["admitted"]] == [f"n/{i}.md" for i in range(10)]
@@ -188,7 +190,8 @@ def test_summarize_uses_full_aggregates_not_truncated_sample(tmp_path):
     d = Decision(admitted=admitted, excluded=[], fulltext_path=None, fulltext_arm="",
                 any_relevant=True, relaxed=False, gate_reason="")
     r = _metrics.build_record(d, {"内存"}, Path("D:/proj"),
-                              session_id="s", prompt_id="p", salt=salt, admitted_k=5)
+                              session_id="s", prompt_id="p", salt=salt,
+                              src="typed", admitted_k=5)
     assert len(r["admitted"]) == 5, "前提：确实发生了截断"
     _metrics.write_record(tmp_path, "s", r)
     s = summarize(load_records(tmp_path))
@@ -229,6 +232,11 @@ def test_build_record_rejects_positional_session_and_prompt_id(tmp_path):
     d = Decision(admitted=[], excluded=[], fulltext_path=None, fulltext_arm="",
                 any_relevant=False, relaxed=False, gate_reason="")
     with pytest.raises(TypeError):
+        # ⚠️ 本用例现在会因「缺必填参数 src」而通过——抛错原因已从「session_id 是
+        # keyword-only」变成「缺参数」，它**已不足以单独守护** keyword-only 语义。
+        # 真正的守护在 test_build_record_src_is_keyword_only_and_required（用
+        # inspect.signature 钉形态）。保留本用例是因为它仍能挡住「把 session_id/
+        # prompt_id 改回位置参数」这一具体回归。
         _metrics.build_record(d, set(), Path("D:/proj"), "sess-A", "pid-1", salt)
 
 
@@ -240,7 +248,8 @@ def test_build_record_session_field_matches_session_id_kwarg(tmp_path):
     d = Decision(admitted=[], excluded=[], fulltext_path=None, fulltext_arm="",
                 any_relevant=False, relaxed=False, gate_reason="")
     r = _metrics.build_record(d, set(), Path("D:/proj"),
-                              session_id="sess-A", prompt_id="pid-1", salt=salt)
+                              session_id="sess-A", prompt_id="pid-1", salt=salt,
+                              src="typed")
     assert r["session"] == "sess-A"
     assert r["prompt_id"] == "pid-1"
 
@@ -388,3 +397,67 @@ def test_flush_without_retention_days_skips_prune_entirely(tmp_path):
     _metrics.flush(tmp_path)      # 默认 retention_days=None
 
     assert not (_metrics.metrics_dir(tmp_path) / "prune_ts.json").exists()
+
+
+def test_near_miss_carries_dedup(tmp_path):
+    """near_miss 必须落 dedup——用于区分「被去重抑制」与「打分不够」。
+
+    实测 2590 条 near_miss 里 173 条（6.7%，下界）是本会话早前已 admitted 的
+    同一篇；它们 topical 高、稳定排在榜首，会让 --report 与 nudge 误报
+    「这篇老是擦肩而过」，而它其实已经成功召回过。
+    """
+    from scripts._decision import Decision, EntryDecision
+    salt = _metrics.get_salt(tmp_path)
+    d = Decision(
+        admitted=[],
+        excluded=[
+            EntryDecision(path="n/dedup.md", topical=9.0, total=0.0, hits=[],
+                          admitted=False, admit_arm="", dedup="fulltext_injected"),
+            EntryDecision(path="n/plain.md", topical=8.0, total=0.0, hits=[],
+                          admitted=False, admit_arm="", dedup=""),
+        ],
+        fulltext_path=None, fulltext_arm="",
+        any_relevant=False, relaxed=False, gate_reason="",
+    )
+    r = _metrics.build_record(d, {"内存"}, Path("D:/proj"),
+                              session_id="s", prompt_id="p", salt=salt, src="typed")
+    by_path = {nm["path"]: nm for nm in r["near_miss"]}
+    assert by_path["n/dedup.md"]["dedup"] == "fulltext_injected"
+    assert by_path["n/plain.md"]["dedup"] == ""
+    # 既有性能护栏不变：near_miss 仍不落 total（补算实测 +150~200ms，会顶穿 UPS 预算）
+    assert "total" not in by_path["n/plain.md"]
+
+
+def test_build_record_records_src(tmp_path):
+    """记录必须落 src —— 没有它就无法把召回按来源拆开看。
+
+    事件级实测（259 条）：typed 113 / sdk 93 / 无字段 37 /
+    suggestion_accepted 12 / queued 1。sdk 占 35.9%、且占全文注入 51.8%，
+    其输入是 `Branch:/Range:` 提交元信息模板，与人类提问必须能分开统计。
+    """
+    from scripts._decision import Decision, EntryDecision
+    salt = _metrics.get_salt(tmp_path)
+    d = Decision(admitted=[], excluded=[], fulltext_path=None, fulltext_arm="",
+                 any_relevant=False, relaxed=False, gate_reason="")
+    r = _metrics.build_record(d, {"内存"}, Path("D:/proj"),
+                              session_id="s", prompt_id="p", salt=salt, src="typed")
+    assert r["src"] == "typed"
+
+
+def test_build_record_src_is_keyword_only_and_required(tmp_path):
+    """src 与 session_id/prompt_id 同为相邻同型字符串，必须 keyword-only。
+
+    用 inspect.signature 钉形态而非 pytest.raises(TypeError)：后者是弱断言，
+    再加一个位置参数时仍会因「参数过多」抛 TypeError、照样绿，
+    但它宣称守护的那件事已经变了。
+    """
+    import inspect
+    params = inspect.signature(_metrics.build_record).parameters
+    positional = [n for n, p in params.items()
+                  if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD]
+    assert positional == ["decision", "prompt_keywords", "cwd"]
+    for name in ("session_id", "prompt_id", "salt", "src"):
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
+    # src 无默认值——漏传必须报错，不能静默落成 ""（"" 是合法取值，见
+    # tests/integration/test_prompt_submit.py 的空串按用户输入处理用例）
+    assert params["src"].default is inspect.Parameter.empty

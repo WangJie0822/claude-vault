@@ -500,7 +500,11 @@ class ObsidianCLI:
                 continue
             if suffix and p.suffix != suffix:
                 continue
-            results.append(str(p.relative_to(self.vault_path)))
+            # 必须 as_posix()：str(PurePath) 在 Windows 上产出反斜杠，而上面 CLI
+            # 那一支（读 stdout）产出的是正斜杠 —— 同一个 files() 在两条路径上返回
+            # 不同分隔符，降级就不再对调用方透明了。Obsidian 的 wikilink 与 Vault
+            # 内相对路径约定也都是正斜杠。
+            results.append(p.relative_to(self.vault_path).as_posix())
         return self._fallback(reason, data={"paths": sorted(results)})
 
     def reload_vault(self) -> dict:

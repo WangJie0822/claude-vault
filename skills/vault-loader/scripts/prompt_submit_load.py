@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -95,6 +96,10 @@ except Exception as _metrics_exc:  # noqa: BLE001
         分支即可正常工作。即便未来漏补某个新接口，各调用点自身仍有独立 try/except 兜底
         （见 main() 的 stage 块与 _finish_with_metrics），不依赖这层替身作唯一防线。"""
 
+        # 极简 gate 记录要用它构造 _schema；与上面几个接口同理，缺了会让
+        # _stage_gate_record 落进自己的 except 分支、每轮打一行 stderr。
+        SCHEMA = 1
+
         @staticmethod
         def stage(record: dict) -> None:
             return None
@@ -167,9 +172,14 @@ def _is_opt_out_path(cwd: Path, opt_out: list[str]) -> bool:
     return False
 
 
-# 实证（多会话 transcript）promptSource 取值域：typed（手输）/ queued（排队的用户消息）/
+# 实证（多会话 transcript，2026-08-17 复核）promptSource 取值域共 5 个：typed（手输）/
+# queued（排队的用户消息）/ suggestion_accepted（用户点选建议）/ sdk（headless 或 SDK 调用）/
 # system（后台 task-notification 等系统注入）。仅 system 是非用户注入——用黑名单而非
-# "≠typed" 白名单，避免误杀 queued/slash 等真实用户输入（节点2 评审核验：queued="已退出" 是真用户）。
+# "≠typed" 白名单，避免误杀 queued/suggestion_accepted/slash 等真实用户输入
+# （节点2 评审核验：queued="已退出" 是真用户）。
+# ⚠️ 该字段**确实存在于 hook stdin**：本机 259 条 metrics 事件反查 transcript，
+# 排除 toolUseResult/isMeta（它们复用发起 prompt 的 promptId）后，promptSource=system
+# 的 prompt 进入 metrics 的条数为 0 —— 说明下面这道黑名单确实在生效，不是死代码。
 _SYSTEM_PROMPT_SOURCES = frozenset({"system"})
 
 
@@ -436,6 +446,35 @@ def _finish(
     return 0
 
 
+def _stage_gate_record(config: dict, hook_input: dict, gate: str) -> None:
+    """给「未走到打分就早退」的轮次留一条极简记录。
+
+    改动前这四类轮次完全不落盘，导致 `gate` 字段恒为空、报表的闸门分布退化成
+    恒等于 `{'ok': N}` 的空统计——被拦的从来没被记录过，于是「这周有多少次
+    召回被闸门挡掉了」无从回答（实测 259/259 条记录 gate 全为空）。
+
+    **只记五个键，不含 kw_h/cwd_h/admitted/near_miss** —— 零隐私增量。
+    也因为不含 `near_miss` 键，`flush()`（_metrics.py 用 `or []` 取该键）
+    不会为它 bump near_miss 计数。
+
+    自带 metrics.enabled 判断：`flush()` 只看 `_PENDING` 是否非空，漏判会让
+    metrics 关闭时也落盘、绕过 opt-in 边界。
+    fail-open：任何异常只打 stderr，绝不连累召回。
+    """
+    if not config.get("metrics", {}).get("enabled", False):
+        return
+    try:
+        _metrics.stage({
+            "_schema": _metrics.SCHEMA,
+            "ts": round(time.time(), 3),
+            "session": hook_input.get("session_id", "") or "",
+            "prompt_id": hook_input.get("prompt_id", "") or "",
+            "gate": gate,
+        })
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] gate 记录构造失败：{exc}", file=sys.stderr)
+
+
 def _finish_with_metrics(config: dict, cwd: Path,
                          additional_context: str | None = None,
                          system_message: str | None = None) -> int:
@@ -538,12 +577,14 @@ def main() -> int:
             pass
     if not vault_path.exists():
         notify(vault_unreachable(vault_path))
+        _stage_gate_record(config, hook_input, "vault_unreachable")
         return _finish_with_metrics(config, cwd)
 
     rel_cfg = config["relevance"]
     # 拦截非用户手输 prompt（后台 task-notification / 系统注入）——其文本含 UUID/tool-id/路径碎片，
     # 当关键词会污染注入（实证：会话 a9ee6be0 后台命令完成通知被处理、切出 cashbook 假强命中）。
     if rel_cfg.get("skip_non_user_prompts", True) and _is_system_injected_prompt(hook_input, prompt):
+        _stage_gate_record(config, hook_input, "skipped_source")
         return _finish_with_metrics(config, cwd)
 
     # 信号 J（剥 slash + 英文切分 + CJK bigram + 头尾截断均由 relevance 控制）
@@ -560,6 +601,7 @@ def main() -> int:
     # 保持旧时机——不因抽出决策纯函数而推迟早退、令热路径多背两次 state 读 + 一次 cache 读。
     gate_reason, _ = gate_keywords(prompt_keywords, config)
     if gate_reason == "too_few_keywords":
+        _stage_gate_record(config, hook_input, "too_few_keywords")
         return _finish_with_metrics(config, cwd)
 
     target_tags = set(i_result.tags) | collect_signal_b_keyword_map(
@@ -581,6 +623,7 @@ def main() -> int:
         # 都是健康态，对它们告警会命中每个新装用户和下次 bump 后的全部存量用户。
         if cache_status.is_failure():
             notify(cache_broken(cache_status.value, vault_path))
+        _stage_gate_record(config, hook_input, "cache_empty")
         return _finish_with_metrics(config, cwd)
 
     ttl = ups_cfg["state_ttl_hours"]
@@ -615,6 +658,8 @@ def main() -> int:
                 decision, prompt_keywords, cwd,
                 session_id=hook_input.get("session_id", ""),
                 prompt_id=hook_input.get("prompt_id", ""),
+                # 与 _is_system_injected_prompt 读同一对键，保持一致
+                src=hook_input.get("promptSource") or hook_input.get("prompt_source") or "",
                 salt=_metrics.get_salt(Path.home()),
                 near_miss_k=config["metrics"].get("near_miss_k", 10),
                 admitted_k=config["metrics"].get("admitted_k", 20),

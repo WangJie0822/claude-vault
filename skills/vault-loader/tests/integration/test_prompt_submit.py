@@ -952,3 +952,48 @@ def test_fallback_cooldown_suppresses_second_hint(tmp_home: Path, tmp_vault: Pat
     assert "未匹配到强相关" in d1["systemMessage"]
     r2 = _run(NEUTRAL_CWD, "帮我写个贪吃蛇游戏")
     assert r2.stdout.strip() == ""   # 冷却窗口内静默
+
+
+# ---------------------------------------------------------------------------
+# 早退点 gate 记录（闸门盲区可观测性）
+# ---------------------------------------------------------------------------
+
+def test_gate_record_written_for_too_few_keywords(tmp_home: Path, tmp_vault: Path) -> None:
+    """关键词不足而早退时，也要留下一条极简记录。
+
+    改动前这类轮次完全不落盘——这正是 `gate` 字段 259/259 全为空、报表
+    渲染成 `{'ok': N}` 的成因：被拦的从来没被记录过。
+    """
+    cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(tmp_vault),
+                               "metrics": {"enabled": True}}))
+
+    _run(NEUTRAL_CWD, "hi")
+
+    files = list((tmp_home / ".claude" / "vault-loader-metrics").rglob("*.jsonl"))
+    assert files, "早退轮次也应落一条极简记录"
+    recs = [json.loads(line) for f in files
+            for line in f.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(recs) == 1
+    assert recs[0]["gate"] == "too_few_keywords"
+    # 极简记录不得带隐私字段
+    assert "kw_h" not in recs[0] and "cwd_h" not in recs[0]
+    # 不含 near_miss 键 ⇒ flush() 的 bump_near_miss_counts 不会为它计数
+    assert "near_miss" not in recs[0] and "admitted" not in recs[0]
+
+
+def test_gate_record_not_written_when_metrics_disabled(tmp_home: Path, tmp_vault: Path) -> None:
+    """metrics 关闭时早退点一律零落盘。
+
+    flush() 只看 _PENDING 是否非空（_metrics.py:451-455），新增的 stage()
+    必须自带 enabled 判断，否则会绕过 metrics 的 opt-in 边界。
+    """
+    cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(tmp_vault)}))
+
+    _run(NEUTRAL_CWD, "hi")
+
+    files = list((tmp_home / ".claude" / "vault-loader-metrics").rglob("*.jsonl"))
+    assert files == []

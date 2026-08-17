@@ -29,6 +29,11 @@ if TYPE_CHECKING:                      # 仅供类型标注，运行期不导入
 
     from scripts._decision import Decision      # 与 prompt_submit_load.py 同一写法
 
+# schema 演进约定（2026-08-17 确立）：**只有加性可选字段可以不 bump 本常量**
+# ——读端一律 `.get(key, 默认)`，新旧双向兼容。任何删除 / 重命名 / 语义变更
+# **必须** bump，并同步给 `analyze_metrics.load_records` 加一条「丢弃了 N 条旧版本
+# 记录」的 stderr 提示：它现在用严格相等过滤（analyze_metrics.py:68）、且 skipped
+# 计数器只统计 JSON 解析失败，bump 会让既有记录**静默消失**（实测本机已积累 259 条）。
 SCHEMA = 1
 _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 _MONTH_RE = re.compile(r"\d{4}-\d{2}")
@@ -163,6 +168,7 @@ def write_record(home: Path, session_id: str, record: dict) -> Path:
 
 def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None",
                  cwd: Path, *, session_id: str, prompt_id: str, salt: bytes,
+                 src: str,
                  near_miss_k: int = 10, admitted_k: int = 20) -> dict:
     """把一次 UPS 决策压成一条可落盘记录。纯计算、无 IO。
 
@@ -212,6 +218,11 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
         "cwd_h": h(str(cwd), salt),
         "kw_h": [h(k, salt) for k in kws],
         "n_kw": len(kws),
+        # 来源（hook stdin 的 promptSource）。harness 下发的枚举值，不含用户内容，
+        # 明文落盘。**刻意无默认值**："" 是合法取值（空串按用户输入处理），给默认
+        # 值会让「调用方漏传」与「来源真的缺失」在数据里无法区分，而按来源拆分
+        # 统计正要切这一刀。
+        "src": src,
         "gate": decision.gate_reason,
         "relaxed": bool(decision.relaxed),
         "admitted": [
@@ -224,7 +235,12 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
         "arm_counts": dict(arm_counts),
         "admitted_k": admitted_k,
         "near_miss": [
-            {"path": ed.path, "topical": round(ed.topical, 3)} for ed in near
+            # dedup 在 _decision.py:173/184/191 已算好，落盘零额外成本——与本函数
+            # 刻意不落 total/hits（需补算、实测 +150~200ms）的性能护栏不冲突。
+            # 没有它就分不清「被去重抑制」（其实已成功召回过）与「打分不够」，
+            # 而前者混在 near-miss 榜首会让 --report 与 nudge 提示误报。
+            {"path": ed.path, "topical": round(ed.topical, 3), "dedup": ed.dedup}
+            for ed in near
         ],
         "n_excluded": len(decision.excluded),
         "ft": {"path": decision.fulltext_path or "", "arm": decision.fulltext_arm},
