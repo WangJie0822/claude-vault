@@ -37,7 +37,11 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入到
 
 ### near-miss 提示（需先开启 `metrics.enabled`）
 
-与上面「失效告知」的四类**真实故障**不同，这条提示的是**效果**而非故障——默认不出现，只有 `metrics.enabled: true`（见下方「本地数据」）时才可能触发：某篇笔记在单会话内「话题分达标却始终没通过闸门入选」累计到 `metrics.nudge_threshold`（默认 10）次，同样经 `systemMessage` 出现一行说明，提示你跑 `analyze_metrics.py --review` 标注或检查该笔记的 tags/keywords。冷却是**全局**的（`metrics.nudge_ttl_hours`，默认 168 小时 = 一周），不是逐篇/逐 cwd，避免刷屏。
+与上面「失效告知」的四类**真实故障**不同，这条提示的是**效果**而非故障——默认不出现，只有 `metrics.enabled: true`（见下方「本地数据」）时才可能触发：某篇笔记**跨会话累计**「话题分达标却始终没通过闸门入选」达 `metrics.nudge_threshold`（默认 10）次，经 `systemMessage` 出现一行说明，提示你跑 `analyze_metrics.py --review` 标注或检查该笔记的 tags/keywords。冷却是**全局**的（`metrics.nudge_ttl_hours`，默认 168 小时 = 一周），不是逐篇/逐 cwd，避免刷屏。
+
+> **是跨会话不是单会话**（此前本节写作「单会话内」，是错的）：计数落在 `~/.claude/vault-loader-metrics/near_miss_counts.json`，全局共享、不随会话清零。差别很大——单会话内攒够 10 次几乎不可能，而跨会话实测半个月就有 200+ 篇达标。
+>
+> 只统计 **topical ≥ 3** 的条目：低于这个分的笔记不是「差一点」，是压根不相关，提示你去调它的 tags/keywords 是错的指引。所以某篇明明反复未入选却从不提示，多半是它的话题分本来就太低。
 
 ### 全文升级判据
 
@@ -160,13 +164,17 @@ vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取
 | 键 | 默认 | 作用 |
 |---|---|---|
 | `metrics.enabled` | `false` | 落盘总开关，**opt-in**：默认关，避免对存量用户在 `/plugin update` 后静默启用新的按提问逐条落盘 |
-| `metrics.near_miss_k` | `10` | 每轮记录 excluded 候选中 topical 分最高的 K 条（near-miss，用于事后评估召回边界） |
+| `metrics.near_miss_k` | `10` | 每轮记录 excluded 候选中 topical 分最高的 K 条（near-miss，用于事后评估召回边界）。**该上限分别作用于 `near_miss` 与 `near_miss_scorelow` 两个数组**，故单轮最多落 2K 条；后者额外受 topical ≥ 3 约束，实测 80% 的轮次为空 |
 | `metrics.admitted_k` | `20` | 每轮落盘 `admitted` 按 `total` 降序保留的展示样本条数上限；真实 Vault 实测单轮 admitted 可达 58~156 条，未截断落盘体积远超预期。截断只影响展示样本，`n_admitted`/`arm_counts` 统计口径基于截断前全量计算，不受影响 |
 | `metrics.retention_days` | `90` | 超过此天数的**月份事件目录**（`<YYYY-MM>/*.jsonl`）自动清理，按「每天至多一次」的频率闸门在正常使用时自动触发，无需手动操作；**只清理这部分**——`.salt`/`near_miss_counts.json`/`nudge_ts.json`/`prune_ts.json`/`annotations.jsonl` 都不受它约束，会一直留到你手动 `--purge` |
 | `metrics.nudge_threshold` | `10` | 某篇笔记累计 near-miss 次数达到此阈值才提示（77 轮真实 prompt 实测标定，判据偏向沉默，勿放宽） |
 | `metrics.nudge_ttl_hours` | `168` | near-miss 提示的**全局**冷却窗口（小时），窗口内所有笔记合计最多提示一次 |
 
 数据落 `~/.claude/vault-loader-metrics/`；跑 `--purge` **无二次确认**，单条命令立即不可逆清空——**含 `--review` 产生的人工标注**。
+
+想只清 near-miss 计数（比如从 0.9.0 升上来、存量计数按旧判据累加过）用 `--reset-counts`：它只删两份可再生的派生数据（`near_miss_counts.json` / `nudge_ts.json`），事件记录与人工标注一律不碰。**别为这个目的去跑 `--purge`**——那会把不可再生的标注一起删掉。
+
+`.salt` 的保密是加盐 hash 的安全前提，但**该保护平台相关**：POSIX 上由 `0600` 保证，Windows 上 `chmod` 不生效（NTFS 走 ACL），实际可读范围取决于 `~/.claude` 继承的 ACL。详见 README「本地数据」一节。
 
 ### 升级后：清理旧版物化残留
 

@@ -92,9 +92,14 @@ except Exception as _metrics_exc:  # noqa: BLE001
 
     class _MetricsStub:  # type: ignore[misc]
         """metrics 导入失败时的零功能替身，覆盖全部被调用接口
-        （stage/flush/build_record/get_salt）——调用点无需改成 `if _metrics is not None`
-        分支即可正常工作。即便未来漏补某个新接口，各调用点自身仍有独立 try/except 兜底
-        （见 main() 的 stage 块与 _finish_with_metrics），不依赖这层替身作唯一防线。"""
+        （stage/flush/annotate/build_record/get_salt）——调用点无需改成
+        `if _metrics is not None` 分支即可正常工作。即便未来漏补某个新接口，各调用点
+        自身仍有独立 try/except 兜底（见 main() 的 stage 块与 _finish_with_metrics），
+        不依赖这层替身作唯一防线。
+
+        漏补一个接口不会破 fail-open（emit 已在其前完成），但会把「静默降级」变成
+        「每轮一行 stderr」——`test_metrics_stub_covers_all_called_interfaces`
+        按实际调用点反射钉住这份清单。"""
 
         # 极简 gate 记录要用它构造 _schema；与上面几个接口同理，缺了会让
         # _stage_gate_record 落进自己的 except 分支、每轮打一行 stderr。
@@ -109,12 +114,27 @@ except Exception as _metrics_exc:  # noqa: BLE001
             return None
 
         @staticmethod
+        def annotate(**_k) -> None:
+            return None
+
+        @staticmethod
         def build_record(*_a, **_k) -> dict:
             return {}
 
         @staticmethod
         def get_salt(home: Path) -> bytes:
             return b""
+
+        # near-miss 提示分支也走 _metrics（此前漏补，由
+        # test_metrics_stub_covers_all_called_interfaces 扫出来）。虽然那段自带
+        # try/except，但缺接口会让它每轮走进 except、打一行 stderr。
+        @staticmethod
+        def nudge_due(home: Path, threshold: int = 10, ttl_hours: int = 168) -> list:
+            return []
+
+        @staticmethod
+        def mark_nudged(home: Path) -> None:
+            return None
 
     _metrics = _MetricsStub()
 
@@ -187,7 +207,16 @@ def _is_system_injected_prompt(hook_input: dict, prompt: str) -> bool:
     """判定该 prompt 是否系统注入（非用户手输），用于跳过知识库注入。
     - promptSource/prompt_source 命中已实证的系统来源黑名单（system）即跳过；该字段未文档化为
       hook stdin、可能不下发，故仅"命中才拦"，缺失/空串/未知值一律按用户输入处理（不误杀）；
-    - 兜底（字段缺失时）：prompt 文本以 <task-notification> 包裹（实证的后台任务完成通知格式）。"""
+    - 兜底（字段缺失时）：prompt 文本以 <task-notification> 包裹（实证的后台任务完成通知格式）。
+
+    ⚠️ **当前（Claude Code 2.1.220）第一条判据恒不生效，全部拦截都来自文本兜底。**
+    实证两条：① 二进制里 UserPromptSubmit 的 hook stdin payload 构造中没有
+    `promptSource` 键（它只存在于 transcript 的 user message 与 CC 内部上下文对象）；
+    ② 本机 1018 条 metrics 记录的 `src` 无一非空，而同期 `skipped_source` 命中 138 次
+    ——那 138 次只可能来自下面的 `<task-notification>` 分支。
+    保留这条判据是因为它无害且面向未来（harness 哪天下发即自动生效），但**不要**把它
+    当成已在工作的防线：如果需要拦截别的系统注入形态（`<system-reminder>` 等），
+    必须另加文本判据，改这里的黑名单没有任何效果。"""
     source = hook_input.get("promptSource") or hook_input.get("prompt_source")
     if source in _SYSTEM_PROMPT_SOURCES:
         return True
@@ -454,8 +483,12 @@ def _stage_gate_record(config: dict, hook_input: dict, gate: str) -> None:
     召回被闸门挡掉了」无从回答（实测 259/259 条记录 gate 全为空）。
 
     **只记五个键，不含 kw_h/cwd_h/admitted/near_miss** —— 零隐私增量。
-    也因为不含 `near_miss` 键，`flush()`（_metrics.py 用 `or []` 取该键）
-    不会为它 bump near_miss 计数。
+    也因为不含 `near_miss_scorelow` 键，`flush()` 走的 `_metrics.scorelow_entries()`
+    对它返回 `[]`，而 `bump_near_miss_counts` 的 `if not paths: return` 在 mkdir /
+    取锁**之前** ⇒ gate 轮次连 metrics 目录都不会碰。
+    ⚠️ 此处原写「`flush()`（_metrics.py 用 `or []` 取该键）」，结论仍成立但**理由指向
+    一个已不存在的机制** —— flush 早已改走 `scorelow_paths`。判据被同一批整改顶歪时，
+    照着它去核验的人会找不到 `or []`，然后怀疑是自己读错了代码。
 
     自带 metrics.enabled 判断：`flush()` 只看 `_PENDING` 是否非空，漏判会让
     metrics 关闭时也落盘、绕过 opt-in 边界。
@@ -491,7 +524,19 @@ def _finish_with_metrics(config: dict, cwd: Path,
     rc = _finish(config, cwd, additional_context, system_message)
     try:
         mcfg = config.get("metrics", {}) or {}
-        retention_days = mcfg.get("retention_days", 90) if mcfg.get("enabled", False) else None
+        enabled = mcfg.get("enabled", False)
+        # 注入正文长度：`additional_context` 就是最终进模型上下文的那段文本，
+        # `_finish`/`emit` 只对 **system_message** 做前置诊断与 sanitize，不碰它
+        # （_output.py 的 emit 注释明写「自身不二次处理」）⇒ 这个长度即真实开销。
+        #
+        # **只在真的有正文时记**：`_finish_with_metrics` 是全部出口的公共通道，
+        # 其中闸门早退与「零 admitted」分支传的都是 None。给它们一律写 0 会
+        # ① 把 25% 的闸门轮次以 0 计进均值、② 让极简 gate 记录多出第 6 个键
+        # （其 docstring 承诺「只记五个键」，且守卫是黑名单式的、拦不住新键漂入）。
+        # 分母那一侧由 summarize 用 `"inj_chars" in r` 判存在来配套，不用 .get(0)。
+        if enabled and additional_context is not None:
+            _metrics.annotate(inj_chars=len(additional_context))
+        retention_days = mcfg.get("retention_days", 90) if enabled else None
         _metrics.flush(Path.home(), retention_days=retention_days)
     except Exception as exc:  # noqa: BLE001 — 指标绝不阻断召回
         print(f"[vault-loader] metrics 写入失败：{exc}", file=sys.stderr)
@@ -660,9 +705,14 @@ def main() -> int:
                 prompt_id=hook_input.get("prompt_id", ""),
                 # 与 _is_system_injected_prompt 读同一对键，保持一致
                 src=hook_input.get("promptSource") or hook_input.get("prompt_source") or "",
+                # prompt 原文只用来算加盐 hash（build_record 内部），不落盘。
+                # 它是 --review 回查 transcript 取原文的定位键，见 build_record 说明。
+                prompt=prompt,
                 salt=_metrics.get_salt(Path.home()),
                 near_miss_k=config["metrics"].get("near_miss_k", 10),
                 admitted_k=config["metrics"].get("admitted_k", 20),
+                # 渲染层配置，随记录落盘供 analyze_metrics 用（它不读 config）
+                max_notes=config["user_prompt_submit"].get("max_notes", 3),
             ))
         except Exception as exc:  # noqa: BLE001
             print(f"[vault-loader] metrics 构造失败：{exc}", file=sys.stderr)

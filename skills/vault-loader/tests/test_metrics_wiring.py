@@ -112,3 +112,47 @@ def test_metrics_import_failure_does_not_break_recall(
     parsed = json.loads(r.stdout)  # 解析失败本身就是本用例要防的那种回归
     ctx = parsed.get("hookSpecificOutput", {}).get("additionalContext")
     assert ctx, f"metrics 导入失败连累了召回，additionalContext 为空：stdout={r.stdout!r}"
+
+
+def test_metrics_stub_covers_all_called_interfaces():
+    """`_MetricsStub` 必须覆盖 `_metrics` 上**被实际调用到**的每个接口。
+
+    stub 在 metrics 模块导入失败时顶上。漏补一个新接口不会破 fail-open
+    （emit 已在其前完成），但会让每轮多打一行 `metrics 写入失败` —— 把「静默降级」
+    变成持续噪声，而这条路径平时不跑、没人会注意到。
+
+    **判据靠扫源码而不是硬编码清单**：写死清单等于要求人同时改两处，
+    而漏改的那次恰恰就是会出问题的那次。
+    """
+    import re
+
+    src_path = Path(__file__).resolve().parents[1] / "scripts" / "prompt_submit_load.py"
+    src = src_path.read_text(encoding="utf-8")
+    # 去掉 _MetricsStub 类体本身，避免把 stub 的定义当成调用点
+    stub_start = src.index("class _MetricsStub")
+    stub_end = src.index("_metrics = _MetricsStub()")
+    body = src[:stub_start] + src[stub_end:]
+
+    # 先剥 docstring 与行注释，再扫调用点。两道都必需，理由各不相同：
+    #   - 只认「后跟左括号」的形态，挡的是注释里的 `_metrics.py` 被当成接口名 `py`；
+    #   - 剥 docstring/注释，挡的是注释里**写全了调用形态**的引用（如解释某个键为什么
+    #     不落盘时提到 `_metrics.scorelow_entries()`）——它长得与真实调用一模一样，
+    #     会让本用例报「stub 缺少接口」，而那个接口根本不在 hook 路径上。
+    #     实际踩过：给 `_stage_gate_record` 的 docstring 补一句机制说明就把本用例弄红了。
+    code = re.sub(r'"""(?:.|\n)*?"""', "", body)      # docstring（本文件无单引号三引号）
+    code = re.sub(r"#.*", "", code)                    # 行注释
+    called = set(re.findall(r"\b_metrics\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", code))
+    assert called, "解析失败：没扫到任何 _metrics.<name> 调用点（判据本身失效了）"
+    # 阳性对照：`stage` 是恒存在的真实调用点，扫不到它说明剥注释剥过头了
+    assert "stage" in called, f"解析失效：真实调用点 stage 被误剥，扫到的是 {sorted(called)}"
+
+    # stub 定义在 `except ImportError` 分支内，正常导入路径下它根本不存在
+    # （`from ... import _MetricsStub` 会 ImportError）⇒ 只能同样按源码解析。
+    stub_src = src[stub_start:stub_end]
+    provided = set(re.findall(r"^\s+def\s+([A-Za-z_][A-Za-z0-9_]*)", stub_src, re.M))
+    assert provided, "解析失败：没扫到 stub 的任何方法定义"
+
+    missing = sorted(called - provided)
+    assert not missing, (
+        f"_MetricsStub 缺少被调用的接口 {missing}；"
+        f"调用点={sorted(called)}，stub 提供={sorted(provided)}")

@@ -101,6 +101,66 @@ def test_opt_out_produces_zero_metrics_files(tmp_home: Path, tmp_vault: Path,
 
 
 # ---------------------------------------------------------------------------
+# 验收 A2 —— inj_chars 的端到端契约（M6）
+# ---------------------------------------------------------------------------
+
+def _read_records(tmp_home: Path) -> list[dict]:
+    md = tmp_home / ".claude" / "vault-loader-metrics"
+    out = []
+    for f in sorted(md.rglob("*.jsonl")):
+        if f.parent.name == md.name:          # 顶层 annotations.jsonl 不是事件记录
+            continue
+        for line in f.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                out.append(json.loads(line))
+    return out
+
+
+def test_inj_chars_equals_real_injected_length(tmp_home: Path, tmp_vault: Path,
+                                               write_frontmatter_cache):
+    """落盘的 inj_chars 必须等于**真正进了模型上下文**的正文长度。
+
+    此前 inj_chars 只有单元级覆盖（8 处全是直接调 `_metrics.annotate()`），
+    没有任何用例把它与 `additionalContext` 的真实长度对起来 —— 也就是说
+    `_finish_with_metrics` 里那行接线写错了对象（比如误传 system_message、
+    或在 sanitize 之前取长度）都不会被发现。
+    """
+    cwd = tmp_home.parent / "proj-inj"
+    cwd.mkdir()
+    _write_note_and_cfg(tmp_home, tmp_vault, write_frontmatter_cache, {})
+    r = _run(cwd, "please explain the SessionStart hook implementation")
+    assert r.returncode == 0
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    recs = [x for x in _read_records(tmp_home) if x.get("gate") == ""]
+    assert recs, "对照失败：没有产生任何走到打分的记录，本用例证明不了任何事"
+    assert recs[-1]["inj_chars"] == len(ctx), (
+        f"落盘 {recs[-1].get('inj_chars')} != 实际注入 {len(ctx)} 字符")
+
+
+def test_gate_record_keeps_exactly_five_keys(tmp_home: Path, tmp_vault: Path,
+                                             write_frontmatter_cache):
+    """闸门早退的极简记录只含五个键 —— 用**集合相等**钉，不用 `not in`。
+
+    `_stage_gate_record` 的 docstring 承诺「只记五个键、零隐私增量」，而它原本的
+    守卫是黑名单式的、拦不住新键漂入。具体失效场景：日后有人把某个早退出口的
+    `additional_context=None` 改成 `""`（一个看起来无害的重构），gate 记录会静默
+    多出 `inj_chars: 0`，25% 的轮次以 0 计进注入量均值 —— 而全套用例一条都不会红。
+
+    集合相等是唯一能拦住「多出一个键」的写法：`"inj_chars" not in rec` 只挡得住
+    这一个名字，挡不住下一个。
+    """
+    cwd = tmp_home.parent / "proj-gate"
+    cwd.mkdir()
+    _write_note_and_cfg(tmp_home, tmp_vault, write_frontmatter_cache, {})
+    r = _run(cwd, "a")           # 关键词不足 ⇒ too_few_keywords 早退
+    assert r.returncode == 0
+    gates = [x for x in _read_records(tmp_home) if x.get("gate")]
+    assert gates, "对照失败：没有产生闸门早退记录"
+    assert set(gates[-1]) == {"_schema", "ts", "session", "prompt_id", "gate"}, (
+        f"极简 gate 记录漂入了新键：{sorted(set(gates[-1]) - {'_schema', 'ts', 'session', 'prompt_id', 'gate'})}")
+
+
+# ---------------------------------------------------------------------------
 # 验收 B —— metrics 四个关键函数任一失败，main() 全流程仍 fail-open
 # ---------------------------------------------------------------------------
 
@@ -146,6 +206,9 @@ def test_metrics_failure_never_breaks_injection_end_to_end(
         ("flush/RuntimeError", (_metrics, "flush"), RuntimeError),
         ("build_record/OSError", (_metrics, "build_record"), OSError),
         ("get_salt/RuntimeError", (_metrics, "get_salt"), RuntimeError),
+        # annotate 与上面几个同权：它在 emit 之后、flush 之前被调用，抛异常同样
+        # 不得让本轮已完成的注入受影响（新接口不进这张矩阵就等于没有 fail-open 覆盖）
+        ("annotate/RuntimeError", (_metrics, "annotate"), RuntimeError),
     ]:
         unique_cwd = tmp_home.parent / f"normal-project-{name.replace('/', '-')}"
         rc, out = _run_inprocess(target, exc, unique_cwd)

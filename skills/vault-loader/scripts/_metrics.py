@@ -18,6 +18,7 @@ import secrets
 import sys
 import time
 from collections import Counter
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,31 @@ if TYPE_CHECKING:                      # 仅供类型标注，运行期不导入
 SCHEMA = 1
 _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 _MONTH_RE = re.compile(r"\d{4}-\d{2}")
+
+# score-low 样本的 topical 下限。`min_topical_score` 默认 4，本值取其 75%。
+#
+# **它是生成侧判据**——`build_record` 落盘时就施加，不再只作用于 nudge 计数。
+# `near_miss_scorelow` 里的条目按定义 topical < 4，但**下界是 0**：真实数据实测该批
+# topical 中位数只有 2.0、9.5% 恰为 0。而三个消费者的文案都是「反复接近召回闸门」
+# 「调 tags/keywords 可能救回来」，对一篇 topical=0 的笔记这些全是错的指引
+# （它不是差一点，是压根不相关）。
+#
+# 下沉到生成侧而非只在消费侧过滤，三个理由：
+#   1. 消费侧过滤靠「三处都记得调同一个函数」维系，而这**已经漏过一次**——上一版把
+#      判据写进 `scorelow_paths` 并在四处文档声明「三个消费者一律走单点」，实际只有
+#      `flush` 在调，`summarize` 与 `sample_near_miss` 各自内联读裸键、都没施加下限。
+#      生成侧施加后磁盘上不存在低于本值的条目，判据无从分叉。
+#   2. 落盘量：分层场景下 `near_miss` 与 `near_miss_scorelow` 交集为 0，单条记录暴露的
+#      excluded 路径精确翻倍（实测 10 → 20）。施加下限后降到 13。
+#   3. 少一个把磁盘数据喂进 `float()` 的消费点（该调用链会抛 ValueError/TypeError）。
+#
+# **代价（刻意记下，不粉饰）**：低于本值的条目**永久不落盘**，将来想调低 floor、
+# 或分析低分条目的分布，都没有历史数据可回溯。缓解手段是把生效值一并落盘为
+# `scorelow_floor`（与 `near_miss_k`/`admitted_k` 同族的自描述字段），至少让
+# 「这批记录当时用的什么阈值」可查——但它换不回已经没落盘的那些条目。
+#
+# 定量（真实数据）：下限取 3 时达阈值的 path 由 51 → 12；取 2 无效果（1812 条几乎全留）。
+NUDGE_TOPICAL_FLOOR = 3.0
 
 
 def metrics_dir(home: Path) -> Path:
@@ -62,7 +88,15 @@ def event_month_dirs(home: Path) -> list[Path]:
 
 def _chmod(p: Path, mode: int) -> None:
     try:
-        os.chmod(p, mode)      # Windows 上无实际效果，但无害，不跳过
+        # ⚠️ Windows 上**这道保护根本不存在**，不只是「无实际效果但无害」——
+        # 「无害」只在「不会弄坏别的东西」这一层成立，它掩盖的是：`.salt` 的保密是
+        # 加盐 hash 的安全前提，而 NTFS 走 ACL、`os.chmod` 对它基本无效，该文件的
+        # 实际可读范围完全取决于 `~/.claude` 继承下来的 ACL。若某个组被授过读权限
+        # （沙箱工具、备份服务常这么做），它就能同时拿到 salt 与 kw_h，对有限的
+        # 关键词空间做字典攻击、还原出 prompt 关键词 —— 那是设计里唯一声明
+        # 「绝不可恢复」的资产。README 已按平台如实标注，不再承诺「该文件须保密」
+        # 这种实现兑现不了的话。仍然调用是因为 POSIX 上它是真实有效的。
+        os.chmod(p, mode)
     except OSError:
         pass
 
@@ -168,8 +202,9 @@ def write_record(home: Path, session_id: str, record: dict) -> Path:
 
 def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None",
                  cwd: Path, *, session_id: str, prompt_id: str, salt: bytes,
-                 src: str,
-                 near_miss_k: int = 10, admitted_k: int = 20) -> dict:
+                 src: str, prompt: str = "",
+                 near_miss_k: int = 10, admitted_k: int = 20,
+                 max_notes: int = 3) -> dict:
     """把一次 UPS 决策压成一条可落盘记录。纯计算、无 IO。
 
     隐私边界（不可协商，见 task-6-brief.md）：
@@ -201,7 +236,34 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
     算错或崩溃。
     """
     kws = sorted(prompt_keywords or ())
-    near = sorted(decision.excluded, key=lambda ed: -ed.topical)[:near_miss_k]
+    # 只排一次序，两个样本都从它切 —— excluded 在真实 Vault 上中位数 736 条。
+    # 省下的第二次 `sorted(721)+[:10]` 实测 min 45.9us / median 50.6us，而本函数
+    # 全程 min 120~132us ⇒ **约 +38%**（占 300ms UPS 预算的 0.017%）。
+    # ⚠️ 此处原写「会把本函数的主要开销翻倍」，是未经实证的推算，已按实测订正——
+    # 它当时紧挨着下面那批精确实测数字（226/216、188/482），相邻的实证反而给它背了书。
+    ranked = sorted(decision.excluded, key=lambda ed: -ed.topical)
+    near = ranked[:near_miss_k]
+    # 「真·擦肩」样本必须**在截断之前**就把去重抑制的条目排掉，不能留给消费侧过滤。
+    # 两类条目的 topical 有结构性差异（不是统计巧合，是 _decision.py 的分支决定的）：
+    #   - 新篇落 excluded 的条件是 `t < min_topical`（:206）⇒ topical **严格 < 4**
+    #   - fulltext_injected 分支（:171）**不看 topical 就 excluded** ⇒ 可以高到 11
+    #   - candidate_injected 分支（:189）条件是 t < ft_topical(6) ⇒ 可以落在 [4, 6)
+    # 于是按 topical 降序取 top-k 时，被去重的条目天然占满槽位：真实数据实测 226 个
+    # 混合事件里 216 个严格分层，**188/482（39%）的轮次里 score-low 一条都进不了
+    # `near_miss`**。在消费侧再过滤，拿到的是「k 减去本轮已注入篇数」的残差而非真相。
+    #
+    # 新增**加性可选字段**而不改 `near_miss` 的语义，是为了不 bump SCHEMA：
+    # `analyze_metrics.load_records` 用严格相等过滤（:68），bump 会让既有记录静默
+    # 消失（实测本机已积累 1018 条）。旧键保留原样，供回溯与旧记录兼容。
+    # 惰性取前 k：`ranked` 已按 topical 降序，找满 k 个即停，不再遍历剩余条目。
+    # **`topical >= NUDGE_TOPICAL_FLOOR` 在这里施加、不留给消费侧**（见该常量的说明）：
+    # 消费侧过滤靠三处各自记得调同一个函数，上一版就是这样漏掉的；生成侧施加后磁盘上
+    # 不存在低于 floor 的条目，判据无从分叉。代价是这些条目永久不落盘，故把生效阈值
+    # 一并落盘为 `scorelow_floor`。
+    near_scorelow = list(islice(
+        (ed for ed in ranked
+         if not ed.dedup and ed.topical >= NUDGE_TOPICAL_FLOOR),
+        near_miss_k))
     admitted_all = decision.admitted
     n_admitted = len(admitted_all)
     # "?" 与 summarize() 里 `a.get("arm") or "?"` 的兜底口径保持一致：admit_arm
@@ -217,11 +279,35 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
         "prompt_id": prompt_id or "",
         "cwd_h": h(str(cwd), salt),
         "kw_h": [h(k, salt) for k in kws],
+        # prompt 原文的加盐 hash —— **不是**用来还原内容，而是给 `--review` 当**定位键**。
+        #
+        # 为什么必须有它：标注要回答「这篇笔记该不该被召回」，而这个问题在不知道
+        # 「当时问的是什么」时**根本无法回答**。此前 --review 只显示「被召回 63 次、
+        # topical<=10.8、路径」，标注者对着这些信息按 r/i/u，等于掷骰子。
+        #
+        # 为什么是 hash 而不是原文：prompt 原文绝不落盘（本函数 docstring 的隐私边界）。
+        # 而 transcript(`~/.claude/projects/*/<session_id>.jsonl`) 本来就在本机、
+        # 本来就存着全文 —— 标注时按 session_id 找到它，对每条 user message 算同样的
+        # hash 做**精确匹配**，就能把原文取回来展示。全程不新增任何落盘的可读内容。
+        #
+        # 为什么不落 transcript_path（它确实在 hook payload 里，实测存在）：
+        # 那个路径含项目目录名，而 `cwd` 特意只落了 hash —— 落它是隐私回退。
+        # session_id 已经够定位（实测 387/388 = 99.7% 能找到对应 transcript）。
+        #
+        # 为什么不靠时间戳就近匹配：实测只有 82.8% 能唯一定位，17.2% 落在
+        # 「同一秒内多条 user 消息」的歧义里，而标注是不可再生的数据，不能建在猜上。
+        "prompt_h": h(prompt, salt) if prompt else "",
         "n_kw": len(kws),
         # 来源（hook stdin 的 promptSource）。harness 下发的枚举值，不含用户内容，
         # 明文落盘。**刻意无默认值**："" 是合法取值（空串按用户输入处理），给默认
         # 值会让「调用方漏传」与「来源真的缺失」在数据里无法区分，而按来源拆分
         # 统计正要切这一刀。
+        # ⚠️ **实测在 Claude Code 2.1.220 上恒为 ""**：该键不在 UserPromptSubmit 的
+        # hook stdin payload 里（本机 1018 条记录无一非空）。字段保留作探针——harness
+        # 日后下发即自动有值。消费侧务必按「缺失/空串 = 人类输入」处理，不要写成
+        # 白名单枚举：`analyze_metrics._NON_HUMAN_SRC` 上方记着那次教训（白名单让
+        # 0.9.0 的精度标注通道从上线起 100% 空转，而守卫用例手工构造 src="typed"，
+        # 是一种生产中从未存在过的形态，因此永远发现不了）。
         "src": src,
         "gate": decision.gate_reason,
         "relaxed": bool(decision.relaxed),
@@ -242,13 +328,80 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
             {"path": ed.path, "topical": round(ed.topical, 3), "dedup": ed.dedup}
             for ed in near
         ],
+        # 只含「过不了精度闸门」（dedup == ""）**且** topical >= scorelow_floor 的条目，
+        # 即真正意义上的擦肩而过。三个消费者一律经 `scorelow_entries` 读这个键；
+        # `near_miss` 那份留给回溯与旧记录。
+        "near_miss_scorelow": [
+            {"path": ed.path, "topical": round(ed.topical, 3)}
+            for ed in near_scorelow
+        ],
+        # 生效阈值随记录落盘（与 near_miss_k/admitted_k 同族的自描述字段）。
+        # 它换不回没落盘的低分条目，但至少让「这批记录当时按什么阈值筛的」可查——
+        # 否则日后调 floor，新旧记录混在一起就再也分不清谁是按哪个口径写的。
+        "scorelow_floor": NUDGE_TOPICAL_FLOOR,
         "n_excluded": len(decision.excluded),
         "ft": {"path": decision.fulltext_path or "", "arm": decision.fulltext_arm},
         "near_miss_k": near_miss_k,
+        # 渲染层的 max_notes 也随记录落盘（同 near_miss_k/admitted_k 的自描述模式）。
+        # `analyze_metrics` 不读 config，此前把默认值 3 硬编码进报表文案与
+        # `sample_admitted` 的取数——用户一旦改这个配置项，报表就开始说假话，
+        # 而抽样池会抽到**从未渲染给用户**的条目（标注对象本该是「用户实际看到的」）。
+        "max_notes": max_notes,
     }
 
 
 NEAR_MISS_MAX_ENTRIES = 500     # 总条目上限，仅在超出时按 count 降序截断
+
+
+def scorelow_entries(rec: dict,
+                     floor: float = NUDGE_TOPICAL_FLOOR) -> list[tuple[str, float]]:
+    """从一条记录里取出「够格算真·擦肩」的 `(path, topical)` —— 三个消费者共用出口。
+
+    **返回 (path, topical) 而不是只返回 path，是这次修复的关键**：上一版只提供
+    `scorelow_paths`（`list[str]`），而 `summarize` 的榜单要计数、`sample_near_miss`
+    要 `topical_max`，两者都拿不到需要的形态，于是**各自内联读了裸键**并双双漏掉
+    下限过滤——「单点判据」四处写进文档却只有 1/3 的消费者在用。抽象没被采用时，
+    先怀疑它的形态是不是只贴合了第一个调用者。
+
+    **floor 现在是双重施加**（生成侧 `build_record` + 这里）：
+    - 生成侧那道是主判据，让磁盘上根本不存在低于 floor 的条目（见 NUDGE_TOPICAL_FLOOR）；
+    - 这里这道是二次判据，专为两种情形保留：① 判据下沉**之前**已落盘的记录仍含低分
+      条目；② 将来 floor 调整后，旧记录按旧阈值落盘。两者都会让磁盘数据与当前判据
+      不一致，而消费者不该去区分「这条记录是哪个版本写的」。
+      幂等的代价只是一次比较，换掉的是一整类版本分支。
+
+    **旧记录（无 `near_miss_scorelow` 键）返回空** —— 不是保守，是它们的 `near_miss`
+    样本在截断阶段就已被去重条目挤占（39% 的轮次一条 score-low 都没留下），对旧样本
+    做过滤得到的是有系统性偏斜的残差，宁可不计也不要把偏斜的数计进长期累计。
+
+    **`topical` 用 try/except 而非裸 `float()`**：磁盘 jsonl 可能被手工编辑或位翻转，
+    实测 `topical="high"` 抛 ValueError、`topical={}` 抛 TypeError。这条路径**今天
+    就可达**——`sample_near_miss` / `sample_admitted` 在 `--review` 里直接消费磁盘记录。
+    畸形值按「不达标」丢弃该条，不抛：`--report`/`--review` 是排障入口，最不该在数据
+    异常时整个罢工（实测未加此守卫时，一条坏记录令 stdout 完全为空）。
+    """
+    items = rec.get("near_miss_scorelow")
+    if not isinstance(items, list):
+        return []
+    out: list[tuple[str, float]] = []
+    for nm in items:
+        if not isinstance(nm, dict):
+            continue
+        p = nm.get("path")
+        if not (isinstance(p, str) and p):
+            continue
+        try:
+            t = float(nm.get("topical") or 0)
+        except (TypeError, ValueError):
+            continue                      # 手工改坏的值当不达标，不让 CLI 崩
+        if t >= floor:
+            out.append((p, t))
+    return out
+
+
+def scorelow_paths(rec: dict, floor: float = NUDGE_TOPICAL_FLOOR) -> list[str]:
+    """`scorelow_entries` 的 path 投影。`flush()` 的 nudge 计数只需要 path。"""
+    return [p for p, _ in scorelow_entries(rec, floor)]
 
 
 def _counts_path(home: Path) -> Path:
@@ -371,6 +524,45 @@ def _bump_locked(home: Path, paths: list[str]) -> None:
     _chmod(cp, 0o600)
 
 
+def reset_counts(home: Path) -> int:
+    """清空 near-miss 累计计数（含 nudge 冷却戳），返回被清掉的条目数。
+
+    **为什么需要一个专门的出口**：计数只增不减，且 `bump_near_miss_counts` 的
+    500 条容量在本机已经顶满。改判据只影响**此后**的累加，存量污染（实测 211 条
+    已达阈值、其中 78.2% 是被去重抑制的）不会自行消退 —— 不给重置手段的话，
+    用户看到的那条 nudge 提示在修复上线后一字不变。
+
+    **它是派生数据，不是用户数据**：`purge()` 的 docstring 自己把
+    `near_miss_counts.json` 与 `nudge_ts.json` 归为「派生 json」，与「删了不可
+    重新生成」的 `annotations.jsonl` 明确分开。故本函数刻意**不碰** annotations
+    与事件目录 —— 用户想全清有 `--purge`，这里只做可再生部分。
+
+    连带删 `nudge_ts.json`：计数归零后旧的冷却戳会把下一次提示推迟到一周后，
+    而此刻恰恰是最该让新口径提示尽早出现的时候。
+
+    **取锁再删**：`_bump_locked` 的 docstring 声明「该文件的一切读-改-写都必须持锁」，
+    而本函数直接 unlink 就绕过了那条不变量。竞态很具体——某个 hook 进程正处在
+    「已 read、未 write」的窗口内时，它随后的 `write_text` 会把重置前读到的计数原样
+    写回，用户看到「已清空（N 条）」却一条没少，且完全无声。窗口窄、本命令又是人工
+    交互触发，概率低；但代价是「这个函数存在的目的被反转」，而取锁的成本只有几行。
+    拿不到锁时**如实报错**而不是假装成功——本函数跑在 CLI 里（`main()` 捕获后返回 1），
+    不在 hook 路径上，fail-open 约束不适用。
+    """
+    n = len(load_near_miss_counts(home))
+    metrics_dir(home).mkdir(parents=True, exist_ok=True)   # 取锁要求目录存在
+    fd = _acquire_counts_lock(home)
+    if fd is None:
+        raise RuntimeError(
+            "near-miss 计数正被其他进程写入，未做任何清理；请稍后重试")
+    try:
+        _counts_path(home).unlink(missing_ok=True)
+        _nudge_ts_path(home).unlink(missing_ok=True)
+    finally:
+        os.close(fd)
+        _counts_lock_path(home).unlink(missing_ok=True)
+    return n
+
+
 def _prune_ts_path(home: Path) -> Path:
     return metrics_dir(home) / "prune_ts.json"
 
@@ -447,6 +639,45 @@ def stage(record: dict) -> None:
     _PENDING = record
 
 
+# `annotate` 允许写入的键。白名单而非任意 kwargs：`_PENDING` 持有的是隐私域记录
+# （含 kw_h / cwd_h），无约束的 `update()` 等于给它开了一个通用可写入口，未来任何
+# 调用点都能覆盖既有键或塞进内容字段，而 `build_record` docstring 里那套「不可协商」
+# 的隐私边界只约束 build_record 自己。一行校验把边界从"约定"变成"机制"。
+_ANNOTATE_ALLOWED = frozenset({"inj_chars"})
+
+
+def annotate(**fields: object) -> None:
+    """给已 stage 的记录补充渲染后才知道的字段。**零 IO**。
+
+    `_PENDING` 为 None 时**必须直接返回**，不得写成 `_PENDING = _PENDING or {}`
+    ——后者会在 metrics 关闭态凭空造出一条非空记录，随后被 `flush()`（只看
+    `_PENDING` 真值）落盘，正好从这个缝里破掉 opt-in 的零足迹边界。
+
+    不覆盖已存在的键：调用方补的是 build_record 之后才产生的信息，撞键即意味着
+    语义冲突，静默覆盖会让落盘值与 build_record 的契约不一致。
+    """
+    global _PENDING
+    if _PENDING is None:
+        return
+    for k, v in fields.items():
+        # 越界键与撞键都**出声**。白名单本身是对的，但静默丢弃与本模块「不静默」的
+        # 惯例相左（load_records/load_annotations/prune_expired 全都经 stderr 报出）。
+        # 具体风险：将来某处写成 `annotate(inj_char=...)`（少个 s），结果是该字段恒缺失、
+        # 报表恒显示「无数据」——**与「功能没上线」在现象上完全一样**，正是这批缺陷的
+        # 家族特征。
+        # ⚠️ 只打 stderr、**不抛异常**：`_finish_with_metrics` 是单 try 块，annotate
+        # 抛错会连带跳过同块内的 flush，整条记录丢失。
+        if k not in _ANNOTATE_ALLOWED:
+            print(f"[vault-loader] annotate 忽略未登记字段 {k!r}"
+                  f"（允许集 {sorted(_ANNOTATE_ALLOWED)}）", file=sys.stderr)
+            continue
+        if k in _PENDING:
+            print(f"[vault-loader] annotate 撞键 {k!r}，保留 build_record 的原值",
+                  file=sys.stderr)
+            continue
+        _PENDING[k] = v
+
+
 def flush(home: Path, retention_days: int | None = None) -> None:
     """把缓冲写盘。调用方必须用 try/except 兜住（见 prompt_submit_load）。
 
@@ -469,7 +700,13 @@ def flush(home: Path, retention_days: int | None = None) -> None:
         rec = _PENDING
         _PENDING = None
         write_record(home, str(rec.get("session") or ""), rec)
-        bump_near_miss_counts(home, [nm.get("path", "") for nm in rec.get("near_miss") or []])
+        # 只计「真·擦肩」：判据与报表榜单、--review 抽样池共用 scorelow_paths 单点。
+        # 改动前是无差别计入全部 near_miss，实测后果——达 nudge 阈值的 211 篇里
+        # 78.2% 其实已被注入过（43.6% 甚至被全文注入过），提示的语义整个是反的：
+        # 它想说「这篇一直召不回，去调 tags/keywords」，报出来的却是「这篇早就给过你了」。
+        # `scorelow_paths` 对缺少新键的极简 gate 记录返回 []，`bump_near_miss_counts`
+        # 的 `if not paths: return` 在 mkdir/取锁之前，故 gate 轮次连目录都不会碰。
+        bump_near_miss_counts(home, scorelow_paths(rec))
     if retention_days is not None:
         try:
             if _prune_due(home):
