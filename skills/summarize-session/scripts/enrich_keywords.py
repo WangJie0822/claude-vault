@@ -19,6 +19,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+_PLUGIN_ROOT = Path(__file__).resolve().parents[3]
+# 只有**确实像插件根**才插入 sys.path。legacy 独立布局
+# （`~/.claude/skills/<skill>/scripts/`）下 parents[3] 正是 `~/.claude` 本身——
+# 把一个多插件共享、可被任意工具写入的目录放到 sys.path[0]，等于让任何能在那里
+# 落一个 `context_vault/__init__.py` 的东西在每次 hook 进程内取得代码执行。
+# 判据不成立时跳过，交给下面的 ImportError façade 兜底。
+_LOOKS_LIKE_PLUGIN_ROOT = (_PLUGIN_ROOT / "context_vault" / "runtime.py").is_file()
+if _LOOKS_LIKE_PLUGIN_ROOT and str(_PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_ROOT))
+
+from context_vault.model import call_claude, call_codex, choose_backend
+
 # sanitize / frontmatter 写入的权威实现在 _keywords.py——归集（archive_doc）与
 # 流程补全（keywords_gap）共用同一口径。此处导入同时起 re-export 作用，保持
 # `enrich_keywords.sanitize_keywords` 这一既有引用面（含测试）不变。
@@ -33,23 +45,15 @@ def _call_claude(content: str) -> str | None:
         "为下面这篇笔记生成 3-8 个中文/英文检索扩展词（同义词、别名、跨语言术语），"
         "只输出 JSON：{\"keywords\": [...]}。笔记：\n"
     )
-    claude = shutil.which("claude")
-    if claude is None:
-        return None
-    env = dict(os.environ)
-    env["VAULT_LOADER_DISABLE"] = "1"
-    try:
-        r = subprocess.run(
-            [claude, "-p", "--model", "haiku"],
-            input=prompt + content,
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=_TIMEOUT, env=env, shell=False,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None
-    if r.returncode != 0:
-        return None
-    return r.stdout
+    return call_claude(prompt + content, timeout=_TIMEOUT, model="haiku")
+
+
+def _call_codex(content: str) -> str | None:
+    prompt = (
+        "为下面这篇笔记生成 3-8 个中文/英文检索扩展词（同义词、别名、跨语言术语），"
+        "只输出符合 schema 的 JSON。笔记：\n"
+    )
+    return call_codex(prompt + content, timeout=_TIMEOUT)
 
 
 def _extract_json(text) -> str | None:
@@ -103,12 +107,29 @@ def main(argv=None) -> int:
     ap.add_argument("--vault", required=True)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--backend", choices=("auto", "claude", "codex"), default="auto",
+                    help="模型后端；auto 跟随当前插件运行时，不跨提供商回退")
     args = ap.parse_args(argv)
 
     vault = Path(args.vault).expanduser().resolve()
     if not vault.is_dir():
         print(f"vault 不存在: {vault}", file=sys.stderr)
         return 1
+
+    # backend 在循环**外**解析一次。两个理由：
+    # 1. `choose_backend("auto")` 在两个 PLUGIN_ROOT 变量都不存在时抛 ValueError，而
+    #    本脚本按设计就是「付费、手动 opt-in、不接自动管线」的 CLI——正常从普通终端跑，
+    #    两个变量都不会有。放在循环里意味着用户看到的是一条裸 traceback（且已经先
+    #    `processed += 1` 了），而不是可操作的提示。`--dry-run` 提前 continue，
+    #    所以这个坑只在真跑时触发，更隐蔽。
+    # 2. 每篇重复调用没有意义。
+    backend = ""
+    if not args.dry_run:
+        try:
+            backend = choose_backend(args.backend)
+        except ValueError as exc:
+            print(f"错误：{exc}", file=sys.stderr)
+            return 2
 
     processed = 0   # 受 --limit 约束：dry-run=候选篇、real=已发起 claude 调用篇
     enriched = 0
@@ -131,9 +152,9 @@ def main(argv=None) -> int:
             processed += 1
             continue
         processed += 1
-        out = _call_claude(text)
+        out = _call_codex(text) if backend == "codex" else _call_claude(text)
         if out is None:
-            print(f"跳过（claude 失败/缺失）: {note.relative_to(vault)}", file=sys.stderr)
+            print(f"跳过（{backend} 失败/缺失）: {note.relative_to(vault)}", file=sys.stderr)
             continue
         if enrich_note(rp, out):
             enriched += 1

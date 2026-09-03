@@ -636,3 +636,40 @@ def test_global_cn_token_re_untouched_guard() -> None:
     from scripts._signal_collect import _CN_TOKEN_RE
 
     assert _CN_TOKEN_RE.pattern == r"[一-鿿]{3,}"
+
+
+def test_signal_i_reads_agents_md_for_codex(tmp_path):
+    """项目指令文件也可能是 AGENTS.md（Codex 的约定）。
+
+    只读 CLAUDE.md 时，README 承诺的四个逃生阀里「项目注释 disable」那一个在
+    Codex 上永远不生效，信号 I 的 tags/extra_paths 同样恒空——且毫无提示，
+    用户只会以为自己写错了注释语法。
+    """
+    from scripts._signal_collect import collect_signal_i_project_claude_md
+
+    (tmp_path / "AGENTS.md").write_text(
+        "# AGENTS\n<!-- vault-loader: disable -->\n", encoding="utf-8")
+    assert collect_signal_i_project_claude_md(tmp_path).disabled is True
+
+
+def test_signal_i_merges_both_instruction_files(tmp_path):
+    """两个文件同时存在时取并集——本仓库自己就是这个形态。"""
+    from scripts._signal_collect import collect_signal_i_project_claude_md
+
+    (tmp_path / "CLAUDE.md").write_text(
+        "<!-- vault-loader: tags=[a, b] -->\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text(
+        "<!-- vault-loader: tags=[c] -->\n", encoding="utf-8")
+    result = collect_signal_i_project_claude_md(tmp_path)
+    assert result.tags == {"a", "b", "c"}
+    assert result.disabled is False
+
+
+def test_signal_i_disable_in_either_file_wins(tmp_path):
+    """停用意图写在任一文件里都应生效。"""
+    from scripts._signal_collect import collect_signal_i_project_claude_md
+
+    (tmp_path / "CLAUDE.md").write_text("# nothing special\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text(
+        "<!-- vault-loader: disable -->\n", encoding="utf-8")
+    assert collect_signal_i_project_claude_md(tmp_path).disabled is True

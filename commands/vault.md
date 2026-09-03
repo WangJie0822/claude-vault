@@ -1,4 +1,4 @@
-读取知识库索引（路径由 ~/.claude/skills/summarize-session/config.json 的 default_vault_path 决定，默认 ~/.claude/knowledge-vault），然后根据用户的问题或当前上下文，按需加载最相关的笔记文件。
+这是兼容旧 Claude slash command 的薄入口。实际规则以 `skills/vault/SKILL.md` 为准：路径优先读取 `~/.context-vault/config.json::vault_path`，旧 `~/.claude` 配置仅作兼容回退。Codex 直接调用 `vault` skill。
 
 规则：
 1. 先读取 <vault>/CLAUDE.md 了解所有笔记的结构（<vault> 为配置的知识库路径）

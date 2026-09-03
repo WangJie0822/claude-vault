@@ -76,7 +76,7 @@ summary: "一行摘要"
 **自动诊断与修复**：
 
 ```bash
-SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
 # 仅诊断
 python3 "$SS/rebuild_index.py" \
   --vault $VAULT --health-check-only

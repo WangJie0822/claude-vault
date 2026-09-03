@@ -7,6 +7,11 @@
 会被误读成它要检测的失效。按 session 分文件后实测 160/160 零丢失。
 
 本模块所有函数必须可被调用方用 try/except 完整兜住；模块顶层零 IO。
+
+模块顶层从 `context_vault` 导入 `lease_lock` / 路径工具，但**配了 ImportError
+façade**（与 `_state.py` / `_config_loader.py` 同款），所以 legacy 独立布局或
+3.10 及以下解释器上不会整体 import 失败。此处曾写「刻意不依赖任何内部模块」，
+在双运行时改造引入这两个导入后已不成立——注释与实现不符比没有注释更误导。
 """
 from __future__ import annotations
 
@@ -22,9 +27,47 @@ from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+_PLUGIN_ROOT = Path(__file__).resolve().parents[3]
+# 只有**确实像插件根**才插入 sys.path。legacy 独立布局
+# （`~/.claude/skills/<skill>/scripts/`）下 parents[3] 正是 `~/.claude` 本身——
+# 把一个多插件共享、可被任意工具写入的目录放到 sys.path[0]，等于让任何能在那里
+# 落一个 `context_vault/__init__.py` 的东西在每次 hook 进程内取得代码执行。
+# 判据不成立时跳过，交给下面的 ImportError façade 兜底。
+_LOOKS_LIKE_PLUGIN_ROOT = (_PLUGIN_ROOT / "context_vault" / "runtime.py").is_file()
+if _LOOKS_LIKE_PLUGIN_ROOT and str(_PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_ROOT))
+
+try:
+    from context_vault.atomic import lease_lock
+    from context_vault.paths import canonical_config, context_home, use_canonical_namespace
+except ImportError:  # compatibility façade for isolated legacy script copies
+    # 与 `_state.py` / `_config_loader.py` 同款兜底。缺了它，legacy 独立布局或
+    # 3.10 及以下解释器（`context_vault.coexist` 用了 3.11 的 tomllib）会让本模块
+    # 整体 import 失败，于是每次 UserPromptSubmit 都多打一行 stderr——而 metrics
+    # 默认是关的，用户为一个自己没开的功能持续付噪声。
+    from contextlib import contextmanager
+
+    def context_home(home: Path | None = None) -> Path:
+        return (home or Path.home()) / ".context-vault"
+
+    def canonical_config(home: Path | None = None) -> Path:
+        return context_home(home) / "config.json"
+
+    def use_canonical_namespace(home: Path | None = None) -> bool:
+        # façade 降级：拿不到 context_vault 时保守走 legacy 布局，
+        # 绝不把既有用户的数据切到一个空命名空间。
+        return False
+
+    @contextmanager
+    def lease_lock(target: Path, *, timeout: float = 2.0, stale_after: float = 30.0):
+        # 降级为无锁：本 façade 只在拿不到 context_vault 时生效，此时同进程内的
+        # 顺序写仍然正确，跨进程并发写退化为「后写者胜」。metrics 是 opt-in 的
+        # 观测数据，丢一条记录远好过让整条召回链路多一行报错。
+        yield
+
 if TYPE_CHECKING:                      # 仅供类型标注，运行期不导入（L-PY1）
-    # 本模块被每次 UserPromptSubmit 无条件 import，且刻意不依赖任何内部模块
-    # （import 失败要能被 fail-open 隔离掉）。放 TYPE_CHECKING 里既补上标注，
+    # 本模块被每次 UserPromptSubmit 无条件 import。对 `context_vault` 的依赖走上面
+    # 的 façade 兜底，故 import 失败不会波及调用方。放 TYPE_CHECKING 里既补上标注，
     # 又不引入运行期依赖——`from __future__ import annotations` 已让注解全部惰性求值。
     from collections.abc import Collection
 
@@ -36,6 +79,9 @@ if TYPE_CHECKING:                      # 仅供类型标注，运行期不导入
 # 记录」的 stderr 提示：它现在用严格相等过滤（analyze_metrics.py:68）、且 skipped
 # 计数器只统计 JSON 解析失败，bump 会让既有记录**静默消失**（实测本机已积累 259 条）。
 SCHEMA = 1
+RUNTIME_SCHEMA = 2
+_RUNTIME = "legacy"
+_EVENT_ID = ""
 _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 _MONTH_RE = re.compile(r"\d{4}-\d{2}")
 
@@ -65,7 +111,43 @@ _MONTH_RE = re.compile(r"\d{4}-\d{2}")
 NUDGE_TOPICAL_FLOOR = 3.0
 
 
+def configure_context(runtime: str, event_id: str = "") -> None:
+    """选择本次 hook 进程的 metrics 命名空间。
+
+    ⚠️ **`"legacy"` 必须被显式接受**：`analyze_metrics.py` 在 canonical config 不存在
+    时（即升级当天的全部存量用户）默认传的就是这个字符串。此前它落进 else 分支、
+    又不在白名单里，于是被映射成 `"unknown"` 并指向 `~/.context-vault/metrics/unknown`
+    ——一个空目录。后果是 `--report` 报「无数据」、`--review` 抽不到条目、`--purge`
+    打印「已清空 0 个数据文件」而真实数据原样留在盘上，三者都与「本来就没有数据」
+    完全不可区分。
+
+    未知取值一律回落 `"legacy"` 而不是 `"unknown"`：后者会凭空造出一个谁也不会去看
+    的孤儿命名空间，把数据写进去等于丢掉。
+    """
+    global _RUNTIME, _EVENT_ID
+    # Existing Claude users stay on the 0.9.x metrics layout until they create
+    # or migrate canonical config. Codex always needs an explicit namespace.
+    if runtime in {"legacy", "unknown"} or (
+            runtime == "claude" and not use_canonical_namespace()):
+        _RUNTIME = "legacy"
+    else:
+        _RUNTIME = runtime if runtime in {"claude", "codex"} else "legacy"
+    _EVENT_ID = event_id
+
+
+def current_schema() -> int:
+    return RUNTIME_SCHEMA if _RUNTIME != "legacy" else SCHEMA
+
+
+def runtime_record_fields() -> dict:
+    if _RUNTIME == "legacy":
+        return {}
+    return {"runtime": _RUNTIME, "event_id": _EVENT_ID}
+
+
 def metrics_dir(home: Path) -> Path:
+    if _RUNTIME != "legacy":
+        return context_home(home) / "metrics" / _RUNTIME
     return home / ".claude" / "vault-loader-metrics"
 
 
@@ -200,11 +282,65 @@ def write_record(home: Path, session_id: str, record: dict) -> Path:
     return p
 
 
+def _dedup_counts(excluded) -> dict:
+    """全部 excluded 条目按 dedup 成因计数。
+
+    **必须遍历全量，不能复用 `near_miss`**：后者是按 topical 降序取 top-k 的截断
+    样本（实测采样率 1.38%、100% 的轮次都在截断），而两类条目的 topical 有结构性
+    差异——dedup 条目不看 topical 就被排除（可达 11），新篇被排除的条件恰恰是
+    `t < min_topical`（必 < 4）。于是按 topical 降序时 dedup 天然占满窗口，窗口内
+    占比（实测 45%）与真实占比（量级约 1%）相差一个数量级以上。
+
+    成本：一次 O(len(excluded)) 的计数，不调 score()/_hit_keywords()，
+    与 `n_excluded` 已有的 len() 同量级，不触碰 UPS 的耗时预算。
+    """
+    counts: dict[str, int] = {}
+    for ed in excluded:
+        k = getattr(ed, "dedup", "") or ""
+        counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def build_session_start_record(*, session_id: str, inj_chars: int,
+                               n_notes: int, n_worklogs: int,
+                               n_commits: int) -> dict:
+    """SessionStart 通道的极简记录。纯计算、无 IO。
+
+    **只记规模与开销，不记笔记路径**：这条通道要回答的是「它花了多少、值不值」，
+    答那个不需要知道注入了哪几篇；不落路径则隐私增量为 0。
+
+    `channel` 是读端的隔离判据。缺该键的旧记录一律按 UPS 处理（向后兼容）。
+    隔离是硬要求：SS 记录的 `gate` 为空，一旦被当成 UPS 记录，会被计入 `n_ok`，
+    同时稀释「走到打分」占比、全文注入率与候选池均值 —— 修一个缺口却弄坏三个
+    已有指标。
+
+    为什么这条通道值得落盘：此前 `session_start_load.py` 对 `_metrics` 的引用数是
+    **0**，报表只有一句免责「不含 SessionStart 通道，它不落 metrics」，而免责不是
+    数据。从 transcript 侧直接量，557 个会话检出 SessionStart 注入、合计 642,439
+    字符（中位 724、p90 2091）—— 这笔开销在「值不值」的账上整个缺席。
+    """
+    rec = {
+        "_schema": current_schema(),
+        "ts": round(time.time(), 3),
+        "session": session_id or "",
+        "channel": "session_start",
+        "inj_chars": int(inj_chars),
+        "n_notes": int(n_notes),
+        "n_worklogs": int(n_worklogs),
+        "n_commits": int(n_commits),
+    }
+    if _RUNTIME != "legacy":
+        rec["runtime"] = _RUNTIME
+    return rec
+
+
 def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None",
                  cwd: Path, *, session_id: str, prompt_id: str, salt: bytes,
                  src: str, prompt: str = "",
                  near_miss_k: int = 10, admitted_k: int = 20,
-                 max_notes: int = 3) -> dict:
+                 max_notes: int = 3,
+                 min_topical: float | None = None,
+                 ft_topical: float | None = None) -> dict:
     """把一次 UPS 决策压成一条可落盘记录。纯计算、无 IO。
 
     隐私边界（不可协商，见 task-6-brief.md）：
@@ -272,8 +408,8 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
     # 显式按 total 降序排序再截断——不依赖 decision.admitted 已被上游 (-total, -mtime)
     # 预排序这一未在本函数签名/契约中声明的隐式前提，函数自身对排序负责。
     admitted_top = sorted(admitted_all, key=lambda ed: -ed.total)[:admitted_k]
-    return {
-        "_schema": SCHEMA,
+    record = {
+        "_schema": current_schema(),
         "ts": round(time.time(), 3),
         "session": session_id or "",
         "prompt_id": prompt_id or "",
@@ -340,6 +476,7 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
         # 否则日后调 floor，新旧记录混在一起就再也分不清谁是按哪个口径写的。
         "scorelow_floor": NUDGE_TOPICAL_FLOOR,
         "n_excluded": len(decision.excluded),
+        "dedup_counts": _dedup_counts(decision.excluded),
         "ft": {"path": decision.fulltext_path or "", "arm": decision.fulltext_arm},
         "near_miss_k": near_miss_k,
         # 渲染层的 max_notes 也随记录落盘（同 near_miss_k/admitted_k 的自描述模式）。
@@ -348,6 +485,19 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
         # 而抽样池会抽到**从未渲染给用户**的条目（标注对象本该是「用户实际看到的」）。
         "max_notes": max_notes,
     }
+    # 两个最承重的判据阈值。`analyze_metrics` 不读 config，而
+    # `fulltext_topical_threshold` 在样本期内已经由 6 改成 10（实测两期全文注入率
+    # 65.4% vs 40.1%），报表却只能给出不描述任何一个时期的合并值。补 `max_notes`
+    # 时写下的理由（「用户一改配置报表就开始说假话」）逐字适用于这两个字段。
+    # 不传时不落键：让读端能用 `in` 判存在，而不是把「没记录」误读成某个具体值。
+    if min_topical is not None:
+        record["min_topical"] = min_topical
+    if ft_topical is not None:
+        record["ft_topical"] = ft_topical
+    if _RUNTIME != "legacy":
+        record["runtime"] = _RUNTIME
+        record["event_id"] = _EVENT_ID or prompt_id or ""
+    return record
 
 
 NEAR_MISS_MAX_ENTRIES = 500     # 总条目上限，仅在超出时按 count 降序截断
@@ -643,7 +793,15 @@ def stage(record: dict) -> None:
 # （含 kw_h / cwd_h），无约束的 `update()` 等于给它开了一个通用可写入口，未来任何
 # 调用点都能覆盖既有键或塞进内容字段，而 `build_record` docstring 里那套「不可协商」
 # 的隐私边界只约束 build_record 自己。一行校验把边界从"约定"变成"机制"。
-_ANNOTATE_ALLOWED = frozenset({"inj_chars"})
+# `shown` 是渲染层算出的**权威**列表（用户实际看到的那几篇，有序）。
+# 读端此前只能从落盘的 `admitted` 数组按 `limit = max_notes - (1 if ft else 0)`
+# 重建，而那条重建路径是脆的：实测 18822 条 admitted 的 `total - topical` 只有
+# 两个取值（0.5 / 1.0），于是 **97.7% 的轮次前 5 条 total 存在并列**，并列时的
+# 实际次序由 `-mtime` 决定，而 mtime 根本不落盘。今天重建仍然对，只是因为
+# `build_record` 用了稳定排序且上游预排过 —— 而 `build_record` 的注释恰恰声明
+# 「不依赖上游已按 (-total, -mtime) 预排序这一隐式前提」。任何人照那句注释去改
+# 排序键，全部历史与未来记录的「用户看到了什么」都会静默错位，且没有任何用例会红。
+_ANNOTATE_ALLOWED = frozenset({"inj_chars", "shown"})
 
 
 def annotate(**fields: object) -> None:
@@ -765,14 +923,22 @@ def purge(home: Path) -> int:
     if not root.exists():
         return 0
     n = 0
-    for d in list(root.iterdir()):
-        if d.is_dir():
-            n += len(list(d.glob("*.jsonl")))
-            shutil.rmtree(d, ignore_errors=True)
-        elif d.name != ".salt":
-            if d.suffix == ".jsonl":
-                n += 1          # annotations.jsonl：必须计数，不能静默消失
-            d.unlink(missing_ok=True)
+    lock_target = root.parent / f".{root.name}-purge"
+    with lease_lock(lock_target):
+        for d in list(root.iterdir()):
+            if d.is_dir():
+                count = len(list(d.glob("*.jsonl")))
+                shutil.rmtree(d)
+                if d.exists():
+                    raise OSError(f"metrics directory still exists after purge: {d}")
+                n += count
+            elif d.name != ".salt":
+                is_event = d.suffix == ".jsonl"
+                d.unlink()
+                if d.exists():
+                    raise OSError(f"metrics file still exists after purge: {d}")
+                if is_event:
+                    n += 1      # annotations.jsonl：必须计数，不能静默消失
     return n
 
 

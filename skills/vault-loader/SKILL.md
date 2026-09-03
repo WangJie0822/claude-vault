@@ -1,13 +1,13 @@
 ---
 name: vault-loader
-description: 自动从知识库按相关性注入 summary 清单到会话上下文（零配置，安装即生效）。SessionStart 注入项目相关笔记 + 近期工作日志；UserPromptSubmit 按用户问题动态深入。禁用逃生阀：VAULT_LOADER_DISABLE=1（单次进程）/ ~/.claude/.vault-loader-disabled 文件（持续）/ config enabled:false（永久）。
+description: 自动从知识库按相关性注入 summary 清单到 Claude Code 或 Codex 会话上下文（零配置，安装即生效）。SessionStart 注入项目相关笔记 + 近期工作日志；UserPromptSubmit 按用户问题动态深入。禁用逃生阀：VAULT_LOADER_DISABLE=1、~/.context-vault/.disabled 或 config enabled:false。
 argument-hint: "[--doctor]"
 allowed-tools: Read, Bash(python3 *)
 ---
 
 # vault-loader：自动加载知识库
 
-vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入到 Claude Code 会话上下文，让 Claude 启动时即可看到项目历史决策、近期工作进展。
+vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Claude Code 或 Codex 会话上下文，让当前编码智能体启动时即可看到项目历史决策、近期工作进展。
 
 ## 触发机制
 
@@ -56,11 +56,11 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入到
 
 ## 安装（零配置）
 
-作为 `claude-vault` 插件安装即生效：插件自带的 `hooks/hooks.json` 由 Claude Code 自动加载并注册 SessionStart / UserPromptSubmit hook，**无需手动编辑 `~/.claude/settings.json`**。hook 经插件的 polyglot wrapper 运行，脚本路径相对 `${CLAUDE_PLUGIN_ROOT}`（插件 cache 安装目录）解析。
+作为 `context-vault` 插件安装即生效：Claude Code 与 Codex 都从插件自带的 `hooks/hooks.json` 注册 SessionStart / UserPromptSubmit。hook 经同一个 polyglot wrapper 运行，root 优先取 `PLUGIN_ROOT`，其次兼容 `CLAUDE_PLUGIN_ROOT`，最后按 wrapper 自身位置解析。
 
-vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取 `vault_path`；未配置时默认 `~/.claude/knowledge-vault`，可设为任意 Obsidian Vault 路径。
+新装从 `~/.context-vault/config.json` 读取共享 `vault_path`，默认 `~/.context-vault/knowledge-vault`；公共配置不存在时继续兼容旧 `~/.claude/skills/vault-loader/config.json`，不会自动删除或覆盖旧数据。
 
-> ⚠️ **改 Vault 路径必须改两处**。`/summarize-session --set-default <路径>` 只写 summarize-session 的 `default_vault_path`（写端），**不会**让 vault-loader 跟着走——实测只设写端时，读端仍解析到 `~/.claude/knowledge-vault`，于是自动注入在一个空目录上工作、静默无输出。读端要另行在 `~/.claude/skills/vault-loader/config.json` 设 `vault_path` 为同一路径。两值不一致时，SessionStart 会经诊断通道给出可见提示。
+> `vault_path` 只维护一处：`~/.context-vault/config.json`。两份 0.9.x legacy 配置仅在 canonical 不存在时只读兼容；若两值冲突，doctor/迁移会停止，不猜测正确路径。
 
 1. 确认 `<vault>/.meta/frontmatter-cache.json` 存在（由 `/summarize-session` 首次运行后自动生成）。
 2. 首次启动新会话即生效。
@@ -69,7 +69,7 @@ vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取
 
 ## 配置
 
-配置文件：`~/.claude/skills/vault-loader/config.json`。
+配置文件：`~/.context-vault/config.json`。
 
 **文件缺失时写入的是最小占位**（`_config_version` + 一行说明），**不是**全量默认值——你没有显式写进去的键永远走代码里的当前默认，因此默认值随版本演进对你即时生效。只需要写你要改的键，其余留空即可。
 
@@ -81,7 +81,8 @@ vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取
 |---|---|---|
 | `enabled` | `true` | 总开关；false 永久关停 |
 | `dry_run` | `false` | true 时**不真实注入**（`hookSpecificOutput` 字段缺失，不喂模型），仅输出标 `[DRY-RUN]` 的 `systemMessage`，用于灰度验证会注入什么 |
-| `vault_path` | `~/.claude/knowledge-vault` | Vault 路径 |
+| `vault_path` | `~/.context-vault/knowledge-vault` | Vault 路径 |
+| `runtimes.claude.enabled` / `runtimes.codex.enabled` | `true` | 分宿主启停；不影响另一端 |
 | `keyword_to_tags` | `{}` | cwd 关键词 → tag 映射 |
 | `opt_out_paths` | `["/tmp", "/private/tmp", <本机临时目录>]` | 路径前缀黑名单，命中即跳过 |
 | `verbose_on_skip` | `false` | 跳过时输出短提示 |
@@ -115,7 +116,7 @@ vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取
 | `user_prompt_submit.max_notes` | `3` | 清单注入的笔记条数上限 |
 | `user_prompt_submit.fulltext_max_bytes` | `8192` | 全文注入的字节上限，超出截断 |
 | `user_prompt_submit.min_keyword_count` | `2` | prompt 关键词数下限，不足即静默早退（纯 CJK 单词可被 `relax_pure_cjk_single` 放宽） |
-| `user_prompt_submit.state_ttl_hours` | `24` | 去重状态与兜底提示冷却的有效期（小时） |
+| `user_prompt_submit.state_ttl_hours` | `24` | 去重状态、兜底提示冷却的有效期（小时）。**同一个值也约束 `relevance.session_topic` 主题词**：既是已提炼主题词的有效期，也是"本会话是否已尝试过提炼（含失败）"负缓存的有效期——过期后才会重新拉起提炼子进程（F6，整分支终审 2026-09-02） |
 
 > ⚠️ `user_prompt_submit.min_score` 与 `user_prompt_submit.fulltext_threshold` **均已废弃、运行时不读**，改它们不产生任何效果。实际生效的是 `relevance.min_topical_score`（注入闸门）与 `relevance.fulltext_topical_threshold`（全文升级）。两键仍保留在默认表中仅为兼容旧 config。
 
@@ -133,6 +134,7 @@ vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取
 | `scoring.prompt_tag_hit` | `4` | prompt 关键词命中笔记 tag。多 tag 命中取**最大** IDF 因子而非累加（防堆砌 tag 刷分） |
 | `scoring.prompt_summary_hit` | `2` | prompt 关键词命中笔记 summary |
 | `scoring.prompt_keyword_hit` | `5` | prompt 关键词命中笔记 frontmatter 的 `keywords`。刻意 > `prompt_tag_hit`(4)，使策展的精确 keywords 能胜过泛 tag |
+| `scoring.session_topic_hit` | `2` | 会话主题词命中一篇笔记的加分（tag/summary/keywords 三面任一，不含 path，多命中取一次不累加）。刻意 < `relevance.min_topical_score`(4)，使主题词零 prompt 关键词命中时无法单独越过精度闸门。**但可以**叠加 prompt 关键词已算出的 topical 分把笔记推过 `relevance.fulltext_topical_threshold`（触发数千字全文注入）——这是已知且被测试锁定的行为，非 bug，见 `tests/test_session_topic_scoring.py::test_topic_word_alone_can_cross_fulltext_threshold` |
 
 > `commit_keyword_hit` / `commit_keyword_cap` 对应的 commit 关键词信号**当前无生产调用方**（两个 hook 都不传 `commit_keywords`），调这两个键暂不影响实际打分；SessionStart 展示近期提交走的是另一条路径。
 
@@ -153,9 +155,13 @@ vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取
 | `relevance.max_prompt_keywords` | `30` | prompt 关键词数软上限。巨型 prompt（大段粘贴）会让 O(N×M×K) 打分破预算；超限取确定性子集。`0` / `null` 表示不限 |
 | `relevance.split_cjk_bigram` | `true` | CJK 按 bigram 分词。false 回到旧 mega-token 行为（中文短词几乎召不回） |
 | `relevance.relax_pure_cjk_single` | `true` | 纯 CJK 单 token 放宽 `min_keyword_count` 闸门（配合 relaxed 静默） |
+| `relevance.deictic_gate` | `true` | 纯指代/应答型 prompt（「继续执行」「ok」「好的」）直接不注入。**整串匹配**，「继续执行 F1，另外…」不受影响 |
+| `relevance.deictic_words` | `null` | `null` 用内置词表；给列表则**完全替换**它（不是追加），用于关掉误伤词或换语言 |
 | `relevance.exclude_note_tags` | `["archived"]` | 召回池排除这些 tag 的笔记（SessionStart 与 UserPromptSubmit 共用；`[]` 关闭；`/vault` 手动检索不受影响） |
 | `relevance.use_tag_idf` | `true` | tag 命中按 IDF 加权（泛 tag 降权、singleton tag 满分）；false 为止血开关，数值等价回到旧等权行为 |
 | `relevance.tag_idf_floor` | `0.5` | 泛 tag 的保底加权因子，值域下界。设 `0` 会让泛 tag 归零、行为剧变；调高（如 `0.7`）减弱降权强度 |
+| `relevance.session_topic` | `false` | 会话首轮异步提炼 3-8 个主题词，后续轮次用作辅助召回信号（让「继续执行」这类短 prompt 也能召回会话相关笔记）。**默认关**：开启后会拉起一个 `claude -p` 子进程（模型固定 `haiku`），**把你本轮 prompt 原文与 `session_topic_top_n` 篇候选笔记的路径+摘要一并发给它**用于提炼关键词。prompt 原文与候选内容经 stdin 传给子进程（不落 argv/进程表），提炼产物（主题词本身）落盘在本机 state 文件，不上传、不进 metrics |
+| `relevance.session_topic_top_n` | `10` | 首轮送进提炼子进程的候选笔记篇数（路径+摘要，`Entry` 无 `title` 字段）。注入给你的仍是 top-3，这个数只影响提炼的输入 |
 
 > ⚠️ **阈值与权重耦合**：`relevance` 的三个阈值（`min_topical_score` / `fulltext_topical_threshold` / `confidence_bands.high`）是按当前 `scoring` 权重标定的——默认权重（tag 4 / summary 2 / keywords 5、floor 0.5）下话题分上界为 11。**改 `scoring` 权重后必须同步复核这三个阈值**，否则闸门会整体偏松或偏紧（例如把 `prompt_tag_hit` 提到 8，单个泛 tag 命中就能越过全文阈值）。
 
@@ -170,7 +176,7 @@ vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取
 | `metrics.nudge_threshold` | `10` | 某篇笔记累计 near-miss 次数达到此阈值才提示（77 轮真实 prompt 实测标定，判据偏向沉默，勿放宽） |
 | `metrics.nudge_ttl_hours` | `168` | near-miss 提示的**全局**冷却窗口（小时），窗口内所有笔记合计最多提示一次 |
 
-数据落 `~/.claude/vault-loader-metrics/`；跑 `--purge` **无二次确认**，单条命令立即不可逆清空——**含 `--review` 产生的人工标注**。
+1.0 数据分别落 `~/.context-vault/metrics/claude/` 与 `~/.context-vault/metrics/codex/`；0.9.x legacy 才使用 `~/.claude/vault-loader-metrics/`。`--runtime all --purge` 会不可逆清空两端 canonical 数据（含人工标注）。
 
 想只清 near-miss 计数（比如从 0.9.0 升上来、存量计数按旧判据累加过）用 `--reset-counts`：它只删两份可再生的派生数据（`near_miss_counts.json` / `nudge_ts.json`），事件记录与人工标注一律不碰。**别为这个目的去跑 `--purge`**——那会把不可再生的标注一起删掉。
 
@@ -183,7 +189,7 @@ vault-loader 从**自己的** `~/.claude/skills/vault-loader/config.json` 读取
 插件自带收敛脚本清理这类残留。**先 dry-run 预览**（只读，不改任何文件）：
 
 ```bash
-VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$VL/migrate_config.py"
 ```
 
@@ -210,7 +216,7 @@ python3 "$VL/migrate_config.py"
 **先跑健康自检**（只读，不改动任何文件）——它一次性回答下面大部分问题：
 
 ```bash
-VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$VL/migrate_config.py" --doctor
 ```
 
@@ -234,7 +240,7 @@ vault 路径是否一致、各开关值。刻意不打印 `keyword_to_tags` / `o
 测试随插件一起分发，跑在插件的 cache 安装目录下（`~/.claude/skills/vault-loader/` 现在只剩运行时的 `config.json`，**没有**测试，在那里跑必然收集不到用例）：
 
 ```bash
-VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader 2>/dev/null | sort -V | tail -1)
+VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader 2>/dev/null | sort -V | tail -1)
 cd "$VL" && python3 -m pytest -q
 ```
 

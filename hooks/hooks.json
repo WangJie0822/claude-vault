@@ -1,11 +1,11 @@
 {
-  "description": "claude-vault: auto-inject vault notes into session context",
+  "description": "context-vault: auto-inject local knowledge into session context",
   "hooks": {
     "SessionStart": [
-      { "matcher": "startup|clear|compact", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/session_start_load.py" }] }
+      { "matcher": "startup|clear|compact", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/session_start_load.py", "additionalContextLimit": 12000 }] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/prompt_submit_load.py" }] }
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/prompt_submit_load.py", "additionalContextLimit": 12000 }] }
     ]
   }
 }

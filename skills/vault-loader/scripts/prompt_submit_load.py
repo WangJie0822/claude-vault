@@ -13,6 +13,15 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+_PLUGIN_ROOT = Path(__file__).resolve().parents[3]
+# 只有**确实像插件根**才插入 sys.path。legacy 独立布局
+# （`~/.claude/skills/<skill>/scripts/`）下 parents[3] 正是 `~/.claude` 本身——
+# 把一个多插件共享、可被任意工具写入的目录放到 sys.path[0]，等于让任何能在那里
+# 落一个 `context_vault/__init__.py` 的东西在每次 hook 进程内取得代码执行。
+# 判据不成立时跳过，交给下面的 ImportError façade 兜底。
+_LOOKS_LIKE_PLUGIN_ROOT = (_PLUGIN_ROOT / "context_vault" / "runtime.py").is_file()
+if _LOOKS_LIKE_PLUGIN_ROOT and str(_PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_ROOT))
 
 # fail-open 硬约束的一个既有缺口（F6）：顶层 import 在下方 `if __name__ == "__main__"`
 # 的 try/except 之外执行，任何导入期异常都会直接 exit 1 + traceback，兜底完全覆盖不到
@@ -42,6 +51,10 @@ try:
     )
     from scripts._decision import (
         decide_injection, StateView, _hit_keywords, gate_keywords, select_fulltext,
+        is_deictic_only,
+    )
+    from scripts._topic import (
+        load_session_topic, spawn_topic_extraction, has_recent_topic_attempt,
     )
 except Exception as _import_exc:  # noqa: BLE001 — fail-open 优先于一切
     if __name__ != "__main__":
@@ -106,6 +119,21 @@ except Exception as _metrics_exc:  # noqa: BLE001
         SCHEMA = 1
 
         @staticmethod
+        def current_schema() -> int:
+            return 1
+
+        @staticmethod
+        def configure_context(*_a, **_k) -> None:
+            return None
+
+        # 与 current_schema/configure_context 同批新增，此前漏补第三个：
+        # _stage_gate_record 用 `**_metrics.runtime_record_fields()` 展开它。
+        # 返回空 dict 而非 None——调用点是字典展开，None 会直接抛 TypeError。
+        @staticmethod
+        def runtime_record_fields() -> dict:
+            return {}
+
+        @staticmethod
         def stage(record: dict) -> None:
             return None
 
@@ -151,7 +179,8 @@ MAX_TITLE_CHARS = 120
 def _is_runtime_disabled(home: Path) -> bool:
     if os.environ.get("VAULT_LOADER_DISABLE") == "1":
         return True
-    if (home / ".claude" / ".vault-loader-disabled").exists():
+    if ((home / ".context-vault" / ".disabled").exists()
+            or (home / ".claude" / ".vault-loader-disabled").exists()):
         return True
     return False
 
@@ -498,11 +527,12 @@ def _stage_gate_record(config: dict, hook_input: dict, gate: str) -> None:
         return
     try:
         _metrics.stage({
-            "_schema": _metrics.SCHEMA,
+            "_schema": _metrics.current_schema(),
             "ts": round(time.time(), 3),
             "session": hook_input.get("session_id", "") or "",
             "prompt_id": hook_input.get("prompt_id", "") or "",
             "gate": gate,
+            **_metrics.runtime_record_fields(),
         })
     except Exception as exc:  # noqa: BLE001
         print(f"[vault-loader] gate 记录构造失败：{exc}", file=sys.stderr)
@@ -553,12 +583,54 @@ def main() -> int:
 
     cwd = Path(hook_input.get("cwd", os.getcwd()))
     prompt = hook_input.get("prompt", "")
+    should_claim = False
+    legacy_enabled = False
+    coexist_note = ""
+
+    try:
+        from context_vault.coexist import check_legacy_plugin
+        from context_vault.events import claim_event
+        from context_vault.runtime import HookContext
+        hook_context = HookContext.from_payload(hook_input)
+        legacy_enabled, coexist_note = check_legacy_plugin(
+            hook_context.runtime.value, home=home, cwd=hook_context.cwd
+        )
+        should_claim = hook_context.runtime.value in {"claude", "codex"}
+    except Exception as exc:
+        hook_context = None
+        print(f"[vault-loader] runtime 识别失败，使用 legacy state：{exc}", file=sys.stderr)
 
     if _is_runtime_disabled(home):
         return 0
 
+    # 程序化调用（`claude -p` 及其派生）不注入：它带着完整任务 prompt 而来，
+    # 本机历史笔记不构成它的上下文。实测这类轮次占 35.3%，却吃掉约一半的注入
+    # 预算（每轮中位 4238 字符 vs 人类会话 971）。
+    #
+    # 位置必须在 load_config_ex 之前、metrics 之前：放晚了这些轮次照样落盘，
+    # 报表口径依旧被污染。判据与「读不出来一律按人类处理」的方向见 _entrypoint。
+    # 延迟 import + 吞异常：本闸门是可选优化，绝不能成为新的失败源（hook 必须
+    # fail-open）。
+    try:
+        from scripts._entrypoint import is_supported_session
+        if not is_supported_session():
+            return 0
+    except Exception:
+        pass
+
     config, cfg_fallback, cfg_detail = load_config_ex()
+    if hook_context is not None:
+        try:
+            from scripts._state import configure_context
+            configure_context(hook_context.runtime.value, hook_context.session_id)
+            _metrics.configure_context(hook_context.runtime.value, hook_context.event_id)
+        except Exception as exc:
+            print(f"[vault-loader] runtime namespace 配置失败：{exc}", file=sys.stderr)
     if not config.get("enabled", True):
+        return 0
+    if hook_context is not None and not config.get("runtimes", {}).get(
+        hook_context.runtime.value, {}
+    ).get("enabled", True):
         return 0
     ups_cfg = config["user_prompt_submit"]
     if not ups_cfg.get("enabled", True):
@@ -574,6 +646,34 @@ def main() -> int:
     i_result = collect_signal_i_project_claude_md(cwd)
     if i_result.disabled:
         return 0
+
+    if legacy_enabled:
+        # UPS 侧此前是纯 `return 0`——会话中途完全无提示，用户看到的只是「突然不注入了」。
+        # 走 stderr 而非 systemMessage：本函数在此之后才决定是否 emit，提前 emit 会
+        # 占掉那唯一一次写出。
+        print("[context-vault] 已暂停：检测到旧 claude-vault 仍启用；"
+              "请先停用旧插件，再启用新插件。", file=sys.stderr)
+        return 0
+    if coexist_note:
+        print(f"[context-vault] 共存检测：{coexist_note}", file=sys.stderr)
+
+    if should_claim and hook_context is not None:
+        try:
+            if not claim_event(
+                hook_context.runtime.value,
+                hook_context.event or "UserPromptSubmit",
+                hook_context.session_id,
+                hook_context.event_id,
+                scope=str(hook_context.cwd),
+                ttl_seconds=None if hook_context.stable_event_id else 5.0,
+                # 不稳定 id 由 prompt 原文派生：让 events 侧加本机盐、
+                # 并且不把它明文落进 marker。
+                stable=hook_context.stable_event_id,
+                home=home,
+            ):
+                return 0
+        except Exception as exc:
+            print(f"[vault-loader] 事件去重失败，继续执行：{exc}", file=sys.stderr)
 
     # ↓↓↓ 停用闸门到此为止，从这里开始才允许登记诊断 ↓↓↓
     if cfg_fallback == "corrupt":
@@ -641,6 +741,16 @@ def main() -> int:
         split_cjk_bigram=rel_cfg.get("split_cjk_bigram", True),
         max_keywords=rel_cfg.get("max_prompt_keywords", 30),
     )
+    # 触发点0（2026-09-02）：纯指代/应答型 prompt（「继续执行」「ok」）静默早退。
+    # 紧邻触发点1 放置，是为了让「闸门只有这两处」一眼可见，避免日后有人在别处再造第三个。
+    # 两者判据不同且互不依赖：本条看 prompt **原文**、整串匹配；触发点1 看分词后的关键词数。
+    # 谁先谁后不影响放行结果，但**影响 gate 字段的归因**，故顺序是刻意的：
+    # 空 prompt 必须归给 too_few_keywords（`is_deictic_only` 对空串返回 False，见其
+    # docstring），否则报表上会显示成「被指代闸门拦的」，而实际原因是没词。
+    if is_deictic_only(prompt, config):
+        _stage_gate_record(config, hook_input, "deictic_only")
+        return _finish_with_metrics(config, cwd)
+
     # 触发点1：关键词数不足 → 静默早退。单一真源 gate_keywords（与 decide_injection
     # 内部共用同一函数，无第二处逻辑副本）；F1：在此处（cache/state IO 之前）立即判定，
     # 保持旧时机——不因抽出决策纯函数而推迟早退、令热路径多背两次 state 读 + 一次 cache 读。
@@ -653,9 +763,29 @@ def main() -> int:
         cwd, config.get("keyword_to_tags", {})
     )
 
+    # 层 3：会话主题词作为独立信号。默认关；读失败一律空集合（fail-open）。
+    # 注：此处不能用下方 `ttl = ups_cfg["state_ttl_hours"]`（entries 加载之后才定义、
+    # 晚于本处）——`ups_cfg` 本身在 main() 更早处已构造，直接取同一个键。
+    topic_words: set[str] = set()
+    # F2（整分支终审，2026-09-02）：`topic_attempted` 标记本会话是否已有一次提炼
+    # 尝试（成功或失败）落在 TTL 窗口内——`topic_words` 为空集分不清"从未尝试"与
+    # "尝试过但失败/尚在飞行"，必须单独判一次，见 has_recent_topic_attempt 的 spawn
+    # 门禁用法。
+    topic_attempted = False
+    if rel_cfg.get("session_topic", False):
+        try:
+            session_id = hook_input.get("session_id", "") or ""
+            topic_words = set(load_session_topic(
+                cwd, session_id, ups_cfg["state_ttl_hours"]))
+            topic_attempted = has_recent_topic_attempt(
+                cwd, session_id, ups_cfg["state_ttl_hours"])
+        except Exception as exc:                 # noqa: BLE001
+            print(f"[vault-loader] 主题读取失败：{exc}", file=sys.stderr)
+
     signals = Signals(
         target_tags=target_tags,
         prompt_keywords=prompt_keywords,
+        session_topic_words=topic_words,
     )
 
     entries, cache_status = load_cache_status(vault_path)
@@ -690,6 +820,49 @@ def main() -> int:
     # return 0（见上方），本调用点 prompt_keywords/config 与该早退判定完全同源，
     # decide_injection 内部复算的 gate_keywords 结果必然一致，不会再触发 too_few_keywords。
 
+    # 层 3：本会话尚无主题 ⇒ 首个有效轮次，异步提炼。放在 decision 算出之后紧邻处——
+    # 这是唯一一个"decision.admitted 已知且必然执行到"的位置：主注入路径有 7 个
+    # `_finish_with_metrics` 出口，若放在 emit 之后需在每个出口前重复插入，必然漏一个。
+    # spawn 是 detached 进程创建，实测为毫秒级，远低于 UPS 的 300ms 预算，不阻塞、
+    # 不必等到 emit 完成才拉起（具体数字来自一次性真机验证，非自动化守卫钉住的值，
+    # 不在仓库内留可核验出处，此处刻意不写具体毫秒数）。
+    #
+    # F1（评审新发现，2026-09-02）：局部变量 `dry_run = config.get("dry_run", False)`
+    # 在本函数更靠后、emit 之前才赋值（本触发点在它之前执行），故此处必须直接读
+    # `config.get("dry_run", False)`，不能等复用下面那个同名局部变量（按行号引用会被
+    # 后续编辑顶歪，此处按符号定位）。dry_run 的语义是「灰度期只看会注入什么、
+    # 不产生真实副作用」（SKILL.md 承诺"不真实注入"），而 spawn 会真实拉起
+    # `claude -p` 子进程、产生真实 LLM 调用与写盘——这与 dry_run 的不变量冲突，
+    # 必须一并拦截。
+    #
+    # 已知遗留（刻意不修，2026-09-02 裁定；2026-09-02 整分支终审 Ruling 15 订正代价模型）：
+    # 同一会话内，若前一次提炼仍在飞行中（子进程尚未写回 state——中位 21s / 最长 120s
+    # 超时窗口内），此时又发一轮 UPS，两次都会判定"尚无主题记录"而各拉起一个提炼
+    # 子进程，重复消耗一次 LLM 配额。state 写入受 context_vault/atomic.py 的
+    # lease_lock 保护，不会损坏数据；加去重需要新增"正在提炼"状态及其生命周期管理
+    # （何时置位、何时清、崩溃后谁清），成本大于收益——代价上限是"飞行窗口期内的
+    # 并发轮次数"，是有界的。
+    #
+    # 此前这条注释把"提炼失败"也算进这条可接受的遗留里，代价模型只算了成功路径、
+    # 漏算了失败路径：旧实现失败时不落任何标记，`not topic_words` 会永远为真，
+    # 导致**持续失效场景下每一轮 UPS 都重新拉起子进程、无上限**——真实上界是完整
+    # LLM 时延，不是先前估计的"同会话 30 秒内"。已在 F2（整分支终审，2026-09-02）
+    # 修复：`run_extraction_child` 现在无论成功失败都调用 `save_session_topic` 落一个
+    # 带 ts 的标记，`has_recent_topic_attempt` 据此判定"是否已尝试过且未过期"，使
+    # 持续失效的代价收敛为"每个 TTL 窗口最多一次"，不再是每轮一次。
+    if (rel_cfg.get("session_topic", False) and not topic_words and not topic_attempted
+            and not config.get("dry_run", False)):
+        try:
+            top_n = int(rel_cfg.get("session_topic_top_n", 10))
+            cands = [(e.path, (active_entries[e.path].summary or "")[:120])
+                     for e in decision.admitted[:top_n]]
+            if cands:
+                spawn_topic_extraction(
+                    cwd, hook_input.get("session_id", "") or "",
+                    prompt, cands, config)
+        except Exception as exc:                 # noqa: BLE001
+            print(f"[vault-loader] 主题提炼触发失败：{exc}", file=sys.stderr)
+
     # metrics 落盘：默认关闭（config 无 "metrics" 键时 .get 恒返回 False），仅开发者
     # 手动开启。stage 零 IO，真正写盘延后到 _finish_with_metrics 的 flush；此处任何
     # 异常只降级为「这条指标没记上」，绝不连累召回（下面 admitted/not admitted 两分支
@@ -713,6 +886,10 @@ def main() -> int:
                 admitted_k=config["metrics"].get("admitted_k", 20),
                 # 渲染层配置，随记录落盘供 analyze_metrics 用（它不读 config）
                 max_notes=config["user_prompt_submit"].get("max_notes", 3),
+                # 两个最承重的判据阈值。ft 阈值在样本期内已由 6 改成 10，
+                # 不落盘则报表只能给出跨制度的合并值（实测 65.4% vs 40.1%）。
+                min_topical=config["relevance"].get("min_topical_score"),
+                ft_topical=config["relevance"].get("fulltext_topical_threshold"),
             ))
         except Exception as exc:  # noqa: BLE001
             print(f"[vault-loader] metrics 构造失败：{exc}", file=sys.stderr)
@@ -748,6 +925,11 @@ def main() -> int:
     injection_text, injected_paths, fulltext_title = build_injection_text_ups(
         scored, keywords_str, prompt_keywords, ups_cfg, rel_cfg, vault_path,
         hits_by_path=hits_by_path, fulltext_path=decision.fulltext_path)
+    # 权威的「用户看到了哪几篇」——渲染层刚算出来，直接落盘，别让读端去重建。
+    try:
+        _metrics.annotate(shown=list(injected_paths))
+    except Exception:      # noqa: BLE001  metrics 故障绝不影响注入
+        pass
     summary_items = scored[: ups_cfg["max_notes"]]
     summary = (build_summary_ups(summary_items, prompt_keywords, fulltext_title,
                                  injection_text, display_cfg, rel_cfg,

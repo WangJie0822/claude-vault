@@ -18,10 +18,13 @@ def _reset_emit_guard():
     但单测在**同一进程**内会跨用例反复调用 emit，不复位的话第二个用例起就被守卫
     静默拦掉，表现为「stdout 空」的假失败。
     """
+    from scripts import _metrics
     from scripts._output import reset_emit_guard
 
+    _metrics.configure_context("unknown")
     reset_emit_guard()
     yield
+    _metrics.configure_context("unknown")
     reset_emit_guard()
 
 

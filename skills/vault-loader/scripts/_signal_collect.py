@@ -77,28 +77,40 @@ def _split_comma_list(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+# 项目指令文件名，按优先级排列。**两个都要读**：Codex 用户的项目指令写在
+# AGENTS.md 里（本仓库这次新增的 AGENTS.md 就是这个事实的证明）。只读 CLAUDE.md 时，
+# README 承诺的四个逃生阀里 `<!-- vault-loader: dis‌able -->` 那一个在 Codex 上
+# **永远不生效**，信号 I 的 tags/extra_paths 同样恒空——而且没有任何提示，
+# 用户只会以为自己写错了注释语法。
+_PROJECT_INSTRUCTION_FILES = ("CLAUDE.md", "AGENTS.md")
+
+
 def collect_signal_i_project_claude_md(project_root: Path) -> ProjectClaudeMdResult:
-    """读 project_root/CLAUDE.md，提取 vault-loader 注释。"""
+    """读 project_root 下的项目指令文件，提取 vault-loader 注释。
+
+    CLAUDE.md 与 AGENTS.md **取并集**而不是二选一：同一个项目可能两个都有
+    （本仓库即是），而停用意图无论写在哪一个里都应当生效。
+    """
     result = ProjectClaudeMdResult()
-    claude_md = project_root / "CLAUDE.md"
-    if not claude_md.exists():
-        return result
+    for name in _PROJECT_INSTRUCTION_FILES:
+        path = project_root / name
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        except UnicodeDecodeError:
+            continue
 
-    try:
-        text = claude_md.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return result
-    except UnicodeDecodeError:
-        return result
+        if _DISABLE_RE.search(text):
+            result.disabled = True
 
-    if _DISABLE_RE.search(text):
-        result.disabled = True
+        for m in _TAGS_RE.finditer(text):
+            result.tags.update(_split_comma_list(m.group(1)))
 
-    for m in _TAGS_RE.finditer(text):
-        result.tags.update(_split_comma_list(m.group(1)))
-
-    for m in _PATHS_RE.finditer(text):
-        result.extra_paths.extend(_split_comma_list(m.group(1)))
+        for m in _PATHS_RE.finditer(text):
+            result.extra_paths.extend(_split_comma_list(m.group(1)))
 
     return result
 

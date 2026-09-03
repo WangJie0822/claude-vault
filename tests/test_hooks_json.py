@@ -47,3 +47,13 @@ def test_hooks_json_commands_have_type_command():
                 assert hook["type"] == "command", (
                     f"Event {event}: hook type is {hook['type']!r}, expected 'command'"
                 )
+
+
+def test_context_hooks_have_bounded_codex_output():
+    """Codex spills oversized context; keep the shared hook limit explicit and positive."""
+    data = json.loads((ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))
+    for entries in data["hooks"].values():
+        for entry in entries:
+            for hook in entry["hooks"]:
+                assert isinstance(hook.get("additionalContextLimit"), int)
+                assert hook["additionalContextLimit"] > 0

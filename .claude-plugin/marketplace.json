@@ -1,14 +1,14 @@
 {
-  "name": "claude-vault-marketplace",
-  "description": "Self-marketplace for the claude-vault plugin — a knowledge-base capture & recall loop for Claude Code.",
+  "name": "context-vault-marketplace",
+  "description": "Self-marketplace for Context Vault — local knowledge capture and recall for Claude Code and Codex.",
   "owner": {
-    "name": "claude-vault contributors"
+    "name": "context-vault contributors"
   },
   "plugins": [
     {
-      "name": "claude-vault",
-      "description": "Auto-inject relevant Obsidian vault notes into Claude Code sessions, and distill sessions back into the vault. Cross-platform knowledge-base loop (capture + recall).",
-      "version": "0.9.1",
+      "name": "context-vault",
+      "description": "Capture and recall a local knowledge vault from Claude Code and Codex.",
+      "version": "1.0.0",
       "source": "./"
     }
   ]

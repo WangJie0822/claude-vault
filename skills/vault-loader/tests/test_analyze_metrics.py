@@ -299,6 +299,23 @@ def test_purge_and_review_are_mutually_exclusive(tmp_path, monkeypatch):
     assert _metrics.count_annotations(tmp_path) == 1
 
 
+def _seed_review_context(tmp_home, session, prompt_text):
+    """写一条 transcript，使 `--review` 能为该 session 回查出提问上下文。
+
+    新逻辑会剔除「一条可读上下文都没有」的条目（盲标只会产出 unsure），所以
+    测退出码契约的用例必须先让条目可判断，否则流程在「没有待标注的条目」处
+    就提前返回了，走不到被测分支。返回该 prompt 的加盐 hash，供记录使用。
+    """
+    import json as _json
+    proj = tmp_home / ".claude" / "projects" / "proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / f"{session}.jsonl").write_text(
+        _json.dumps({"type": "user", "entrypoint": "cli",
+                     "message": {"content": prompt_text}},
+                    ensure_ascii=False) + "\n", encoding="utf-8")
+    return _metrics.h(prompt_text, _metrics.get_salt(tmp_home))
+
+
 def test_review_devnull_stdin_returns_2_and_writes_no_annotation(tmp_home):
     """评审修 2：Windows 上 stdin=DEVNULL 时 `sys.stdin.isatty()` 实测返回 True
     （NUL 是字符设备，`_isatty()` 对任意字符设备一律判真），前置护栏对这个最常见
@@ -310,8 +327,10 @@ def test_review_devnull_stdin_returns_2_and_writes_no_annotation(tmp_home):
     `input()` 调用不受任何 mock/monkeypatch，全部走真实解释器。
     """
     script = Path(__file__).resolve().parents[1] / "scripts" / "analyze_metrics.py"
+    _ph = _seed_review_context(tmp_home, "sessA", "这轮问的是内存泄露")
     _metrics.write_record(tmp_home, "sessA", {
         "_schema": 1, "ts": 1.0, "session": "sessA", "prompt_id": "p0",
+        "prompt_h": _ph,
         "cwd_h": "x", "kw_h": [], "n_kw": 0, "gate": "", "relaxed": False,
         "admitted": [], "near_miss": [{"path": "notes/foo.md", "topical": 3.2,
                                        "dedup": ""}],
@@ -353,8 +372,10 @@ def test_review_eof_after_saving_one_returns_0(tmp_home, monkeypatch):
     """
     import builtins
     from scripts import analyze_metrics as am
+    _ph = _seed_review_context(tmp_home, "sessA", "这轮问的是内存泄露")
     _metrics.write_record(tmp_home, "sessA", {
         "_schema": 1, "ts": 1.0, "session": "sessA", "prompt_id": "p0",
+        "prompt_h": _ph,
         "cwd_h": "x", "kw_h": [], "n_kw": 0, "gate": "", "relaxed": False,
         "admitted": [], "near_miss": [{"path": "notes/foo.md", "topical": 3.8,
                                        "dedup": ""},
@@ -918,6 +939,121 @@ def test_sample_admitted_honours_non_default_max_notes():
         f"max_notes=1 且有全文 ⇒ 清单侧渲染 0 条，实际 {got}"
 
 
+def _recs_fulltext_starved():
+    """复刻真实数据形态：清单侧条目又多又高频，全文侧稀疏低频。
+
+    本机实测（0.9.1 后 283 轮）：admitted_list 有 497 个条目、count 最大 74；
+    admitted_fulltext 有 209 个条目、count 最大 17；而全局 top20 的门槛是 22。
+    """
+    recs = []
+    for _ in range(30):                       # 25 个清单路径，各出现 30 次
+        for g in range(0, 25, 3):
+            paths = [f"L{j}.md" for j in range(g, min(g + 3, 25))]
+            recs.append({
+                "_schema": _metrics.SCHEMA, "src": "", "gate": "",
+                "ft": {"path": "", "arm": ""}, "max_notes": 3,
+                "admitted": [{"path": p, "topical": 6.0, "total": 9.0}
+                             for p in paths],
+                "near_miss": [],
+            })
+    for _ in range(5):                        # 3 个全文路径，各出现 5 次
+        for f in range(3):                    # max_notes=1 + 有全文 => 清单侧 0 条
+            recs.append({
+                "_schema": _metrics.SCHEMA, "src": "", "gate": "",
+                "ft": {"path": f"F{f}.md", "arm": "topical>=6"}, "max_notes": 1,
+                "admitted": [{"path": f"F{f}.md", "topical": 8.0, "total": 99.0}],
+                "near_miss": [],
+            })
+    return recs
+
+
+def test_sample_admitted_reserves_quota_for_fulltext():
+    """全文侧必须有独立配额，否则被清单侧结构性挤出、精度永远测不到。
+
+    0.9.0 把 kind 分成 admitted_fulltext / admitted_list，理由是「代价差一个
+    量级……混成一类之后就分不出是哪边错了」。但排序是全局 top-k，而清单侧每轮
+    贡献 max_notes-1 条、全文侧每轮至多 1 条 => 清单侧 count 系统性更高。
+    本机实测：全局 top20 门槛 22、全文侧最大 17，**一条都进不去**，于是 283 轮
+    数据下 admitted_fulltext 的人工标注恒为 0 —— 而全文正是代价最大的召回形态
+    （单篇上限 8192 字节、占 42% 的轮次）。
+
+    变异验证：把返回值改回全局 `sorted(...)[:k]`，本用例转红。
+    """
+    from scripts.analyze_metrics import sample_admitted
+    got = sample_admitted(_recs_fulltext_starved(), k=20)
+    fts = [x for x in got if x["kind"] == "admitted_fulltext"]
+    assert fts, "全文侧被清单侧完全挤出，精度标注通道恒空"
+
+
+def _recs_list_starved():
+    """反向形态：全文侧条目多，清单侧只有两条。"""
+    recs = []
+    for i in range(15):
+        recs.append({
+            "_schema": _metrics.SCHEMA, "src": "", "gate": "",
+            "ft": {"path": f"F{i}.md", "arm": "topical>=6"}, "max_notes": 1,
+            "admitted": [{"path": f"F{i}.md", "topical": 8.0, "total": 99.0}],
+            "near_miss": [],
+        })
+    for i in range(2):
+        recs.append({
+            "_schema": _metrics.SCHEMA, "src": "", "gate": "",
+            "ft": {"path": "", "arm": ""}, "max_notes": 1,
+            "admitted": [{"path": f"L{i}.md", "topical": 6.0, "total": 9.0}],
+            "near_miss": [],
+        })
+    return recs
+
+
+def test_sample_admitted_quota_backfills_when_fulltext_scarce():
+    """全文侧不足配额时清单侧补满 —— 池子不因分配额而缩水。
+
+    抽样池本就只有 k 条，而人工标注不可再生；若不回填，全文侧只有 3 条时
+    池子会从 20 缩到 13，白白少标 7 条。
+
+    变异验证：把 `n_list = min(len(lists), k - n_ft)` 改成 `min(len(lists), k // 2)`，
+    本用例转红（20 -> 13）。
+    """
+    import collections
+    from scripts.analyze_metrics import sample_admitted
+    got = sample_admitted(_recs_fulltext_starved(), k=20)
+    assert len(got) == 20, f"共 28 个条目、k=20，池子不该缩水，实际 {len(got)}"
+    kinds = collections.Counter(x["kind"] for x in got)
+    assert kinds["admitted_fulltext"] == 3, "3 条全文应全部进池"
+    assert kinds["admitted_list"] == 17, "其余槽位由清单侧补满"
+
+
+def test_sample_admitted_quota_backfills_when_list_scarce():
+    """清单侧不足时全文侧回填 —— 配额必须是对称的。
+
+    变异验证：删掉 `n_ft = min(len(fts), k - n_list)` 那行，本用例转红
+    （全文侧被钉死在 k//2=10，总数 12）。
+    """
+    import collections
+    from scripts.analyze_metrics import sample_admitted
+    got = sample_admitted(_recs_list_starved(), k=20)
+    kinds = collections.Counter(x["kind"] for x in got)
+    assert kinds["admitted_list"] == 2
+    assert kinds["admitted_fulltext"] == 15, \
+        f"清单侧只有 2 条，全文侧应回填到 15，实际 {kinds['admitted_fulltext']}"
+    assert len(got) == 17
+
+
+def test_sample_admitted_quota_splits_evenly_when_both_ample():
+    """两侧都充足时各占 k//2 —— 这是配额的主场景。
+
+    变异验证：把 `n_ft = min(len(fts), k // 2)` 改成 `min(len(fts), k)`，
+    本用例转红（全文侧独占 20 条，清单侧 0 条）。
+    """
+    import collections
+    from scripts.analyze_metrics import sample_admitted
+    got = sample_admitted(_recs_fulltext_starved() + _recs_list_starved(), k=20)
+    kinds = collections.Counter(x["kind"] for x in got)
+    assert kinds["admitted_fulltext"] == 10, \
+        f"两侧都充足时全文侧应占 k//2=10，实际 {kinds['admitted_fulltext']}"
+    assert kinds["admitted_list"] == 10
+
+
 def test_render_span_uses_persisted_max_notes(tmp_path):
     """报表的「实际渲染 N 篇」按记录真值，不硬编码。
 
@@ -1000,3 +1136,102 @@ def test_corrupt_nested_fields_do_not_crash(tmp_path):
     assert s["arm_dist"] == {"keyword_bypass": 2}, "坏值那一臂跳过，好值那一臂保留"
     assert render_report(s)
     assert sample_admitted(recs, k=5), "topical 坏值按 0 记，条目本身仍进池"
+
+
+def test_configure_context_accepts_legacy_namespace(tmp_home):
+    """`analyze_metrics` 对未迁移用户默认传的就是 "legacy"，必须映射到 0.9.x 布局。
+
+    此前 "legacy" 落进 else 分支、又不在 `{claude, codex, unknown}` 白名单里，被改写成
+    "unknown" ⇒ `metrics_dir` 指向 `~/.context-vault/metrics/unknown`（空目录）。
+    全套用例只传过 "unknown"（conftest 的默认值），而它恰好映射回 legacy，
+    所以这条分叉此前一条用例都碰不到。
+    """
+    _metrics.configure_context("legacy")
+    assert _metrics.metrics_dir(tmp_home) == tmp_home / ".claude" / "vault-loader-metrics"
+
+    # 对照组：canonical 存在时显式 runtime 才走新命名空间。缺了它，本用例对
+    # 「两个命名空间是否被混淆」没有判别力。
+    canonical = tmp_home / ".context-vault" / "config.json"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text("{}", encoding="utf-8")
+    _metrics.configure_context("claude")
+    assert _metrics.metrics_dir(tmp_home) == tmp_home / ".context-vault" / "metrics" / "claude"
+
+    # 未知取值回落 legacy，而不是凭空造一个没人会看的孤儿命名空间
+    _metrics.configure_context("wat")
+    assert _metrics.metrics_dir(tmp_home) == tmp_home / ".claude" / "vault-loader-metrics"
+
+
+def test_purge_actually_deletes_legacy_data_for_unmigrated_user(tmp_home):
+    """未迁移用户跑 `--purge` 必须真的删掉数据。
+
+    这是文档里唯一的用户侧隐私删除控件，删的是加盐关键词 hash、**明文笔记路径**、
+    **明文 session id** 与不可再生的人工标注。此前它打印「已清空 0 个数据文件」
+    + rc=0，而数据原样留在盘上——与「本来就没有数据」完全不可区分。
+
+    走真实 CLI 子进程，不走内部函数：命名空间是在 `main()` 里选定的，
+    直接调 `purge()` 会绕过那一层，正是此前漏检的原因。
+    """
+    script = Path(__file__).resolve().parents[1] / "scripts" / "analyze_metrics.py"
+    _metrics.configure_context("legacy")
+    _metrics.write_record(tmp_home, "sessA", {
+        "_schema": 1, "ts": 1.0, "session": "sessA", "prompt_id": "p0",
+        "cwd_h": "x", "kw_h": ["h1"], "n_kw": 1, "gate": "", "relaxed": False,
+        "admitted": [], "near_miss": [], "n_excluded": 0, "ft": {"path": "", "arm": ""},
+    })
+    legacy_dir = tmp_home / ".claude" / "vault-loader-metrics"
+    (legacy_dir / "annotations.jsonl").write_text(
+        json.dumps({"path": "n/a.md", "label": "relevant"}) + "\n", encoding="utf-8")
+    before = sorted(p.name for p in legacy_dir.rglob("*.jsonl"))
+    assert before, "前置条件：legacy 目录里应有数据文件（否则本用例零判别力）"
+
+    env = dict(os.environ)
+    env.update({"HOME": str(tmp_home), "USERPROFILE": str(tmp_home)})
+    r = subprocess.run([sys.executable, "-B", str(script), "--purge"],
+                       capture_output=True, text=True, env=env, encoding="utf-8",
+                       cwd=str(script.parents[1]), timeout=60)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    remaining = sorted(p.name for p in legacy_dir.rglob("*.jsonl"))
+    assert not remaining, f"--purge 未删除 legacy 数据：{remaining}；stdout={r.stdout!r}"
+    assert "已清空 0 个数据文件" not in r.stdout, \
+        f"报告了 0 个文件，但删除前确有 {len(before)} 个：{r.stdout!r}"
+
+
+def test_purge_all_covers_legacy_namespace(tmp_home):
+    """迁移后 `--purge`（auto→all）必须连 legacy 目录一起清。
+
+    迁移是「复制」不是「移动」：legacy 目录在迁移后原样留在盘上，含加盐 hash、
+    明文笔记路径、明文 session id 与不可再生的人工标注。只清新命名空间却报告
+    「已清空 N 个数据文件」，会让用户以为隐私数据已删除。
+    """
+    script = Path(__file__).resolve().parents[1] / "scripts" / "analyze_metrics.py"
+    # 造出「已迁移」的现场：canonical config **加上** migration.json 的 committed 标记。
+    # 只写 config 是不够的——命名空间翻转的判据是迁移是否真的提交过（`--set-default`
+    # 只写配置不搬数据，不应让命名空间切走），此时 `claude` 仍会落在 legacy 布局。
+    canonical = tmp_home / ".context-vault" / "config.json"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text('{"_config_version": 2}', encoding="utf-8")
+    (tmp_home / ".context-vault" / "migration.json").write_text(
+        '{"schema": 1, "status": "committed"}', encoding="utf-8")
+    rec = {"_schema": 1, "ts": 1.0, "session": "s", "prompt_id": "p", "cwd_h": "x",
+           "kw_h": ["h"], "n_kw": 1, "gate": "", "relaxed": False, "admitted": [],
+           "near_miss": [], "n_excluded": 0, "ft": {"path": "", "arm": ""}}
+    _metrics.configure_context("legacy")
+    _metrics.write_record(tmp_home, "sessLegacy", rec)
+    _metrics.configure_context("claude")
+    _metrics.write_record(tmp_home, "sessClaude", rec)
+    legacy_dir = tmp_home / ".claude" / "vault-loader-metrics"
+    claude_dir = tmp_home / ".context-vault" / "metrics" / "claude"
+    assert list(legacy_dir.rglob("*.jsonl")) and list(claude_dir.rglob("*.jsonl")), \
+        "前置条件：两个命名空间都要有数据，否则本用例零判别力"
+
+    env = dict(os.environ)
+    env.update({"HOME": str(tmp_home), "USERPROFILE": str(tmp_home)})
+    r = subprocess.run([sys.executable, "-B", str(script), "--purge"],
+                       capture_output=True, text=True, env=env, encoding="utf-8",
+                       cwd=str(script.parents[1]), timeout=60)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not list(legacy_dir.rglob("*.jsonl")), f"legacy 未被清理；stdout={r.stdout!r}"
+    assert not list(claude_dir.rglob("*.jsonl")), f"claude 未被清理；stdout={r.stdout!r}"
+    # 扫描目录必须打出来——只报总数时「漏扫」与「本来就空」不可区分
+    assert "扫描目录" in r.stdout and "vault-loader-metrics" in r.stdout

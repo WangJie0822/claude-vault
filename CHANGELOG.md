@@ -1,6 +1,26 @@
 # Changelog
 
-本文件记录 claude-vault 的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
+本文件记录 Context Vault（原 claude-vault）的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [1.0.0] - 2026-08-28
+
+### 新增
+
+- 同一份 skills 与 hooks 支持 Claude Code 和 Codex；新增 Codex manifest 与标准 marketplace 构建产物（`scripts/build_codex_artifact.py`，已接入发布门禁）。
+  > ⚠️ **Codex 端尚未做过真实安装验证**：`codex plugin add` 之后 hooks 是否被自动发现与信任、
+  > `${CLAUDE_PLUGIN_ROOT}` 在 Codex 侧如何展开、stdout 契约是否被接受，三者都还没有端到端证据。
+  > 最便宜的证伪判据：装好后新开一次 Codex 会话，看 `~/.context-vault/state/events/codex/`
+  > 下是否真的生成了 marker 文件——它只有 hook 真跑过才会出现。
+- 公共 runtime/路径/原子锁/模型后端抽象；`enrich_keywords.py` 支持 `claude` 与 `codex exec`。
+- `~/.context-vault/` canonical home，state/metrics **按 runtime 隔离**（注入去重仍按 cwd，跨会话保持——按 session 再切一层会让同一批笔记每开一次新会话重注入一遍），hook 事件以原子 marker 去重。
+- 非破坏迁移工具与只读 doctor；dry-run 默认、Vault 冲突和既有 canonical config 均 fail-closed。
+- Codex session rollout 的 experimental catch-up 扫描/解析适配。
+
+### 变更
+
+- 插件 ID 改名为 `context-vault`；仓库目录名可继续保留 `claude-vault`。
+- hook wrapper root 顺序改为 `PLUGIN_ROOT` → `CLAUDE_PLUGIN_ROOT` → wrapper 相对路径。
+- 1.0 新装默认 Vault 改为 `~/.context-vault/knowledge-vault`；旧配置继续兼容，不自动删除。
 
 ## [0.9.1] - 2026-08-26
 

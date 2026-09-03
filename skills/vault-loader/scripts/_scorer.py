@@ -51,6 +51,11 @@ class Signals:
     commit_keywords: set[str] = field(default_factory=set)      # 信号 D：commit 关键词
     worklog_keywords: set[str] = field(default_factory=set)     # 信号 F：工作日志条目关键词
     prompt_keywords: set[str] = field(default_factory=set)      # 信号 J：仅 UserPromptSubmit
+    # 信号 K（2026-09-02）：会话主题词，由首轮异步提炼、后续轮次复用。
+    # **刻意与 prompt_keywords 分开**：并入后会进 prompt_submit_load 的 shown_hits_str
+    # 回显路径（该行不经 sanitize_injected_text），且按 _hit_keywords 全口径膨胀
+    # （实测裸主题词使 admitted 涨 5.5 倍）。作为独立信号则两者都不发生。
+    session_topic_words: set[str] = field(default_factory=set)
 
 
 def _keyword_hits_entry(keyword: str, entry: Entry) -> bool:
@@ -154,7 +159,11 @@ def _prompt_topical_hits(entry: Entry, signals: Signals, weights: dict,
     使返回 float 4.0 而非 int 4，`==` 成立故数值等价，非逐字节相同）；
     传入 tag_df 时按 IDF 降权，多 tag 命中取 max 而非累加（防堆砌 tag 刷分）。
     """
-    if not signals.prompt_keywords:
+    # 早退条件须同时看 prompt_keywords 与 session_topic_words：早期实现只判前者，
+    # 会让「无 prompt_keywords、仅有 session_topic_words」的调用（如
+    # test_session_topic_scoring.py::test_topic_word_adds_score）在下面的信号 K
+    # 分支被触及前就已 return 0，主题词命中永远算不到分。
+    if not signals.prompt_keywords and not signals.session_topic_words:
         return 0
     total: float = 0
     hit_tags = [t for t in entry.tags
@@ -169,6 +178,16 @@ def _prompt_topical_hits(entry: Entry, signals: Signals, weights: dict,
         total += weights["prompt_summary_hit"]
     if has_keyword_hit(entry, signals.prompt_keywords, use_keywords):
         total += weights["prompt_keyword_hit"]
+    # 信号 K：会话主题词命中（tag/summary/keywords 三面任一，与 _decision.py::_hit_keywords
+    # 同一口径——**不含 path**，避免仅靠文件名命中就计入话题相关性），**只加一次**
+    # —— 与 tag 面「多命中取 max 不累加」同构，防堆砌刷分。
+    # 注：此前误用 _keyword_hits_entry（只查 tags/summary/path，漏 keywords、误含 path），
+    # 评审 Finding 1 实测两个方向都错，已改用与 _hit_keywords 一致的三个单点函数。
+    if signals.session_topic_words and any(
+            _keyword_hits_tags(w, entry) or _keyword_hits_summary(w, entry)
+            or _keyword_hits_keywords(w, entry)
+            for w in signals.session_topic_words):
+        total += weights.get("session_topic_hit", 0)
     return total
 
 
@@ -215,12 +234,17 @@ def score(entry: Entry, signals: Signals, weights: dict,
 def topical_score(entry: Entry, signals: Signals, weights: dict,
                   use_keywords: bool = True, tag_df=None,
                   n_docs: int = 0, tag_idf_floor: float = 0.5) -> float:
-    """仅 prompt 关键词的话题命中分（tag/summary/keywords），不含 context。
+    """仅 prompt 关键词（含会话主题词）的话题命中分（tag/summary/keywords + 主题词），
+    不含 context。
 
-    值域：tag 命中 [prompt_tag_hit*floor, prompt_tag_hit] + summary + keywords。
-    默认权重（tag=4 / summary=2 / keywords=5、floor=0.5）下上界为 11。
-    relevance 段阈值（min_topical_score / fulltext_topical_threshold /
-    confidence_bands.high）假定该权重，改 scoring 权重需同步调阈值。
+    值域：tag 命中 [prompt_tag_hit*floor, prompt_tag_hit] + summary + keywords
+    + session_topic。默认权重（tag=4 / summary=2 / keywords=5、floor=0.5、
+    session_topic=2）下上界为 13（= 4+2+5+2）。relevance 段阈值
+    （min_topical_score / fulltext_topical_threshold / confidence_bands.high）
+    假定的仍是旧权重下的上界 11，改 scoring 权重需同步调阈值；session_topic_hit
+    刻意小于 min_topical_score（断言见
+    tests/test_session_topic_scoring.py::test_upper_bound_invariant_documented），
+    故三个阈值目前仍然有效，但这条不变量是靠该断言钉住的，不是靠本函数值域自动保证。
     """
     return _prompt_topical_hits(entry, signals, weights, use_keywords,
                                 tag_df, n_docs, tag_idf_floor)

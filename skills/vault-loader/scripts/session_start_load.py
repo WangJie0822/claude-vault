@@ -16,6 +16,15 @@ from pathlib import Path
 
 # 确保能 import 同级模块
 sys.path.insert(0, str(Path(__file__).parent.parent))
+_PLUGIN_ROOT = Path(__file__).resolve().parents[3]
+# 只有**确实像插件根**才插入 sys.path。legacy 独立布局
+# （`~/.claude/skills/<skill>/scripts/`）下 parents[3] 正是 `~/.claude` 本身——
+# 把一个多插件共享、可被任意工具写入的目录放到 sys.path[0]，等于让任何能在那里
+# 落一个 `context_vault/__init__.py` 的东西在每次 hook 进程内取得代码执行。
+# 判据不成立时跳过，交给下面的 ImportError façade 兜底。
+_LOOKS_LIKE_PLUGIN_ROOT = (_PLUGIN_ROOT / "context_vault" / "runtime.py").is_file()
+if _LOOKS_LIKE_PLUGIN_ROOT and str(_PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_ROOT))
 
 # fail-open 硬约束的一个既有缺口（F6）：顶层 import 在下方 `if __name__ == "__main__"`
 # 的 try/except 之外执行，任何导入期异常都会直接 exit 1 + traceback，兜底完全覆盖不到
@@ -76,7 +85,8 @@ MAX_TITLE_CHARS = 120
 def _is_runtime_disabled(home: Path) -> bool:
     if os.environ.get("VAULT_LOADER_DISABLE") == "1":
         return True
-    if (home / ".claude" / ".vault-loader-disabled").exists():
+    if ((home / ".context-vault" / ".disabled").exists()
+            or (home / ".claude" / ".vault-loader-disabled").exists()):
         return True
     return False
 
@@ -255,12 +265,55 @@ def main() -> int:
         hook_input = {}
 
     cwd = Path(hook_input.get("cwd", os.getcwd()))
+    hook_context = None
+    should_claim = False
+    legacy_enabled = False
+    coexist_note = ""
+
+    # Configure state after payload parsing so concurrent Claude/Codex sessions
+    # never share an injection namespace.
+    try:
+        from context_vault.coexist import check_legacy_plugin
+        from context_vault.events import claim_event
+        from context_vault.runtime import HookContext
+        hook_context = HookContext.from_payload(hook_input)
+        legacy_enabled, coexist_note = check_legacy_plugin(
+            hook_context.runtime.value, home=home, cwd=hook_context.cwd
+        )
+        should_claim = hook_context.runtime.value in {"claude", "codex"}
+    except Exception as exc:
+        print(f"[vault-loader] runtime 识别失败，使用 legacy state：{exc}", file=sys.stderr)
 
     if _is_runtime_disabled(home):
         return 0
 
+    # 程序化调用（`claude -p` 及其派生）不注入：它带着完整任务 prompt 而来，
+    # 本机历史笔记不构成它的上下文。实测这类轮次占 35.3%，却吃掉约一半的注入
+    # 预算（每轮中位 4238 字符 vs 人类会话 971）。
+    #
+    # 位置必须在 load_config_ex 之前、metrics 之前：放晚了这些轮次照样落盘，
+    # 报表口径依旧被污染。判据与「读不出来一律按人类处理」的方向见 _entrypoint。
+    # 延迟 import + 吞异常：本闸门是可选优化，绝不能成为新的失败源（hook 必须
+    # fail-open）。
+    try:
+        from scripts._entrypoint import is_supported_session
+        if not is_supported_session():
+            return 0
+    except Exception:
+        pass
+
     config, cfg_fallback, cfg_detail = load_config_ex()
+    if hook_context is not None:
+        try:
+            from scripts._state import configure_context
+            configure_context(hook_context.runtime.value, hook_context.session_id)
+        except Exception as exc:
+            print(f"[vault-loader] state namespace 配置失败：{exc}", file=sys.stderr)
     if not config.get("enabled", True):
+        return 0
+    if hook_context is not None and not config.get("runtimes", {}).get(
+        hook_context.runtime.value, {}
+    ).get("enabled", True):
         return 0
     if not config.get("session_start", {}).get("enabled", True):
         return 0
@@ -276,6 +329,36 @@ def main() -> int:
     i_result = collect_signal_i_project_claude_md(project_root)
     if i_result.disabled:
         return 0
+
+    if legacy_enabled and hook_context is not None:
+        emit(
+            None,
+            "📚 context-vault 已暂停：检测到旧 claude-vault 仍启用；请先停用旧插件，再启用新插件。",
+            hook_context.event or "SessionStart",
+        )
+        return 0
+    if coexist_note:
+        # 「某层配置读不出」与「确实检测到旧插件启用」是两回事，必须分开说——
+        # 旧实现把前者也报成后者，会把用户引向一个根本不存在的插件。
+        print(f"[context-vault] 共存检测：{coexist_note}", file=sys.stderr)
+
+    if should_claim and hook_context is not None:
+        try:
+            if not claim_event(
+                hook_context.runtime.value,
+                hook_context.event or "SessionStart",
+                hook_context.session_id,
+                hook_context.event_id,
+                scope=str(hook_context.cwd),
+                ttl_seconds=None if hook_context.stable_event_id else 5.0,
+                # 不稳定 id 由 prompt 原文派生：让 events 侧加本机盐、
+                # 并且不把它明文落进 marker。
+                stable=hook_context.stable_event_id,
+                home=home,
+            ):
+                return 0
+        except Exception as exc:
+            print(f"[vault-loader] 事件去重失败，继续执行：{exc}", file=sys.stderr)
 
     # ↓↓↓ 停用闸门到此为止，从这里开始才允许登记诊断 ↓↓↓
     if cfg_fallback == "corrupt":
@@ -386,6 +469,23 @@ def main() -> int:
         save_injected(cwd, [e.path for e in project_notes] + top_worklogs)
     except Exception as exc:
         print(f"[vault-loader] state 写入失败：{exc}", file=sys.stderr)
+
+    # SessionStart 的注入开销此前完全不落盘（本文件对 _metrics 的引用数曾是 0），
+    # 于是这条通道在「值不值」的账上整个缺席。落一条极简记录：只记规模与开销，
+    # 不记路径。与 UPS 侧一样是 opt-in，且全程吞异常——metrics 绝不影响注入。
+    if config.get("metrics", {}).get("enabled", False):
+        try:
+            from scripts import _metrics as _m
+            _m.stage(_m.build_session_start_record(
+                session_id=hook_input.get("session_id", ""),
+                inj_chars=len(injection_text or ""),
+                n_notes=len(project_notes), n_worklogs=len(top_worklogs),
+                n_commits=len(recent_commits)))
+            _m.flush(Path.home(),
+                     config.get("metrics", {}).get("retention_days", 90))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vault-loader] SessionStart metrics 落盘失败：{exc}",
+                  file=sys.stderr)
 
     return _finish(config, cwd, additional_context=injection_text, system_message=summary)
 

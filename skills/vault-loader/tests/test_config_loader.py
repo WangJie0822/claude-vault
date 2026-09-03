@@ -17,6 +17,19 @@ def _config_path(home: Path) -> Path:
     return home / ".claude" / "skills" / "vault-loader" / "config.json"
 
 
+def _assert_matches_default_except_vault(cfg: dict, msg: str = "") -> None:
+    """断言「合并结构完整、无杂键」，但把 `vault_path` 排除在整体相等之外。
+
+    `DEFAULT_CONFIG["vault_path"]` 是模块加载期按当时 HOME 求值的**快照**，而实际
+    解析值随 HOME 与配置文件位置（canonical / 0.9.x legacy）变化。拿它做整体相等，
+    钉住的不是「合并结构正确」这个契约，而是一个环境常量——于是 1.0 给 legacy 用户
+    回落 0.9.x 默认这个**正确**行为会在此转红。vault_path 另按契约单独断言。
+    """
+    assert {k: v for k, v in cfg.items() if k != "vault_path"} == {
+        k: v for k, v in DEFAULT_CONFIG.items() if k != "vault_path"}, msg
+    assert cfg["vault_path"].replace("\\", "/").endswith("/knowledge-vault")
+
+
 def test_missing_file_returns_default_and_writes(tmp_home: Path) -> None:
     """P0 升级链治理（spec §8.1）：缺失时不再把全量 DEFAULT_CONFIG 写盘（会让默认值
     演进对物化窗口用户永久失效），改写最小占位；但 load_config 返回值仍是完整
@@ -34,7 +47,7 @@ def test_missing_file_returns_default_and_writes(tmp_home: Path) -> None:
     assert cfg["session_start"]["include_tag_matched_notes"] is True
     assert cfg["user_prompt_submit"]["fulltext_threshold"] == 10
     assert cfg_path.exists(), "缺失时应自动写出配置占位"
-    assert cfg == DEFAULT_CONFIG, "load_config 返回值应仍等于 DEFAULT 合并结果"
+    _assert_matches_default_except_vault(cfg, "load_config 返回值应仍等于 DEFAULT 合并结果")
     assert "_config_version" not in cfg, "返回 dict 不得含内部标记键"
     assert "_comment" not in cfg
 
@@ -60,7 +73,7 @@ def test_minimal_stub_on_disk_merges_back_to_full_default(tmp_home: Path) -> Non
 
     cfg = load_config(cfg_path)
 
-    assert cfg == DEFAULT_CONFIG
+    _assert_matches_default_except_vault(cfg)
     assert "_config_version" not in cfg
     assert "_comment" not in cfg
 
@@ -88,7 +101,7 @@ def test_corrupted_json_returns_default_keeps_file(tmp_home: Path) -> None:
 
     cfg = load_config(cfg_path)
 
-    assert cfg == DEFAULT_CONFIG
+    _assert_matches_default_except_vault(cfg)
     assert cfg_path.read_text() == "{not valid json", "损坏文件不得被覆盖"
 
 
@@ -201,12 +214,55 @@ def test_default_config_has_no_private_tags():
 
 
 def test_default_vault_path_is_neutral():
-    from scripts._config_loader import DEFAULT_CONFIG
+    from scripts._config_loader import DEFAULT_CONFIG, _default_vault_for
+    from context_vault.paths import canonical_config, legacy_default_vault
     vp = DEFAULT_CONFIG["vault_path"]
-    # 路径末尾必须为 .claude/knowledge-vault（中性默认，非私人 ~/Vault 硬编码）
-    assert vp.replace("\\", "/").endswith(".claude/knowledge-vault")
+    # 本用例的契约是「产品中性、非私人硬编码」，**不是**某个具体路径取值。
+    # 1.0 之前它被写成 `.claude/knowledge-vault`，那只是当时中性默认恰好的取值；
+    # 把取值当契约会让「新装迁到 .context-vault」这个正确实现在此转红。
+    assert vp.replace("\\", "/").endswith("/knowledge-vault")
     # 不得是旧私人硬编码（仅含 Vault 而不含 knowledge-vault）
     assert "Vault" not in vp or "knowledge-vault" in vp
+    # 两档默认都必须中性，且互不混淆——canonical 走 1.0 新默认，legacy 保 0.9.x 默认。
+    assert str(legacy_default_vault()).replace("\\", "/").endswith(".claude/knowledge-vault")
+    assert _default_vault_for(canonical_config()).replace("\\", "/").endswith(
+        ".context-vault/knowledge-vault")
+
+
+def test_legacy_config_without_vault_path_keeps_09x_default(tmp_path, monkeypatch):
+    """0.9.x 零配置用户升级后不得被静默改指到新的空目录。
+
+    盘上那份 config 是 `_MINIMAL_STUB`（只有 `_config_version`/`_comment`，**不含
+    `vault_path`**）——它正是 loader 首跑自己写出来的形态，因此这不是边角场景而是
+    「装完从没改过配置」的全部用户。三条返回路径（缺失/正常/损坏）必须给出同一答案。
+    """
+    from scripts._config_loader import _MINIMAL_STUB, load_config_ex
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    legacy = tmp_path / ".claude" / "skills" / "vault-loader" / "config.json"
+    legacy.parent.mkdir(parents=True)
+    expected = str(tmp_path / ".claude" / "knowledge-vault")
+
+    # 正常解析：stub 原文
+    legacy.write_text(json.dumps(_MINIMAL_STUB, ensure_ascii=False), encoding="utf-8")
+    assert load_config_ex(legacy).config["vault_path"] == expected
+
+    # 损坏回退：不得叠加一次不可见的 Vault 换址
+    legacy.write_text("{ not json", encoding="utf-8")
+    loaded = load_config_ex(legacy)
+    assert loaded.fallback_reason == "corrupt"
+    assert loaded.config["vault_path"] == expected
+
+    # 缺失：显式传入 legacy 路径时同样回落 0.9.x 默认
+    legacy.unlink()
+    assert load_config_ex(legacy).config["vault_path"] == expected
+
+    # 对照：canonical 路径必须走 1.0 新默认，否则本用例对「两档是否混淆」无判别力
+    canonical = tmp_path / ".context-vault" / "config.json"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(json.dumps(_MINIMAL_STUB, ensure_ascii=False), encoding="utf-8")
+    assert load_config_ex(canonical).config["vault_path"] == str(
+        tmp_path / ".context-vault" / "knowledge-vault")
 
 
 def test_default_dry_run_false():
@@ -476,3 +532,27 @@ def test_doctor_uses_deep_merge(tmp_path, monkeypatch):
     merged = migrate_config._doctor_merge(raw)
     assert merged["metrics"]["enabled"] is False
     assert merged["metrics"]["retention_days"] == 30
+
+
+@pytest.mark.parametrize("bad", [[], "yes", None, 0, {"claude": "yes"}, {"claude": []}])
+def test_malformed_runtimes_never_escapes_load_config(tmp_home: Path, bad) -> None:
+    """`runtimes` 配成非 dict（或成员非 dict）时不得让 hook 崩溃。
+
+    消费点是 `config.get("runtimes", {}).get(rt, {}).get("enabled", True)`——`.get`
+    的默认值只挡「键缺失」，挡不住「键存在但类型不对」。AttributeError 会**逃出**
+    `load_config` 的 except（那里只捕 JSONDecodeError/ValueError/OSError），
+    表现为每次提问召回静默全灭、只有一行用户看不见的 stderr。
+
+    这是 `relevance` 那条既有缺陷的同类第二例（见 `_ensure_relevance_normalized`
+    的 docstring）——新增配置段时容易原样复刻。
+    """
+    cfg_path = _config_path(tmp_home)
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({"runtimes": bad}), encoding="utf-8")
+
+    cfg = load_config(cfg_path)          # 不得抛
+    runtimes = cfg["runtimes"]
+    assert isinstance(runtimes, dict)
+    # 复刻真实消费点的调用链：任何一层类型不对都会在这里抛
+    for rt in ("claude", "codex", "unknown"):
+        assert runtimes.get(rt, {}).get("enabled", True) in (True, False)

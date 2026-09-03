@@ -1,10 +1,10 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file is the single project guidance source for Claude Code and Codex when working with this repository. `AGENTS.md` only points here and must not duplicate these rules.
 
 ## 项目概述
 
-`claude-vault` 是一个跨平台（macOS / Linux / Windows）Claude Code 插件，把三个 skill 与一组 hook 打包成「知识库沉淀—召回」闭环。面向中文笔记工作流调优。
+`context-vault`（仓库目录历史名 `claude-vault`）是一个跨平台（macOS / Linux / Windows）、同时支持 Claude Code 与 Codex 的插件，把三个 skill 与一组 hook 打包成「知识库沉淀—召回」闭环。面向中文笔记工作流调优。
 
 ## 架构大图
 
@@ -16,12 +16,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **核心数据契约**：`<vault>/.meta/frontmatter-cache.json` 是写端（summarize-session 的 `rebuild_index.py`）与读端（vault-loader 的 `load_cache`）之间的唯一接口。读端 `load_cache` 校验 `_version`，不匹配返回空索引——改一端的 cache schema 必须同步另一端。笔记 frontmatter 的 `keywords`（检索扩展词）经此 cache 流到读端 scorer，是**可选增量字段**——新增它**不**触发 `_version` 变更（读端缺失默认空、双向兼容）。
 
-**Vault 路径解析**：**两端各读自己的 config，不存在单一来源**——vault-loader 读 `~/.claude/skills/vault-loader/config.json::vault_path`（`_config_loader.py::DEFAULT_CONFIG`，默认 `~/.claude/knowledge-vault`）；summarize-session 读 `~/.claude/skills/summarize-session/config.json::default_vault_path`（由 `/summarize-session --set-default <路径>` 写入）。**二者不会自动同步**：只改写端，读端纹丝不动。SessionStart 启动时 `compare_vault_paths` 比对两值，不一致经 `_diagnostics.vault_path_mismatch` 走**诊断通道**（用户可见的 systemMessage），并按配置是否回退翻转文案。（`check_vault_path_consistency` 是旧的纯 stderr 版本，现已无生产调用方，其 docstring 自陈建议是错的。）
+**Vault 路径解析（1.0）**：canonical 单一来源是 `~/.context-vault/config.json::vault_path`，全新安装默认 `~/.context-vault/knowledge-vault`。canonical 不存在时继续兼容 0.9.x 的两份 `~/.claude/skills/.../config.json`；旧两值冲突时诊断/迁移必须 fail-closed，不猜哪一份正确。显式迁移只复制，不删除 legacy 数据。
 
 ### Hook 管线（`hooks/`）
 
-- `hooks/hooks.json` 声明 SessionStart / UserPromptSubmit 两类 hook，全部经 `hooks/run-hook.cmd` 路由，脚本路径相对 `${CLAUDE_PLUGIN_ROOT}` 解析。
-- `${CLAUDE_PLUGIN_ROOT}` 由 Claude Code 注入，指向插件的 **cache 安装目录**，不是 `~/.claude/skills/`。
+- `hooks/hooks.json` 是 Claude Code/Codex 共用的薄声明，定义 SessionStart / UserPromptSubmit，两端都由 `hooks/run-hook.cmd` 路由。
+- plugin root 优先级固定为 `PLUGIN_ROOT`（Codex）→ `CLAUDE_PLUGIN_ROOT`（Claude Code）→ wrapper 相对路径；二者都指向插件 cache/加载根，不是用户态 skills 目录。
+- runtime 适配集中在 `context_vault/`：payload 优先识别宿主（`turn_id`/`model` → Codex，`prompt_id`/`agent_type` → Claude，其后才看环境变量；两者都不给时**若 payload 带 `hook_event_name` 则判 Claude**——Codex 两个事件的 required 都含 `model`，而 Claude 的 SessionStart 实测只有 `cwd/hook_event_name/session_id/source/transcript_path`，且 `CLAUDE_PLUGIN_ROOT` **不在 hook 子进程环境里**，没有这条兜底它会落 UNKNOWN 并与同会话的 UPS 分裂到两个命名空间）。共享 config/Vault；**state 与 metrics 按 runtime 隔离，注入去重仍按 cwd**（不按 session：隔离要解决的是两个 runtime 互相踩踏，再切一层 session 会让跨会话去重失效、且 sessions 目录单调增长无清理）；事件 marker 用 `O_EXCL` 保证重复 hook 静默退出。
 - **`run-hook.cmd` 是 polyglot 脚本**：同一文件既是合法的 Windows batch 又是合法的 POSIX sh（顶部 `: << 'BATCH'` heredoc 让 sh 跳过 batch 段）。单文件而非 `.cmd`+`.sh` 两份，是因为 Claude Code 在 Windows 上对含 `.sh` 的命令会前置 bash，导致双文件 wrapper 失效。改这个文件务必保持两种解释器都能正确解析，并保持 LF 行尾（`.gitattributes` 对 `*.sh`/`*.cmd` 强制 `eol=lf`，CRLF 会破坏 shebang / heredoc）。
 - wrapper 按 `py` → `python3` → `python` 顺序探测解释器；找不到任何 Python 即静默 `exit 0`。
 - **所有 hook fail-open**：脚本顶层 `try/except` 兜底 `exit 0`。任何 hook 都不得阻断会话。新增 hook 逻辑时保持这一不变量。
@@ -50,6 +51,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **hook stdin payload 的完整键集合（实测，CC 2.1.220）**：`cwd` / `hook_event_name` / `permission_mode` / `prompt` / `prompt_id` / `session_id` / `transcript_path`；**subagent 调用时多一个 `agent_type`**。取法是给生产 hook 临时加一行只写键名的探针、用 `claude -p` 触发真实调用后立即还原。两条推论：① `agent_type` 才是真正可用的「非人类来源」信号（`promptSource` 根本不存在）；② `transcript_path` 可用但**刻意不落盘**——它含项目目录名，而 `cwd` 特意只存 hash，落它是隐私回退。
   > **方法教训**：查「X 在不在」时顺手把「到底有什么」一起列出来，成本一样、信息多得多。上一轮只查了 `promptSource` 不在，就白白错过了 `transcript_path` 与 `agent_type` 这两个现成的出路，导致「标注没有上下文」这个缺陷多存活了一整轮。
 - **`prompt_h` 是标注的定位键，不是内容**：`--review` 要回答「这篇该不该被召回」，而该问题在不知道当时提问时无法回答（此前界面只有「被召回 N 次 + 路径」，标注等于掷骰子）。落 prompt 原文的加盐 hash，标注时按 `session_id` 找 transcript（文件名即 session_id，实测 387/388 = 99.7% 可达）、对每条 user message 算同 hash **精确匹配**取回原文。**不用时间戳就近匹配**：实测只有 82.8% 能唯一定位，17.2% 落在「同一秒多条消息」的歧义里，而人工标注不可再生、不能建在猜上。隐私边界不变（原文不落盘、路径不落盘、transcript 只读）。**只对新记录生效**，旧记录显示「无提问上下文」。
+- **标注本身也要落 `context_ids`，否则它不能当 ground truth**（2026-09-02）：上一条解决的是「标注时**看得到**当时的提问」，但标注写盘时只存 `path`+`verdict`，**没存是对哪次提问下的判断**。同一篇笔记对 query A 相关、对 query B 不相关，缺了这个关联就算不出 precision，更算不出任何排序指标——已有 74 条标注全部因此不可用，而这正是层 2 三个候选方案（W 判据 / keywords IDF / summary IDF）都无法验收的直接原因。故 `pick_readable_contexts` 第三个返回值交出被选中那几条的 `(session, prompt_h)`，经 `attach_contexts` 挂到条目上、由 `save_annotation(context_ids=...)` 落盘为 `[{"session","prompt_h"}]`。三条约束：① 只落标识符不落原文（落原文即作废上一条的隐私契约，守卫 `test_saved_annotation_never_contains_prompt_text`）；② web 入口的标识符**只从服务端 items 按 (path, kind) 查**，请求体里带的一概忽略——采信它等于让任何能访问该端口的人往这份不可再生的数据里写任意值；③ 不传则**不落该键**，旧记录与新记录都是合法形态。
 - **`src` 字段实测恒为空，别把它当可用的来源信号**：`promptSource` **不在 UserPromptSubmit 的 hook stdin payload 里**（Claude Code 2.1.220 二进制实证；它只存在于 transcript 的 user message 与 CC 内部上下文对象）。字段保留作探针，但消费侧判据必须是**黑名单**（排除确知的 `sdk`/`system`），写成白名单枚举会让通道恒空。**这是本仓库踩过的最贵一课**：0.9.0 的 `_HUMAN_SRC` 白名单连同其「事件级实测 259 条：typed 113 / sdk 93…」的注释，都是拿 **transcript** 的字段分布去标定 **hook stdin** 的判据——用 A 载体的观测标定 B 载体。后果是精度标注通道自上线起 100% 空转，而两条守卫用例手工构造 `src="typed"` 这种**生产中从未存在过的形态**，因此永远全绿。同源提醒：凡「手工构造被测对象、绕过真实产出」的用例，都要额外补一条从真实产出喂进去的端到端用例（`test_sample_admitted_accepts_real_build_record_output` 就是补的那条）。
 - **`inj_chars`**：本轮实际注入正文的字符数，由 `_finish_with_metrics` 在 emit 之后经 `annotate()` 补记（`additional_context` 即最终注入正文，`emit` 只对 system_message 做前置诊断与 sanitize）。**只在真有正文时记**——闸门早退与零 admitted 分支传 None，给它们一律写 0 会把 25% 的轮次以 0 计进均值，也会让极简 gate 记录多出第 6 个键。读端用 `"inj_chars" in r` 判存在，不用 `.get(...,0)`：后者会把「旧记录」与「真的零注入」混成同一个 0。`annotate` 走 `_ANNOTATE_ALLOWED` 白名单且 `_PENDING is None` 时 no-op ——写成 `_PENDING = _PENDING or {}` 会在 metrics 关闭态凭空造记录并被 flush 落盘，破掉 opt-in 零足迹。**两条端到端守卫**（`test_inj_chars_equals_real_injected_length` / `test_gate_record_keeps_exactly_five_keys`）：前者把落盘长度与真实 `additionalContext` 对起来，后者用**集合相等**钉住 gate 记录只有五个键——`"inj_chars" not in rec` 是黑名单，只挡得住这一个名字。该字段加入时只有单元级覆盖（8 处全是直接调 `annotate()`），把某个早退出口的 `None` 改成 `""` 会让 gate 记录静默多出 `inj_chars: 0`、25% 的轮次以 0 计进均值，而全套用例照样全绿。
 - **记录自描述字段**：`near_miss_k`/`admitted_k`/`scorelow_floor`/`max_notes` 随记录落盘，因为 `analyze_metrics` **不读 config**。`max_notes` 那个是补的最晚也最疼的一个——报表曾硬编码「实际渲染 ≤4 篇」，两处都错：全文那篇**计入** `max_notes` 之内（`prompt_submit_load.py:341` 是 `rest = [...][: max_notes - 1]`），真值是 ≤3；且该项可配，硬编码后用户一改配置报表就开始说假话。同一个错还让 `sample_admitted` 每个全文轮次多抓 1 条**从未渲染给用户**的条目进人工标注池，而那份数据不可再生。
@@ -72,10 +74,10 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 
 ## 分发边界（重要）
 
-并非所有目录都随插件分发。**git 跟踪 = 分发**：`.claude-plugin/`、`hooks/`、`skills/`、`commands/`、`scripts/`、`tests/`、`images/`、`docs/MIGRATION.md`、README。
+并非所有目录都随插件分发。**git 跟踪 = 分发源**：`.claude-plugin/`、`.codex-plugin/`、`context_vault/`、`hooks/`、`skills/`、`commands/`、`scripts/`、`tests/`、`images/`、`docs/MIGRATION.md`、README、AGENTS.md（仅指向 CLAUDE.md）、CLAUDE.md、CHANGELOG.md、VERSION。Codex 对外发布物还必须经受跟踪的 `scripts/build_codex_artifact.py` 生成标准 marketplace staging，不能直接把仓库根当 marketplace 安装（那会把 `.git` 和忽略的本机文件复制进 cache）。
 
 **本地开发工具 / 设计文档，被 `.gitignore` 排除、不分发**：
-- `packaging/` —— 作者发布工具：`build_plugin.py`（脱敏闸门，见下）、`import_assets.py`（从 `~/.claude` 源 allowlist 同步资产到插件目录）。含作者特定脱敏规则，对安装者无用。
+- `packaging/` —— 作者私有发布工具：`build_plugin.py`（脱敏闸门，见下）、`import_assets.py`（从 `~/.claude` 源 allowlist 同步资产到插件目录）。公开 Codex staging 构建器是受跟踪的 `scripts/build_codex_artifact.py`，不能放在本目录。
 - `docs/superpowers/` —— spec / plan 设计文档（含私人引用，不能随 clone 泄露）。
 - `.superpowers/` —— subagent-driven 开发的 task 简报。
 - `.claude/` —— git worktree 的物理目录（`EnterWorktree` 默认落这里）。里面是**另一份完整工作树**，误 `git add .claude/` 会把整个仓库副本连同其 `.full-review/`、`.superpowers/` 一起提交进来。
@@ -125,7 +127,21 @@ python -m pytest packaging/
 
 **发布前一次跑完全部门禁**（DO-M1）：`python packaging/run_gates.py` 串起上面四个 pytest 根 + 脱敏闸门 + 推送守卫安装态 + commit message 脱敏，共 7 项，逐项报、有一项红则整体红（`--list` 只列不跑）。各 gate 的 cwd 必须不同——三个 skill 根的导入约定不兼容，共用 rootdir 会 import 失败，这正是它们容易被漏跑的原因。
 
-已实测（2026-08-26 更新，`--collect-only` 口径）：`tests/` **49**、vault-loader **578**、summarize-session **300**、packaging **32** 个用例可正常收集。
+已实测（2026-08-29，双运行时改造 + 四维评审整改后，Windows 本机，`--color=no -p no:cacheprovider`）：
+`tests/` **106 passed / 1 skipped**、vault-loader **596 passed / 2 skipped**、
+summarize-session **293 passed / 2 skipped / 10 failed**、packaging **32 passed / 1 skipped**。
+`python packaging/run_gates.py` 的 8 项门禁 7 项 PASS，唯一 FAIL 即 summarize-session 那 10 条。
+
+那 10 条失败**全部**在 `tests/test_obsidian_cli.py`，逐条核对报错原文后确认同一根因：本机未装
+obsidian-cli（4 条直接 `FileNotFoundError [WinError 2]`，5 条是 `cli-not-found`/`cli-list-missing`
+之类的返回值差异，1 条是上游返回 None 导致的 `TypeError`）；且该文件与 `obsidian_cli.py`
+本轮 `git status` 均为空。**判定「环境性」必须逐条拿到该条自己的报错原文**——按文件名整批
+归类曾让一条真实缺陷（`test_archive_doc.py` 的硬编码日期）被贴上环境噪声标签而无人再看。
+
+> ⚠️ **上一版这行数字是不实的**：它写着三个套件全绿（`tests/` 71 passed、vault-loader 583 passed、
+> summarize-session 290 passed），而当时实测是 3 failed / 6 failed / 11 failed —— 三组全部把红报成了绿。
+> 那不是笔误，是「交付文档按 plan 预期书写完成态」：读者据此**跳过自己的验证**。
+> 凡在本文件写下测试数字，必须回到实际执行记录，不得照 plan 顺写。
 
 本轮（full-review 四维评审整改）vault-loader 553→578（+25），分五笔提交：判据下沉生成侧 +9（三消费者一致性、生成侧 floor、`scorelow_floor` 落盘、畸形 `topical` 参数化、`load_records` 字段 coerce、嵌套字段容错）；报表口径二次订正 +7（`max_notes` 三档取数、`_render_span` 两档、空库早退、两榜同源、`max_notes` 从 `build_record` 真实产出落盘）；`inj_chars` 端到端 +2；stub 覆盖守卫改剥注释 +1（含阳性对照断言）；可观测性与不变量 +6（schema 受支持集合、版本丢弃出声、`src_dist`、`_SYSTEM_PROMPT_SOURCES ⊆ _NON_HUMAN_SRC`、`annotate` 不静默、`reset_counts` 取锁）。
 
@@ -164,4 +180,4 @@ python -m pytest packaging/
 - vault-loader 对 Vault 只读；summarize-session 是唯一写入方（且只追加/新建，不删除已有笔记）。
 - git 跟踪文件中不写 Obsidian `[[...]]` wikilink（vault 是个人知识库层、不随仓库分发）。
 - 文档以中文为主；但分发内容必须通过 `build_plugin.py` 脱敏扫描（零私人标识）。
-- 分发的 SKILL.md / references 引用脚本必须用 cache-glob 定位器（各 skill 顶部「脚本路径」节的 `SS=$(ls -d ~/.claude/plugins/cache/*/<plugin>/*/skills/<skill>/scripts ...)` + `python3 "$SS/X.py"`，每个 Bash 块内联，因 Bash 工具不跨调用保留变量）；**禁用** `~/.claude/skills/.../scripts/`（插件化后源目录退役、只剩 `__pycache__`）与 `${CLAUDE_PLUGIN_ROOT}`（skill 的 Bash 上下文未注入，实测为空）。`tests/test_skill_script_paths.py` 守卫强制（扫 `skills/**/*.md`，命中退役源绝对路径或相对 `python3 scripts/` 即 fail）。
+- 分发的 SKILL.md / references 必须优先按当前加载的 `SKILL.md` 绝对路径定位同级 scripts；仅 Claude Bash 无法取得该路径时允许搜索 `~/.claude/plugins/cache/`，同时识别 `context-vault` 与旧 `claude-vault`。不得跨到 `~/.codex` 取脚本，也不得使用 `~/.claude/skills/.../scripts/` 源目录形式。skill shell 不得假设注入 `PLUGIN_ROOT`/`CLAUDE_PLUGIN_ROOT`；PowerShell/Codex 必须使用当前 skill 的绝对 scripts 路径。

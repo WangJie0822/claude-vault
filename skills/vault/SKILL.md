@@ -11,7 +11,7 @@ allowed-tools: Read, Glob, Grep, Bash(pwd), Bash(basename *)
 
 ## 主动检索时机
 
-以下场景 Claude **应主动运行 /vault** 检索，而非凭记忆或训练数据推断：
+以下场景当前编码智能体**应主动使用 vault skill** 检索，而非凭记忆或训练数据推断：
 
 - 对话涉及**历史技术决策**（如"我们当时为什么选 X 方案"、"上次怎么解决的"）
 - 对话涉及**使用偏好或约定**（如"我平时怎么处理 X"、"规范是什么"）
@@ -24,8 +24,9 @@ allowed-tools: Read, Glob, Grep, Bash(pwd), Bash(basename *)
 ## 配置
 
 知识库路径按以下优先级确定（记为 `$VAULT`）：
-1. 读取 `~/.claude/skills/summarize-session/config.json` 的 `default_vault_path` 字段
-2. 如果配置文件不存在或字段为空，回退到 `$VAULT/`
+1. 读取 `~/.context-vault/config.json` 的 `vault_path` 字段
+2. 公共配置不存在时，兼容读取 `~/.claude/skills/summarize-session/config.json::default_vault_path`
+3. 全新安装回退到 `~/.context-vault/knowledge-vault`
 
 索引文件：`$VAULT/CLAUDE.md`
 

@@ -1,0 +1,24 @@
+{
+  "name": "context-vault",
+  "version": "1.0.0",
+  "description": "Capture and recall a local knowledge vault from Claude Code and Codex.",
+  "author": {
+    "name": "context-vault contributors"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Context Vault",
+    "shortDescription": "Capture and recall local knowledge across coding agents.",
+    "longDescription": "Context Vault connects session summaries, manual vault search, and automatic context recall for Claude Code and Codex while keeping knowledge local.",
+    "developerName": "context-vault contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Search my context vault for relevant project knowledge."
+    ]
+  }
+}

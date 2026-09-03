@@ -4,6 +4,15 @@ from pathlib import Path
 
 from scripts._config_loader import DEFAULT_CONFIG
 
+try:
+    from context_vault.paths import default_vault, legacy_default_vault
+except ImportError:
+    def default_vault(home=None):
+        return (home or Path.home()) / ".context-vault" / "knowledge-vault"
+
+    def legacy_default_vault(home=None):
+        return (home or Path.home()) / ".claude" / "knowledge-vault"
+
 
 def ensure_vault(vault_path: Path) -> None:
     """无条件创建 vault 目录 + .meta/。**只应由 ensure_vault_if_default 调用**——
@@ -34,7 +43,11 @@ def ensure_vault_if_default(vault_path: Path) -> bool:
     保留的唯一写场景是零配置新装（vault_path 还是默认值、用户从未配置过），
     这既是 loader 自身的落地点、也不会踩到任何用户既有目录。
     """
-    if not _same_path(vault_path, Path(DEFAULT_CONFIG["vault_path"])):
+    # 三个候选缺一不可：`DEFAULT_CONFIG["vault_path"]` 是模块加载期求值的快照，
+    # 另两个按当前 HOME 求值；legacy 那个是 0.9.x 零配置用户的落点，漏掉它会让
+    # 这批用户的默认 Vault 不再被自动创建。
+    defaults = (Path(DEFAULT_CONFIG["vault_path"]), default_vault(), legacy_default_vault())
+    if not any(_same_path(vault_path, candidate) for candidate in defaults):
         return False
     ensure_vault(vault_path)
     return True

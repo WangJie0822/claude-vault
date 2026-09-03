@@ -95,6 +95,60 @@ def gate_keywords(prompt_keywords, config: dict) -> tuple[str, bool]:
     return "", False
 
 
+# 层 1 闸门词表（2026-09-02）：纯指代/应答型 prompt。
+# 实测这批占 5.6% 的轮次，当前 100% 靠单个通用词命中——「继续执行」经 bigram 切成
+# {执行, 续执}，`续执` 命中 0 篇、`执行` 命中数百篇，等于拿一个 df 极高的词做检索。
+# 词表刻意保守：**只收零信息的整串**，宁可漏拦不可误拦（误拦会静默丢掉一次真实召回，
+# 漏拦只是维持现状）。承重守卫见 tests/test_deictic_gate.py::test_gold_queries_never_gated。
+_DEICTIC_WORDS = frozenset({
+    "继续执行", "继续", "接着", "然后", "再来", "下一步", "开始", "执行",
+    "好的", "好", "嗯", "是的", "对", "可以", "行", "没问题", "确认", "同意",
+    "就这样", "如上", "同上", "谢谢", "收到", "明白", "知道了", "明白了",
+    "ok", "okk", "go", "next", "yes", "y", "sure", "continue", "proceed",
+    "do it", "go ahead",
+})
+
+# 只剥首尾的标点与空白。**不剥中间**——「好的，那我们改用 X」剥完中间标点会变成
+# 一个不在词表里的长串（正确），但若按 token 切分再匹配就会误判成「好的」。
+_DEICTIC_TRIM = " \t\r\n，。,.!！、~～？?；;：:…·"
+
+
+def is_deictic_only(prompt, config: dict) -> bool:
+    """prompt 是否为纯指代/应答（零实质信息）→ 调用方应静默早退，不注入。
+
+    与 `gate_keywords` 并列而非合并：本判据看 **prompt 原文**，而 gate_keywords 只拿到
+    分词后的 prompt_keywords；`decide_injection` 是纯函数、拿不到原文，改它的签名会
+    把原文一路透传进决策层，得不偿失。
+
+    **整串匹配**（去首尾标点空白后全等），不是前缀/包含匹配 ——
+    「继续执行 F1，另外发现新问题」必须放行。
+
+    fail-open：任何异常或畸形输入一律返回 False（放行），绝不因本闸门丢召回。
+    空串返回 False：那是 `too_few_keywords` 的职责，混进来会让 gate 归因失真。
+    """
+    try:
+        if not isinstance(prompt, str):
+            return False
+        rel = (config or {}).get("relevance") or {}
+        if not rel.get("deictic_gate", True):
+            return False
+        words = rel.get("deictic_words")
+        if words is None:
+            table = _DEICTIC_WORDS
+        else:
+            # 自定义词表**完全替换**默认表（不是追加）——追加语义会让「关掉某个误伤词」
+            # 这个最常见的诉求无法表达。
+            table = frozenset(
+                str(w).strip().lower() for w in words if str(w).strip()
+            )
+        s = prompt.strip().strip(_DEICTIC_TRIM).strip().lower()
+        if not s:
+            return False
+        return s in table
+    except Exception:
+        return False
+
+
 def _hit_keywords(entry: Entry, prompt_keywords) -> list[str]:
     """命中该 entry 的 tag/summary/keywords 的 prompt 关键词，保序去重。
     与精度闸门 topical 口径一致（不含 path）——path 命中不计入话题相关性，

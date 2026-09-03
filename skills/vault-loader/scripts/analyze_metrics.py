@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts import _metrics
+from scripts._entrypoint import INTERACTIVE_ENTRYPOINTS
 from scripts._output import INJECTION_NOTICE, sanitize_injected_text
 
 
@@ -99,7 +100,7 @@ def load_records(home: Path) -> Iterator[dict]:
 #
 # 改成受支持集合 + 计数报出之后：今天行为完全不变（集合只有 {1}），
 # 但 bump 时只需往集合里加一个版本号，历史记录不再静默消失。
-SUPPORTED_SCHEMAS = frozenset({1})
+SUPPORTED_SCHEMAS = frozenset({1, 2})
 
 
 # 顶层数值字段。值非数值时**删键**而不是置 0：下游用 `"inj_chars" in r` 判存在，
@@ -145,7 +146,9 @@ class _Acc:
     """
     __slots__ = ("arm", "gate", "near", "near_dedup", "suppressed",
                  "max_notes_seen", "src_dist", "n", "n_ok", "n_admitted",
-                 "ft", "n_legacy_near", "inj_chars", "inj_n")
+                 "ft", "n_legacy_near", "inj_chars", "inj_n",
+                 "dedup_full", "n_dedup_full", "n_dedup_legacy",
+                 "n_pre_epoch", "ft_by_threshold", "ss_n", "ss_inj_chars")
 
     def __init__(self) -> None:
         self.arm: Counter = Counter()
@@ -157,6 +160,14 @@ class _Acc:
         self.src_dist: Counter = Counter()
         self.n = self.n_ok = self.n_admitted = self.ft = 0
         self.n_legacy_near = self.inj_chars = self.inj_n = 0
+        # 全量成因计数（新记录）与被截断窗口口径（旧记录）严格分开：混算既不是
+        # 全量也不是窗口，而两者的 dedup 占比实测差一个数量级以上。
+        self.dedup_full: Counter = Counter()
+        self.n_dedup_full = self.n_dedup_legacy = self.n_pre_epoch = 0
+        self.ft_by_threshold: dict = {}
+        # SessionStart 通道单独计，绝不并入 UPS 的任何指标（见
+        # _metrics.build_session_start_record 的隔离说明）。
+        self.ss_n = self.ss_inj_chars = 0
 
 
 def _acc_gate_and_admitted(r: dict, a: _Acc) -> None:
@@ -227,6 +238,18 @@ def _acc_near_miss(r: dict, a: _Acc) -> None:
     # 于是 NUDGE_TOPICAL_FLOOR 在榜单上完全失效——topical=0 的笔记照样进榜，
     # 而榜首表头写的正是「调 tags/keywords 可能救回来」。同一个抽象被声明为
     # 「三个消费者的单点」却只有 1/3 在用，这是本轮 High finding 的成因。
+    # 全量成因计数优先：`near_miss` 是按 topical 降序取 top-k 的截断样本
+    # （实测采样率 1.38%、100% 的轮次都在截断），而 dedup 条目 topical 天然更高，
+    # 于是窗口内 dedup 占比 45% vs 真实量级约 1%。有 dedup_counts 就用它。
+    dc = r.get("dedup_counts")
+    if isinstance(dc, dict):
+        a.n_dedup_full += 1
+        for _k, _v in dc.items():
+            if isinstance(_v, int) and not isinstance(_v, bool) and isinstance(_k, str):
+                a.dedup_full[_k] += _v      # 原样保留写端 key，标签映射在渲染层
+    elif r.get("near_miss"):
+        a.n_dedup_legacy += 1
+
     is_new = isinstance(r.get("near_miss_scorelow"), list)
     if is_new:
         for p, _t in _metrics.scorelow_entries(r):
@@ -255,9 +278,38 @@ def _acc_near_miss(r: dict, a: _Acc) -> None:
             a.suppressed[nm["path"]] += 1
 
 
+def _acc_epoch_and_threshold(r: dict, a: _Acc) -> None:
+    """埋点时代切分 + 全文注入率按阈值制度分组。
+
+    **时代判据**：有 `src` 键（走到打分的新记录）或 gate 非空（被拦的新记录）。
+    gate 埋点上线之前，被闸门拦下的轮次**一条都不落盘**，把那段时期的记录计入
+    分母会系统性抬高「走到打分」的占比（真实语料实测 +6.5 个百分点）。不能只判
+    `"src" in r`——被拦的新记录只写 5 个键、不含 src。
+    实测该组合判据在 1625 条真实记录上仅 2 条边界模糊（0.15%，0.9.0 部署过渡期）。
+
+    **阈值分组**：`fulltext_topical_threshold` 在样本期内由 6 改成 10，两期实测
+    全文注入率 65.4% vs 40.1%，而合并值 45.9% 不描述任何一个时期。
+    """
+    if not (("src" in r) or r.get("gate")):
+        a.n_pre_epoch += 1
+    if r.get("gate"):
+        return                      # 被拦的轮次不参与全文注入率
+    ftt = r.get("ft_topical")
+    key = f"{float(ftt)}" if isinstance(ftt, (int, float)) and not isinstance(
+        ftt, bool) else "(未记录)"
+    slot = a.ft_by_threshold.setdefault(key, [0, 0])
+    slot[0] += 1
+    if isinstance(r.get("ft"), dict) and r["ft"].get("path"):
+        slot[1] += 1
+
+
 def _acc_to_dict(a: _Acc) -> dict:
     return {
         "n_events": a.n, "n_ok": a.n_ok, "n_admitted": a.n_admitted,
+        "ss_n": a.ss_n, "ss_inj_chars": a.ss_inj_chars,
+        "dedup_full": dict(a.dedup_full), "n_dedup_full": a.n_dedup_full,
+        "n_dedup_legacy": a.n_dedup_legacy, "n_pre_epoch": a.n_pre_epoch,
+        "ft_by_threshold": a.ft_by_threshold,
         "arm_dist": dict(a.arm), "gate_dist": dict(a.gate),
         # 分母收敛到 gate=="ok"：闸门早退的轮次压根没走到全文判定，把它们计进
         # 分母会稀释出一个既不是「注入率」也不是「命中率」的数（实测 36.2% vs 48.7%）。
@@ -285,10 +337,20 @@ def summarize(records: Iterable[dict]) -> dict:
     """
     a = _Acc()
     for r in records:        # 单趟、不物化：records 是生成器（P3 修复的硬约束）
+        if r.get("channel") == "session_start":
+            # 另一条通道：只累加它自己的两个数，**不进** UPS 的任何统计。
+            # 缺 channel 键的旧记录落到下面，按 UPS 处理（向后兼容）。
+            a.ss_n += 1
+            try:
+                a.ss_inj_chars += int(r.get("inj_chars") or 0)
+            except (TypeError, ValueError):
+                pass
+            continue
         a.n += 1
         _acc_gate_and_admitted(r, a)
         _acc_cost(r, a)
         _acc_near_miss(r, a)
+        _acc_epoch_and_threshold(r, a)
     return _acc_to_dict(a)
 
 
@@ -367,7 +429,12 @@ def render_report(s: dict, show_paths: bool = False) -> str:
         # 不标注的话读者会把这个数当成 vault-loader 的注入开销总量。
         lines.append(f"UPS 注入正文 {inj_total:,} 字符 / {inj_n} 轮 "
                      f"= 均 {inj_total / inj_n:.0f} 字符每轮"
-                     f"（不含 SessionStart 通道，它不落 metrics）")
+                     + ("" if s.get("ss_n") else
+                        "（不含 SessionStart 通道，它不落 metrics）"))
+    if s.get("ss_n"):
+        _ss_avg = s["ss_inj_chars"] / s["ss_n"] if s["ss_n"] else 0
+        lines.append(f"SessionStart 注入 {s['ss_inj_chars']:,} 字符 / "
+                     f"{s['ss_n']} 次会话 = 均 {_ss_avg:,.0f} 字符每次")
     else:
         lines.append("UPS 注入正文字符数: 无数据（该字段自 0.9.1 起记录，旧记录没有）")
     # 来源分布：黑名单判据的自观测出口。`_is_human_src` 默认放行，所以「harness 开始
@@ -377,12 +444,42 @@ def render_report(s: dict, show_paths: bool = False) -> str:
     if src_dist and set(src_dist) != {"(空)"}:
         lines.append(f"来源分布: {src_dist}"
                      f"（非 {list(_NON_HUMAN_SRC)} 的值都会进 --review 的人类标注池）")
+    _n_full, _n_leg = s.get("n_dedup_full", 0), s.get("n_dedup_legacy", 0)
+    if _n_full:
+        _cov = _n_full / (_n_full + _n_leg) * 100 if (_n_full + _n_leg) else 100.0
+        lines.append("")
+        _shown = {("打分不够" if not _k else _k): _v
+                  for _k, _v in (s.get("dedup_full") or {}).items()}
+        lines.append(f"excluded 成因分布（全量口径，覆盖 {_n_full}/{_n_full + _n_leg} "
+                     f"= {_cov:.1f}% 的记录）: {_shown}")
+        if _n_leg:
+            lines.append(f"  ⚠️ 另有 {_n_leg} 条旧记录只有被截断的 top-k 窗口样本，"
+                         f"其 dedup 占比会被结构性放大，未并入上行")
+    _ftt = s.get("ft_by_threshold") or {}
+    if len(_ftt) > 1:
+        lines.append("")
+        lines.append("全文注入率按阈值分期（合并值跨制度、不描述任何一个时期）:")
+        for _k in sorted(_ftt, key=lambda x: (x == "(未记录)", x)):
+            _rounds, _n = _ftt[_k]
+            _pct = _n / _rounds * 100 if _rounds else 0.0
+            lines.append(f"    阈值 {_k}: {_n}/{_rounds} = {_pct:.1f}%")
     lines += ["", f"闸门分布: {s['gate_dist']}", f"入选臂分布: {s['arm_dist']}",
               # 成因分布是**全量口径**（含旧记录），与下面两榜的总体不同 —— 不标注的话
               # 读者会把三组数当成同一批样本的切分。且其「打分不够」桶正是本轮论证为
               # 「有系统性偏斜」的那批残差（旧记录的 near_miss 样本被去重条目挤占）。
-              f"near-miss 成因分布（全部 {s['n_events']} 条记录，口径与下方两榜不同）: "
-              f"{s.get('near_miss_dedup_dist', {})}", ""]
+              f"near-miss 成因分布（**被截断的 top-k 窗口口径**，非全量 excluded；"
+              f"共 {sum((s.get('near_miss_dedup_dist') or {}).values())} 个条目）: "
+              f"{s.get('near_miss_dedup_dist', {})}",
+              "  ⚠️ 该窗口按 topical 降序取样，而去重条目的 topical 天然更高"
+              "（不看分就被排除），故其中 dedup 类占比被结构性放大"
+              + ("；真实占比以上方「全量口径」行为准"
+                 if s.get("n_dedup_full") else
+                 "；当前全部记录都是旧格式，没有可用的全量口径数据"),
+              ""]
+    if s.get("n_pre_epoch"):
+        lines += [f"⚠️ {s['n_pre_epoch']} 条记录（共 {s['n_events']} 条）产自 gate 埋点前，"
+                  f"那时被闸门拦下的轮次一条都不落盘 —— 上面「走到打分」的占比因此被"
+                  f"系统性抬高，按同时代口径重算才可比", ""]
 
     legacy = s.get("n_legacy_near_records", 0)
     lines.append("near-miss · 真·擦肩（够不着精度闸门，调 tags/keywords 可能救回来）:")
@@ -399,7 +496,16 @@ def render_report(s: dict, show_paths: bool = False) -> str:
         lines.append("")
         # 两榜同源（都只统计新格式记录），才当得起「对照」二字 —— 见 summarize 里
         # suppressed 的 `is_new` 条件。
+        #
+        # ⚠️ 但「同源」只保证了**记录集**相同，不保证**采样窗口**相同，而两栏的
+        # `N 次` 正是从两个饱和度截然不同的窗口里数出来的（真实语料实测：
+        # near_miss 窗口 314/314 = 100% 恒满，near_miss_scorelow 仅 33/314 = 11%）。
+        # 于是本榜的 N 实际含义是「该笔记在多少轮里挤进了 top-k 窗口」——被窗口
+        # 硬性截断的下界；而上榜的 N 才接近真实出现次数。两个量纲不同的数并排
+        # 渲染成同一种「N 次」，读者会直接比大小。
         lines.append("对照 · 被去重抑制（其实已经成功召回过，**不是**漏召回）:")
+        lines.append("  ⚠️ 本栏 N 是「挤进 top-k 窗口的轮次数」，受窗口截断影响、是下界；"
+                     "与上一栏的 N 量纲不同，两栏不可直接比大小")
         for p, c in sup:
             lines.append(f"  {c:>4} 次  {_shown_path(p, show_paths)}")
     if not show_paths and (s.get("near_miss_top") or sup):
@@ -523,8 +629,466 @@ def sample_admitted_events(records: Iterable[dict], path: str, kind: str,
     return out
 
 
+REPLACEMENT_CHAR = "\ufffd"
+
+
+def sample_events_with_hits(records: Iterable[dict], path: str, kind: str,
+                            limit: int = 12) -> list[tuple[str, str, list[str]]]:
+    """同 `sample_admitted_events`，但附带该笔记当轮的命中词。
+
+    **limit 默认给得比展示条数大**：`pick_readable_contexts` 要在其中筛可读的，
+    而实测约 45.7% 的上下文行不可读（33.3% 乱码 + 12.4% 回查不到），候选池按 3
+    取会经常挑不满。
+
+    `hits` 只在 `admitted` 数组里有真实值——`_decision` 对 excluded 条目的
+    hits 是**未计算的占位值** `[]`（性能护栏），所以 near_miss 一律返回空列表，
+    不假装有。
+    """
+    out: list[tuple[str, str, list[str]]] = []
+    for r in records:
+        ph, s = r.get("prompt_h"), r.get("session")
+        if not (isinstance(ph, str) and ph and isinstance(s, str) and s):
+            continue
+        if kind == "admitted_fulltext":
+            hit = (r.get("ft") or {}).get("path") == path
+        elif kind == "admitted_list":
+            hit = any(isinstance(a, dict) and a.get("path") == path
+                      for a in (r.get("admitted") or []))
+        else:
+            hit = any(isinstance(nm, dict) and nm.get("path") == path
+                      for nm in (r.get("near_miss_scorelow") or []))
+        if not hit:
+            continue
+        hits: list[str] = []
+        for a in (r.get("admitted") or []):
+            if isinstance(a, dict) and a.get("path") == path:
+                h = a.get("hits")
+                if isinstance(h, list):
+                    hits = [x for x in h if isinstance(x, str)]
+                break
+        out.append((s, ph, hits))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def pick_readable_contexts(events, resolve, want: int = 3):
+    """从候选事件里挑出**可读**的前 want 条，并分类统计不可读的成因。
+
+    `resolve(session, prompt_h) -> str` 由调用方注入（生产传 `lookup_prompt`），
+    使本函数保持可测的纯逻辑。
+
+    两类不可读必须分开计数——它们的成因与可处置性完全不同，而此前被同一句
+    「（transcript 里找不到，可能已被清理）」一并解释掉了：
+    - `corrupt`：transcript 里存的就是 U+FFFD，写入方在存盘前已解码坏，不可逆；
+    - `unresolved`：hash 对不上。实测 50 条里 48 条 transcript 就在盘上，
+      真实原因是 hook 拿到原始 prompt、transcript 存的是 slash/skill 展开后的形态。
+
+    凑够 want 条即停：每条都要回查一次 transcript，不能白扫。
+
+    第三个返回值 `picked` 是**被选中那几条**的 `(session, prompt_h)`，与 `items`
+    一一对应、顺序一致，供 `save_annotation` 落盘 —— 标注若不带 query 关联，
+    就算不出任何排序指标（实测：已有 74 条标注正因缺这个而无法用作 ground truth）。
+    只交出标识符、不交出原文：原文按需回查，落盘一份就等于作废「prompt 原文不落盘」契约。
+    """
+    items: list[tuple[str, list[str]]] = []
+    picked: list[tuple[str, str]] = []
+    reasons = {"corrupt": 0, "unresolved": 0}
+    for s, ph, hits in events:
+        if len(items) >= want:
+            break
+        text = resolve(s, ph)
+        if not text:
+            reasons["unresolved"] += 1
+        elif REPLACEMENT_CHAR in text:
+            reasons["corrupt"] += 1
+        else:
+            items.append((" ".join(text.split())[:160], hits))
+            picked.append((s, ph))
+    return items, reasons, picked
+
+
+def format_context_lines(items, reasons) -> list[str]:
+    """渲染标注上下文块。归因必须如实分类，见 `pick_readable_contexts`。"""
+    lines: list[str] = []
+    if items:
+        lines.append("  ── 该笔记被召回时，你问的是 ──")
+        for i, (text, hits) in enumerate(items, 1):
+            lines.append(f"   {i}. {sanitize_injected_text(text, keep_newlines=False)}")
+            if hits:
+                # 命中词是「这篇为什么被召回」的直接答案，且早已明文落盘——
+                # 在此之前 analyze_metrics 对它的引用数是 0，隐私代价白付了。
+                shown = "、".join(sanitize_injected_text(h, keep_newlines=False)
+                                  for h in hits[:8])
+                lines.append(f"      命中词：{shown}")
+    n_c = reasons.get("corrupt", 0)
+    n_u = reasons.get("unresolved", 0)
+    if n_c:
+        lines.append(f"  ⚠️ 另有 {n_c} 轮的提问在写入 transcript 时就已编码损坏"
+                     f"（含替换字符），原文不可恢复")
+    if n_u:
+        lines.append(f"  ⚠️ 另有 {n_u} 轮回查不到：hook 收到的是你敲的原文，而 "
+                     f"transcript 存的是 slash command / skill 展开后的形态，"
+                     f"两者 hash 对不上（**不是**历史被清掉了）")
+    if not items and not (n_c or n_u):
+        lines.append("  ── 无提问上下文（该条目写于 prompt_h 落盘之前）──")
+    return lines
+
+
+def session_entrypoint(session: str, tindex: dict) -> str:
+    """按 session 从 transcript 取 entrypoint。取不到返回 ""。"""
+    p = tindex.get(session)
+    if p is None:
+        return ""
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 200:
+                    return ""
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict) and rec.get("type") == "user":
+                    ep = rec.get("entrypoint")
+                    return ep if isinstance(ep, str) else ""
+    except OSError:
+        return ""
+    return ""
+
+
+def human_records(records: Iterable[dict], tindex: dict) -> Iterator[dict]:
+    """只放行人类交互会话的记录，供 `--review` 的抽样使用。
+
+    **为什么写端闸门不够**：`_entrypoint.is_supported_session()` 只挡新产生的记录，
+    而标注池吃的是历史语料 —— 实测 1103 个打分轮次里 35.3% 产自 `claude -p` 一类的
+    程序化调用。用户实测反馈标注界面混进了不是他敲的内容（「先用 Bash 工具运行
+    echo MODEL=…」），取证确认那条来自 `entrypoint='sdk-cli'` 的会话。拿派发指令去问
+    「这篇该不该被召回」毫无意义，而人工标注不可再生。
+
+    **未知来源一律保留**，与写端闸门同向：宁可漏禁，不可误删。误删一条人类样本的
+    代价高于混进一条程序化样本，而 transcript 可达率实测 98.9%。
+
+    判据常量从 `_entrypoint` 导入而非内联 —— 两处判据漂移是本仓库反复吃过亏的形态。
+    """
+    cache: dict[str, str] = {}
+    for r in records:
+        s = r.get("session")
+        if not isinstance(s, str) or not s:
+            yield r
+            continue
+        if s not in cache:
+            cache[s] = session_entrypoint(s, tindex)
+        ep = cache[s]
+        if ep and ep not in INTERACTIVE_ENTRYPOINTS:
+            continue
+        yield r
+
+
+def attach_contexts(items, records_factory, resolve, want: int = 3):
+    """给每个待标注条目附上可读的提问上下文；**一条都读不出来的直接剔除**。
+
+    用户实测反馈：标注界面里出现「无提问上下文」的条目，只能盲标 unsure。这类
+    条目对精度评估零贡献，却占满标注池的名额——而人工标注是这套机制里唯一不可
+    再生的数据，名额该让给能判断的条目。
+
+    `records_factory` 必须是**可重复调用**的工厂：`load_records` 是生成器、只能
+    迭代一次，每个条目都要重新扫一遍（刻意不物化，那会重演已修的 574MB 峰值）。
+
+    预取还顺带消掉一次重复扫描：此前 `--review` 构造 todo 时扫一遍、显示上下文时
+    又扫一遍。
+    """
+    out = []
+    for it in items:
+        events = sample_events_with_hits(records_factory(), it["path"],
+                                         it.get("kind", "near_miss"))
+        ctxs, reasons, picked = pick_readable_contexts(events, resolve, want=want)
+        if not ctxs:
+            continue
+        enriched = dict(it)
+        enriched["contexts"] = ctxs
+        enriched["unreadable"] = reasons
+        # 标注落盘用：只带标识符，原文留在 contexts 里供展示、不落盘
+        enriched["context_ids"] = picked
+        out.append(enriched)
+    return out
+
+
 def annotations_path(home: Path) -> Path:
     return _metrics.metrics_dir(home) / "annotations.jsonl"
+
+
+REVIEW_CSS = """
+:root{--bg:#fbfbfa;--fg:#23221f;--mut:#6b6862;--line:#e3e0da;--card:#fff;
+--ok:#2f7d5b;--no:#b4453a;--un:#8a7a3d;--acc:#3a5c9e}
+@media(prefers-color-scheme:dark){:root:not([data-t=l]){--bg:#1a1a19;--fg:#e8e6e1;
+--mut:#9b968d;--line:#33322e;--card:#232320;--ok:#5cb98d;--no:#e08076;--un:#c4ae63;
+--acc:#7ba0dd}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.6 -apple-system,"Segoe UI",system-ui,sans-serif}
+.wrap{max-width:920px;margin:0 auto;padding:24px 16px 96px}
+h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);margin:0 0 20px}
+.bar{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);
+padding:10px 0;margin-bottom:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.bar button{font:inherit;padding:5px 10px;border:1px solid var(--line);border-radius:6px;
+background:var(--card);color:var(--fg);cursor:pointer}
+.bar button:hover{border-color:var(--acc)}
+.prog{margin-left:auto;color:var(--mut);font-variant-numeric:tabular-nums}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:14px 16px;margin-bottom:12px}
+.card.done{border-color:var(--acc)}
+.path{font-weight:600;word-break:break-all}
+.meta{color:var(--mut);font-size:12px;margin:2px 0 10px}
+.tag{display:inline-block;padding:1px 7px;border:1px solid var(--line);border-radius:99px;
+font-size:11px;margin-right:6px}
+.ctx{border-left:2px solid var(--line);padding:2px 0 2px 10px;margin:8px 0}
+.ctx p{margin:0 0 2px;word-break:break-word}
+.hits{color:var(--mut);font-size:12px}
+.hits b{color:var(--acc);font-weight:600}
+.warn{color:var(--un);font-size:12px;margin-top:6px}
+.opts{display:flex;gap:6px;margin-top:12px;flex-wrap:wrap}
+.opts label{padding:5px 12px;border:1px solid var(--line);border-radius:6px;cursor:pointer;
+font-size:13px;user-select:none}
+.opts input{margin-right:5px}
+.opts input:checked+span{font-weight:600}
+.opts label:has(input[value=relevant]:checked){border-color:var(--ok);color:var(--ok)}
+.opts label:has(input[value=irrelevant]:checked){border-color:var(--no);color:var(--no)}
+.opts label:has(input[value=unsure]:checked){border-color:var(--un);color:var(--un)}
+.foot{position:fixed;left:0;right:0;bottom:0;background:var(--card);
+border-top:1px solid var(--line);padding:12px 16px;display:flex;justify-content:center;gap:12px}
+.foot button{font:inherit;font-weight:600;padding:9px 22px;border-radius:8px;
+border:1px solid var(--acc);background:var(--acc);color:#fff;cursor:pointer}
+.note{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--mut);
+border-radius:6px;padding:10px 14px;margin-bottom:18px;color:var(--mut);font-size:13px}
+"""
+
+
+def _esc(s) -> str:
+    import html as _h
+    return _h.escape("" if s is None else str(s), quote=True)
+
+
+def build_review_html(items) -> str:
+    """渲染标注页面。**所有外部内容都必须转义**。
+
+    页面嵌入两类不可信内容：笔记路径（来自 Vault）与提问原文（来自 transcript）。
+    二者都可能含 HTML 元字符，不转义就是注入面。内嵌 JSON 另外要把 `</` 打断，
+    否则 `</script>` 会提前闭合标签、后面的内容被当 HTML 解析。
+
+    表单本身零 JS 依赖（普通 POST）；JS 只做批量设置与进度显示，禁用了也能提交。
+    """
+    import json as _json
+
+    cards = []
+    for i, it in enumerate(items):
+        ctx_html = []
+        for text, hits in it.get("contexts") or []:
+            hit_html = ""
+            if hits:
+                hit_html = ('<div class="hits">命中词：'
+                            + "、".join(f"<b>{_esc(h)}</b>" for h in hits[:8])
+                            + "</div>")
+            ctx_html.append(f'<div class="ctx"><p>{_esc(text)}</p>{hit_html}</div>')
+        un = it.get("unreadable") or {}
+        warn = ""
+        bits = []
+        if un.get("corrupt"):
+            bits.append(f"{un['corrupt']} 轮的提问在写入 transcript 时已编码损坏")
+        if un.get("unresolved"):
+            bits.append(f"{un['unresolved']} 轮回查不到（slash/skill 展开后 hash 对不上）")
+        if bits:
+            warn = f'<div class="warn">⚠️ 另有 {"；".join(_esc(b) for b in bits)}</div>'
+        opts = "".join(
+            f'<label><input type="radio" name="v{i}" value="{v}">'
+            f'<span>{lbl}</span></label>'
+            for v, lbl in (("relevant", "相关"), ("irrelevant", "不相关"),
+                           ("unsure", "不确定")))
+        cards.append(f"""<div class="card" data-i="{i}">
+<div class="path">{_esc(it.get("path"))}</div>
+<div class="meta"><span class="tag">{_esc(it.get("kind"))}</span>
+被召回 {int(it.get("count") or 0)} 次 · topical≤{float(it.get("topical_max") or 0):.1f}</div>
+{"".join(ctx_html)}{warn}
+<input type="hidden" name="p{i}" value="{_esc(it.get("path"))}">
+<input type="hidden" name="k{i}" value="{_esc(it.get("kind"))}">
+<div class="opts">{opts}</div></div>""")
+
+    payload = _json.dumps([{"path": it.get("path"), "kind": it.get("kind")}
+                           for it in items], ensure_ascii=False).replace("</", "<\\/")
+    return f"""<!doctype html><html lang="zh"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vault-loader 标注</title><style>{REVIEW_CSS}</style>
+<script id="d" type="application/json">{payload}</script>
+<div class="wrap"><h1>召回质量标注</h1>
+<p class="sub">共 {len(items)} 条。勾选后点底部「提交」一次写入，可随时回改。</p>
+<div class="note">「相关」= 这篇当时确实该被召回；「不相关」= 不该召回，属于误召；
+「不确定」= 看了提问也判断不了。已标注过的条目不会再出现。</div>
+<form method="post" action="/submit" id="f">
+<div class="bar">
+<button type="button" onclick="setAll('relevant')">全标相关</button>
+<button type="button" onclick="setAll('irrelevant')">全标不相关</button>
+<button type="button" onclick="setAll('')">清空</button>
+<span class="prog" id="pg"></span></div>
+{"".join(cards)}
+<div class="foot"><button type="submit">提交</button></div></form></div>
+<script>
+const f=document.getElementById('f');
+function setAll(v){{f.querySelectorAll('input[type=radio]').forEach(r=>{{
+r.checked = v ? r.value===v : false;}});upd();}}
+function upd(){{const n=document.querySelectorAll('.card').length;let d=0;
+document.querySelectorAll('.card').forEach(c=>{{const on=c.querySelector('input:checked');
+c.classList.toggle('done',!!on);if(on)d++;}});
+document.getElementById('pg').textContent=`已标 ${{d}} / ${{n}}`;}}
+f.addEventListener('change',upd);upd();
+</script></html>"""
+
+
+def apply_web_annotations(home: Path, payload, *, items=None) -> tuple[int, list[str]]:
+    """把网页提交的标注写入 annotations.jsonl。返回 (保存条数, 错误列表)。
+
+    **请求体来自浏览器，一律不可信**：verdict / kind 都必须对着白名单校验，
+    非法值拒绝且不写入——`save_annotation` 自己也会 raise，但那会让整批中断，
+    而这里要的是「坏条目跳过、好条目照存」。
+
+    `context_ids` 同理**只从服务端自己的 `items` 里按 (path, kind) 查**，
+    请求体里带的一概忽略：采信它等于让任何能访问该端口的人往这份不可再生的
+    标注数据里写任意 session/prompt_h。按 (path, kind) 而非裸 path 配对，
+    是因为同一篇笔记的两种 kind 本就是两个独立判断（见 `load_annotations`）。
+    """
+    id_map: dict[tuple, object] = {}
+    for it in (items or []):
+        if isinstance(it, dict):
+            id_map[(it.get("path"), it.get("kind"))] = it.get("context_ids")
+    saved, errs = 0, []
+    for i, row in enumerate(payload or []):
+        if not isinstance(row, dict):
+            errs.append(f"#{i}: 不是对象")
+            continue
+        path, kind = row.get("path"), row.get("kind")
+        verdict = row.get("verdict") or ""
+        if not isinstance(path, str) or not path:
+            errs.append(f"#{i}: path 非法")
+            continue
+        if not verdict:
+            continue                       # 没勾选：跳过，不算错误
+        if verdict not in VERDICTS:
+            errs.append(f"#{i}: verdict 非法 {verdict!r}")
+            continue
+        if kind not in KINDS:
+            errs.append(f"#{i}: kind 非法 {kind!r}")
+            continue
+        try:
+            save_annotation(home, path, verdict, kind=kind,
+                            context_ids=id_map.get((path, kind)))
+            saved += 1
+        except Exception as exc:           # noqa: BLE001
+            errs.append(f"#{i}: 写入失败 {exc}")
+    return saved, errs
+
+
+def serve_review(home: Path, items, port: int = 0,
+                 open_browser: bool = True) -> int:
+    """起本地标注服务，提交后写盘并退出。只绑 127.0.0.1。
+
+    绑定地址不可配：这个服务读写的是本机的标注数据，没有任何鉴权，暴露到
+    0.0.0.0 等于把它交给同网段任何人。端口默认 0（由系统分配），避开占用。
+    """
+    import threading
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs
+
+    html = build_review_html(items)
+    result = {"saved": 0, "errs": []}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):         # 不往 stderr 刷访问日志
+            pass
+
+        def _send(self, body: str, code: int = 200):
+            data = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path not in ("/", "/index.html"):
+                self._send("<h1>404</h1>", 404)
+                return
+            self._send(html)
+
+        def do_POST(self):
+            if self.path != "/submit":
+                self._send("<h1>404</h1>", 404)
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            form = parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+            rows = []
+            for i in range(len(items)):
+                rows.append({"path": (form.get(f"p{i}") or [""])[0],
+                             "kind": (form.get(f"k{i}") or [""])[0],
+                             "verdict": (form.get(f"v{i}") or [""])[0]})
+            # items 传服务端自己的那份：rows 里的 path/kind 来自表单、可被改动，
+            # 查不到对应条目时 apply_web_annotations 会不落标识符而非编一个。
+            saved, errs = apply_web_annotations(home, rows, items=items)
+            result["saved"], result["errs"] = saved, errs
+            msg = f"<h1>已保存 {saved} 条</h1>"
+            if errs:
+                msg += "<p>以下条目被拒绝：</p><ul>" + "".join(
+                    f"<li>{_esc(e)}</li>" for e in errs) + "</ul>"
+            self._send(f'<!doctype html><meta charset="utf-8">'
+                       f'<style>{REVIEW_CSS}</style><div class="wrap">{msg}'
+                       f'<p class="sub">可以关闭本页了。</p></div>')
+            threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    print(f"标注页已就绪：{url}")
+    print("（在浏览器里勾选后点「提交」；提交后本服务自动退出）")
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:                  # noqa: BLE001
+            pass
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已取消，未写入任何标注")
+        return 1
+    finally:
+        srv.server_close()
+    if result["errs"]:
+        print(f"已保存 {result['saved']} 条；{len(result['errs'])} 条被拒绝")
+        return 1
+    print(f"已保存 {result['saved']} 条标注")
+    return 0
+
+
+def collect_review_items(home: Path, tindex: dict, salt: bytes):
+    """构造待标注条目（已剔除程序化来源与零可读上下文的），命令行版与网页版共用。
+
+    抽成函数是因为两个入口的准备逻辑必须**逐字相同** —— 只要有一处漏了
+    `human_records` 或 `attach_contexts`，那个入口的标注池就会重新混进程序化
+    记录或盲条目，而人工标注不可再生。
+    """
+    done = load_annotations(home)
+    todo = [x for x in sample_near_miss(human_records(load_records(home), tindex))
+            if ("near_miss", x["path"]) not in done]
+    for x in todo:
+        x["kind"] = "near_miss"
+    # 第二趟：精度侧。两类各自 k 条上限、不合并计数。
+    # load_records 是生成器、只能迭代一次，所以这里**刻意**再扫一遍文件——
+    # 用 IO 换内存，绝不改成一趟物化（会重演 574MB 峰值那个已修的回归）。
+    todo += [x for x in sample_admitted(human_records(load_records(home), tindex))
+             if (x["kind"], x["path"]) not in done]
+    # 预取上下文：一条都读不出来的条目直接剔除（盲标只会产出 unsure）
+    return attach_contexts(
+        todo, lambda: human_records(load_records(home), tindex),
+        lambda _s, _ph: lookup_prompt(home, _s, _ph, salt, tindex))
 
 
 def sample_near_miss(records: Iterable[dict], k: int = 20) -> list[dict]:
@@ -636,12 +1200,56 @@ def sample_admitted(records: Iterable[dict], k: int = 20) -> list[dict]:
                 continue
             _bump("admitted_list", a.get("path") or "", a.get("topical") or 0)
             shown += 1
-    return sorted(agg.values(),
-                  key=lambda x: (-x["count"], -x["topical_max"]))[:k]
+    ranked = sorted(agg.values(),
+                    key=lambda x: (-x["count"], -x["topical_max"]))
+    return _apply_kind_quota(ranked, k)
+
+
+def _apply_kind_quota(ranked: list[dict], k: int) -> list[dict]:
+    """按 kind 分配额取样，两侧互相回填。`ranked` 须已按优先级降序。
+
+    **为什么不能用全局 top-k**：清单侧每轮贡献 max_notes-1 条、全文侧每轮至多 1
+    条，于是清单侧的 count 系统性更高。本机实测（0.9.1 后 283 轮）清单侧 497 个
+    条目、count 最大 74，全文侧 209 个条目、count 最大 17，而全局 top20 的门槛是
+    22 —— 全文侧一条都进不去，admitted_fulltext 的人工标注恒为 0。0.9.0 分出这个
+    kind 的理由是「代价差一个量级……混成一类之后就分不出是哪边错了」，分了 kind
+    却不分配额，那个理由就没有兑现。
+
+    **互相回填**：某一侧不足配额时另一侧补满，否则数据少时池子会平白缩水 ——
+    抽样池本就只有 k 条，而人工标注不可再生。
+
+    全文优先排前：标注者中途停手时，先标到的是代价最大的那一类（单篇上限 8192
+    字节，占 42% 的轮次）。
+    """
+    fts = [x for x in ranked if x["kind"] == "admitted_fulltext"]
+    lists = [x for x in ranked if x["kind"] != "admitted_fulltext"]
+    n_ft = min(len(fts), k // 2)
+    n_list = min(len(lists), k - n_ft)
+    n_ft = min(len(fts), k - n_list)        # 清单侧不足时，全文侧回填
+    return fts[:n_ft] + lists[:n_list]
+
+
+def _normalize_context_ids(raw) -> list[dict]:
+    """把 `[(session, prompt_h), ...]` 归一成可落盘的 dict 列表。
+
+    畸形输入一律降级为空列表，**绝不抛异常**：标注是这套机制里唯一不可再生的数据
+    （见 `_metrics.purge` 的定性），为了一个附属字段让整条写入失败是本末倒置。
+    落 dict 而非裸元组，是因为 JSON 没有元组、读回来会变成 list，
+    带键名才能在日后加字段时不必猜位置。
+    """
+    out: list[dict] = []
+    try:
+        for item in (raw or []):
+            s, ph = item                      # 长度不为 2 即抛，由下面兜住
+            if isinstance(s, str) and isinstance(ph, str) and s and ph:
+                out.append({"session": s, "prompt_h": ph})
+    except Exception:                          # noqa: BLE001
+        return []
+    return out
 
 
 def save_annotation(home: Path, path: str, verdict: str, *,
-                    kind: str = DEFAULT_KIND) -> None:
+                    kind: str = DEFAULT_KIND, context_ids=None) -> None:
     """追加一条标注。后写覆盖先写（读取时按 (kind, path) 合并）。
 
     `kind` 强制 keyword-only：它与 `path`/`verdict` 是相邻同类型字符串，位置
@@ -656,6 +1264,11 @@ def save_annotation(home: Path, path: str, verdict: str, *,
     p.parent.mkdir(parents=True, exist_ok=True)
     rec = {"_schema": _metrics.SCHEMA, "path": path,
            "verdict": verdict, "kind": kind}
+    ids = _normalize_context_ids(context_ids)
+    if ids:
+        # 不传 / 归一后为空则**不落该键**：旧记录与新记录都是合法形态，
+        # 读端不必区分「没有这个字段」与「有但是空的」两种情况。
+        rec["context_ids"] = ids
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -732,23 +1345,59 @@ def main() -> int:
     action.add_argument("--report", action="store_true")
     action.add_argument("--purge", action="store_true")
     action.add_argument("--review", action="store_true")
+    action.add_argument("--review-web", action="store_true",
+                        help="在浏览器里批量标注（本地服务，只绑 127.0.0.1）")
     # 只清 near-miss 累计计数这一份**派生**数据，不碰事件记录与人工标注。
     # 与 --purge 分开是因为二者代价差一个量级：purge 会删掉不可再生的 annotations。
     action.add_argument("--reset-counts", action="store_true")
     # --show-paths 是 --report 的修饰项，不参与互斥
     ap.add_argument("--show-paths", action="store_true")
+    ap.add_argument(
+        "--runtime", choices=("auto", "legacy", "claude", "codex", "all"), default="auto",
+        help="metrics 命名空间；canonical 存在时 auto/all 同时处理 Claude 与 Codex",
+    )
     args = ap.parse_args()
     home = Path.home()
+    canonical_exists = (home / ".context-vault" / "config.json").exists()
+    selected = args.runtime
+    if selected == "auto":
+        selected = "all" if canonical_exists else "legacy"
+    # `all` **必须包含 legacy**。迁移是「复制」不是「移动」，legacy 目录在迁移后
+    # 原样留在盘上（含加盐 hash、明文笔记路径、明文 session id、不可再生的人工标注）。
+    # 漏掉它时 `--purge` 只清一半却报告「已清空 N 个数据文件」，`--report` 也看不到
+    # 那半边——「没有数据」与「数据在另一个命名空间」不可区分。
+    runtimes = ("legacy", "claude", "codex") if selected == "all" else (selected,)
+
+    def all_records():
+        for runtime in runtimes:
+            _metrics.configure_context(runtime)
+            yield from load_records(home)
+
     if args.reset_counts:
-        n = _metrics.reset_counts(home)
+        n = 0
+        for runtime in runtimes:
+            _metrics.configure_context(runtime)
+            n += _metrics.reset_counts(home)
         print(f"已清空 near-miss 累计计数（{n} 条）与 nudge 冷却戳。"
               f"事件记录与人工标注未受影响。")
         return 0
     if args.purge:
         # 先读标注条数——purge 之后就读不到了，而这是唯一不可重新生成的数据
-        n_ann = _metrics.count_annotations(home)
-        n = _metrics.purge(home)
-        msg = f"已清空 {n} 个数据文件"
+        n_ann = 0
+        n = 0
+        scanned: list[str] = []
+        try:
+            for runtime in runtimes:
+                _metrics.configure_context(runtime)
+                scanned.append(str(_metrics.metrics_dir(home)))
+                n_ann += _metrics.count_annotations(home)
+                n += _metrics.purge(home)
+        except OSError as exc:
+            print(f"metrics 清理失败，仍有数据保留：{exc}", file=sys.stderr)
+            return 2
+        # 把实际扫过的目录打出来：这是不可逆删除，用户必须能看出「漏了哪一个」。
+        # 只报一个总数时，「清了 0 个」与「压根没扫到那个目录」完全不可区分。
+        msg = f"已清空 {n} 个数据文件（扫描目录：{'、'.join(scanned)}）"
         if n_ann:
             # 按非空行数计，不解析 JSON、不去重、不分类：near-miss 与精度两类
             # 混在同一个数里。刻意保持不解析——test_count_annotations_tolerates_
@@ -758,7 +1407,29 @@ def main() -> int:
                     f"含 near-miss 与精度两类，未去重）")
         print(msg)
         return 0
+    if args.review_web:
+        if len(runtimes) != 1:
+            print("--review-web 必须显式指定 --runtime legacy|claude|codex",
+                  file=sys.stderr)
+            return 2
+        _metrics.configure_context(runtimes[0])
+        tindex = _transcript_index(home)
+        try:
+            salt = _metrics.get_salt(home)
+        except OSError as exc:
+            print(f"读取盐失败，无法回查提问上下文：{exc}", file=sys.stderr)
+            return 2
+        todo = collect_review_items(home, tindex, salt)
+        if not todo:
+            print("没有待标注的条目（有上下文可判断的都已标注完）")
+            return 0
+        return serve_review(home, todo)
+
     if args.review:
+        if len(runtimes) != 1:
+            print("--review 必须显式指定 --runtime legacy|claude|codex", file=sys.stderr)
+            return 2
+        _metrics.configure_context(runtimes[0])
         # 下面两条是**假设没有这层护栏**、裸 input() 会撞上的失败形态——正是这层
         # isatty() 检查想防的东西。都发生在无人能应答的环境里：
         #   stdin=DEVNULL      -> input() 立刻抛 EOFError，无兜底则整条堆栈打到
@@ -774,24 +1445,20 @@ def main() -> int:
             print("--review 需要交互式终端；当前 stdin 不是 TTY，已中止。",
                   file=sys.stderr)
             return 2
-        done = load_annotations(home)
-        todo = [x for x in sample_near_miss(load_records(home))
-                if ("near_miss", x["path"]) not in done]
-        for x in todo:
-            x["kind"] = "near_miss"
-        # 第二趟：精度侧。两类各自 k 条上限、不合并计数。
-        # load_records 是生成器、只能迭代一次，所以这里**刻意**再扫一遍文件——
-        # 用 IO 换内存，绝不改成一趟物化（会重演 574MB 峰值那个已修的回归）。
-        todo += [x for x in sample_admitted(load_records(home))
-                 if (x["kind"], x["path"]) not in done]
+        # transcript 索引：既用于按 (session, prompt_h) 取回提问原文，也用于
+        # `human_records` 按 session 判来源。**必须在抽样之前建好** —— 抽样已经
+        # 依赖它了。索引与盐都只取一次，全程复用。
+        tindex = _transcript_index(home)
+        try:
+            salt = _metrics.get_salt(home)
+        except OSError as exc:
+            print(f"读取盐失败，无法回查提问上下文：{exc}", file=sys.stderr)
+            return 2
+        todo = collect_review_items(home, tindex, salt)
         if not todo:
-            print("没有待标注的条目")
+            print("没有待标注的条目（有上下文可判断的都已标注完）")
             return 0
         print(f"待标注 {len(todo)} 条。输入 r=相关 / i=不相关 / u=不确定 / q=退出")
-        # 标注上下文：按 (session_id, prompt_h) 从 transcript 取回当时的提问原文。
-        # 没有它，「该不该被召回」这个问题无法回答（见 lookup_prompt 的说明）。
-        # 索引与盐都只取一次，全程复用。
-        tindex = _transcript_index(home)
         try:
             salt = _metrics.get_salt(home)
         except OSError:
@@ -803,18 +1470,9 @@ def main() -> int:
             # 每条重新扫一遍 records：load_records 是生成器、只能迭代一次，
             # 且这里刻意不物化（P3 修复，旧实现实测 574MB 峰值）。--review 是人工
             # 交互命令，每条多花几十毫秒 IO 换取不重演那个内存回归，是划算的。
-            ctx = sample_admitted_events(load_records(home), item["path"], item["kind"])
-            if ctx:
-                print(f"\n  ── 该笔记被召回时，你问的是 ──")
-                for i, (sess, ph) in enumerate(ctx, 1):
-                    raw = lookup_prompt(home, sess, ph, salt, tindex)
-                    if raw:
-                        one = " ".join(raw.split())[:160]
-                        print(f"   {i}. {sanitize_injected_text(one, keep_newlines=False)}")
-                    else:
-                        print(f"   {i}. （transcript 里找不到，可能已被清理）")
-            else:
-                print("\n  ── 无提问上下文（该条目写于 prompt_h 落盘之前）──")
+            print("")
+            for _ln in format_context_lines(item["contexts"], item["unreadable"]):
+                print(_ln)
             try:
                 # isatty() 撒谎时（见上方 Windows DEVNULL 案例）会一路执行到这里，
                 # 第一次 input() 立刻 EOFError。区分两种 EOFError：
@@ -835,11 +1493,12 @@ def main() -> int:
             if ans == "q":
                 break
             if ans in code:
-                save_annotation(home, item["path"], code[ans], kind=item["kind"])
+                save_annotation(home, item["path"], code[ans], kind=item["kind"],
+                                context_ids=item.get("context_ids"))
                 saved += 1
         print(f"已标注，结果在 {annotations_path(home)}")
         return 0
-    print(render_report(summarize(load_records(home)), show_paths=args.show_paths))
+    print(render_report(summarize(all_records()), show_paths=args.show_paths))
     return 0
 
 

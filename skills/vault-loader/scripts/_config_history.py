@@ -73,6 +73,8 @@ HISTORICAL_DEFAULTS: dict[str, list] = {
     # 665cf63（2026-07-22 "tag 命中按 IDF 加权+keywords 权重 3→5"）改为 5——
     # "keywords 是策展的精确召回信号，必须能胜过泛 tag 命中（实测 keywords=3 时打不过 tag=4）"。
     "scoring.prompt_keyword_hit": [3, 5],
+    # Task 2（2026-09-02，会话主题词打分信号）新增，仅一个历史值。
+    "scoring.session_topic_hit": [2],
 
     # ── relevance.*（数值调参键；布尔开关/列表见模块 docstring，不入本表） ──
     "relevance.min_topical_score": [4],
@@ -85,4 +87,8 @@ HISTORICAL_DEFAULTS: dict[str, list] = {
     "relevance.max_prompt_keywords": [30],
     # 665cf63（2026-07-22）引入 tag_idf_floor=0.5，此后未变。
     "relevance.tag_idf_floor": [0.5],
+    # Task 4（2026-09-02，会话主题预热接线）新增，仅一个历史值。
+    # 注：同批新增的 relevance.session_topic 是布尔开关，不入本表
+    # （iter_leaf_segments 显式排除 bool，见模块 docstring「收敛范围」一节）。
+    "relevance.session_topic_top_n": [10],
 }

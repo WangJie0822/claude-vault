@@ -62,3 +62,30 @@ def test_guard_actually_reads_skill_md():
     assert len(text) > 1000, "SKILL.md 内容异常短，守卫可能读到了错误的文件"
     # 反向自证：一个绝不会出现在文档里的键名必须被判为「未文档化」
     assert not _mentions(text, "relevance", "__definitely_not_a_real_key__")
+
+
+def test_skill_md_documents_session_topic_ttl_coupling():
+    """F6（整分支终审，2026-09-02）：`state_ttl_hours` 一行必须提及它同时约束
+    `relevance.session_topic` 的主题词与提炼失败标记的有效期——`prompt_submit_load.py`
+    的 `load_session_topic`/`has_recent_topic_attempt` 都直接读同一个
+    `ups_cfg["state_ttl_hours"]`，不写清楚这个耦合，用户改这个值时不知道它还会
+    影响主题预热多久重试一次。"""
+    text = _skill_text()
+    rows = [line for line in text.splitlines()
+            if "user_prompt_submit.state_ttl_hours" in line]
+    assert rows, "SKILL.md 未找到 user_prompt_submit.state_ttl_hours 这一行"
+    assert "session_topic" in rows[0], (
+        f"state_ttl_hours 一行未提及与 session_topic 的耦合：{rows[0]}")
+
+
+def test_skill_md_session_topic_hit_row_does_not_overclaim():
+    """F3（整分支终审，2026-09-02）：`scoring.session_topic_hit` 的文档措辞不得再
+    断言"无法单独把笔记拉进召回集，只能锦上添花"——实测该说法只对精度闸门
+    （`min_topical_score`）成立，对全文阈值（`fulltext_topical_threshold`）不成立：
+    叠加 prompt 关键词已有的 topical 分，主题词可以把笔记推过全文阈值。"""
+    text = _skill_text()
+    rows = [line for line in text.splitlines() if "scoring.session_topic_hit" in line]
+    assert rows, "SKILL.md 未找到 scoring.session_topic_hit 这一行"
+    assert "只能锦上添花" not in rows[0], f"文档仍残留已被 F3 推翻的表述：{rows[0]}"
+    assert "fulltext_topical_threshold" in rows[0], (
+        "文档应提及可越过全文阈值这一已知且被测试锁定的行为")

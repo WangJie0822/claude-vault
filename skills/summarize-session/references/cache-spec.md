@@ -82,7 +82,7 @@ CLAUDE.md 中的索引区由开始和结束标记界定，脚本只替换两个�
 ## 脚本用法
 
 ```bash
-SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
 # 正常运行
 python3 "$SS/rebuild_index.py" --vault "$VAULT"
 

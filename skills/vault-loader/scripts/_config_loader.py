@@ -7,10 +7,57 @@ from copy import deepcopy
 from pathlib import Path
 from typing import NamedTuple
 
+# Direct skill scripts are launched from plugin caches where the repository root
+# is not automatically importable. Bootstrap it from this file's location.
+_PLUGIN_ROOT = Path(__file__).resolve().parents[3]
+# 只有**确实像插件根**才插入 sys.path。legacy 独立布局
+# （`~/.claude/skills/<skill>/scripts/`）下 parents[3] 正是 `~/.claude` 本身——
+# 把一个多插件共享、可被任意工具写入的目录放到 sys.path[0]，等于让任何能在那里
+# 落一个 `context_vault/__init__.py` 的东西在每次 hook 进程内取得代码执行。
+# 判据不成立时跳过，交给下面的 ImportError façade 兜底。
+_LOOKS_LIKE_PLUGIN_ROOT = (_PLUGIN_ROOT / "context_vault" / "runtime.py").is_file()
+if _LOOKS_LIKE_PLUGIN_ROOT and str(_PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_ROOT))
+
+try:
+    from context_vault.paths import (
+        canonical_config,
+        default_vault,
+        legacy_default_vault,
+        legacy_loader_config,
+        resolve_config_path,
+    )
+except ImportError:  # compatibility façade for isolated legacy script copies
+    def canonical_config(home: Path | None = None) -> Path:
+        return (home or Path.home()) / ".context-vault" / "config.json"
+
+    def default_vault(home: Path | None = None) -> Path:
+        return (home or Path.home()) / ".context-vault" / "knowledge-vault"
+
+    def legacy_default_vault(home: Path | None = None) -> Path:
+        return (home or Path.home()) / ".claude" / "knowledge-vault"
+
+    def legacy_loader_config(home: Path | None = None) -> Path:
+        return (home or Path.home()) / ".claude" / "skills" / "vault-loader" / "config.json"
+
+    def resolve_config_path(home: Path | None = None) -> tuple[Path, bool]:
+        base = home or Path.home()
+        canonical = canonical_config(base)
+        legacy = base / ".claude" / "skills" / "vault-loader" / "config.json"
+        if canonical.exists():
+            return canonical, False
+        if legacy.exists():
+            return legacy, False
+        return canonical, True
+
 DEFAULT_CONFIG: dict = {
     "enabled": True,
     "dry_run": False,
-    "vault_path": str(Path.home() / ".claude" / "knowledge-vault"),
+    "vault_path": str(default_vault()),
+    "runtimes": {
+        "claude": {"enabled": True},
+        "codex": {"enabled": True},
+    },
 
     "session_start": {
         "enabled": True,
@@ -47,6 +94,21 @@ DEFAULT_CONFIG: dict = {
         "prompt_summary_hit": 2,
         "prompt_keyword_hit": 5,   # 3→5：keywords 是策展的精确召回信号，
                                    # 必须能胜过泛 tag 命中（实测 keywords=3 时打不过 tag=4）
+        # 信号 K（2026-09-02）：会话主题词命中。**刻意小于 min_topical_score（4）**——
+        # 主题词单独（零 prompt 关键词命中）时无法越过精度闸门、不能凭空把一篇笔记
+        # 拉进召回集；断言见
+        # tests/test_session_topic_scoring.py::test_upper_bound_invariant_documented。
+        #
+        # ⚠️ F3（整分支终审，2026-09-02）：这**不等于**「无法单独把笔记推过全文阈值」——
+        # 此前这条注释与 SKILL.md 都写着"只能锦上添花"，是假话，只对 min_topical_score
+        # 成立。实测（带 tag-IDF 折扣的真实场景）：一篇笔记单靠 prompt 关键词算出的
+        # topical 若恰好落在 [min_topical_score, fulltext_topical_threshold) 区间内，
+        # 叠加 session_topic_hit 可以把它推过 fulltext_topical_threshold（默认 6），
+        # 触发数千字的全文注入。已裁定（Ruling 16）不改 select_fulltext 引入
+        # 「含/不含主题词」两套 topical（成本大于收益：多一个概念且要贯穿 EntryDecision
+        # 与渲染层），该行为按「已知且被测试锁定」处理，见
+        # tests/test_session_topic_scoring.py::test_topic_word_alone_can_cross_fulltext_threshold。
+        "session_topic_hit": 2,
     },
 
     "keyword_to_tags": {},
@@ -96,6 +158,20 @@ DEFAULT_CONFIG: dict = {
         # 关闭后数值等价回到旧行为，不杀整个 loader。
         "use_tag_idf": True,
         "tag_idf_floor": 0.5,       # 泛 tag 的保底因子；0 会让泛 tag 归零、行为剧变
+        # 层 3（2026-09-02）：会话主题预热。**默认关**——它会拉起外部进程，
+        # 不得对存量用户静默启用（同 metrics.enabled 的 opt-in 边界）。
+        "session_topic": False,
+        # 首轮送进提炼子进程的候选笔记篇数。取 10 不是 30：注入给用户的是 top-3，
+        # 送出去的越多、暴露面越大；精排 PoC 用 30 篇时 prompt 已 2-4KB。
+        "session_topic_top_n": 10,
+        # 层1 闸门（2026-09-02）：纯指代/应答型 prompt（「继续执行」「ok」）不注入。
+        # 这批实测占 5.6% 的轮次当前 100% 靠单个通用词命中（「继续执行」bigram 切出的
+        # `执行` 命中数百篇），是召回质量最差的一批。
+        "deictic_gate": True,
+        # None = 用内置词表（见 _decision.py 的 _DEICTIC_WORDS）。
+        # 给列表则**完全替换**内置表，不是追加——追加语义无法表达「关掉某个误伤词」
+        # 这个最常见的诉求。
+        "deictic_words": None,
     },
 
     "metrics": {
@@ -126,6 +202,22 @@ _MINIMAL_STUB: dict = {
 # （否则会作为杂键泄漏给下游消费者——它们不在 DEFAULT_CONFIG 里，_deep_merge 会
 # 把 override 里的陌生键原样塞进 result）。
 _CONFIG_META_KEYS = ("_config_version", "_comment")
+
+
+def _default_vault_for(path: Path) -> str:
+    """未显式配置 `vault_path` 时，按配置文件所在位置决定默认值。
+
+    只有**真正的 0.9.x loader 配置路径**回落 0.9.x 默认；canonical 与任何其它
+    显式路径（含测试传入的临时路径）都走 1.0 的产品中性默认。
+
+    判据写成「是不是 legacy」而不是「是不是 canonical」：后者会把任意显式路径一并
+    归进 legacy 档，波及一批只关心默认值本身的用例。
+
+    **判据必须单点**：缺失、正常、损坏三条返回路径都要给出同一个答案。此前只在
+    「正常解析」那一条上做了判定，另外两条各自沿用 `DEFAULT_CONFIG` 里模块加载期
+    求值的新默认，于是 0.9.x 零配置用户被静默改指到不存在的新目录。
+    """
+    return str(legacy_default_vault() if path == legacy_loader_config() else default_vault())
 
 
 def _deep_merge(default: dict, override: dict) -> dict:
@@ -167,6 +259,28 @@ def _ensure_relevance_normalized(result: dict) -> dict:
         rel = deepcopy(DEFAULT_CONFIG["relevance"])
         result["relevance"] = rel
     _normalize_relevance(rel)
+    _ensure_runtimes_normalized(result)
+    return result
+
+
+def _ensure_runtimes_normalized(result: dict) -> dict:
+    """`runtimes` 段类型兜底——与上面 relevance 那条同一个缺陷类的第二个实例。
+
+    消费点是 `config.get("runtimes", {}).get(<rt>, {}).get("enabled", True)`
+    （两个 hook 各一处）。`.get` 的默认值只挡得住「键缺失」，挡不住「键存在但类型不对」：
+    用户把它写成 `"runtimes": []` 或 `"runtimes": "yes"`，`.get` 就会抛
+    AttributeError，而它**逃得出** `load_config` 的 except（那里只捕
+    JSONDecodeError/ValueError/OSError）→ 每次提问召回静默全灭，只有一行 stderr。
+
+    成员级也要归一：`{"claude": "yes"}` 会在第二层 `.get` 上同样抛出。
+    """
+    runtimes = result.get("runtimes")
+    if not isinstance(runtimes, dict):
+        result["runtimes"] = deepcopy(DEFAULT_CONFIG["runtimes"])
+        return result
+    for name, entry in list(runtimes.items()):
+        if not isinstance(entry, dict):
+            runtimes[name] = deepcopy(DEFAULT_CONFIG["runtimes"].get(name, {"enabled": True}))
     return result
 
 
@@ -213,13 +327,18 @@ def load_config_ex(path: Path | None = None) -> ConfigLoad:
     - 损坏：保留原文件，stderr 警告，返回默认值，置位 `corrupt`
     - 正常：与默认值深合并（`_config_version`/`_comment` 等内部标记键会被剔除）
     """
+    fresh_canonical = False
     if path is None:
-        path = Path.home() / ".claude" / "skills" / "vault-loader" / "config.json"
+        path, fresh_canonical = resolve_config_path()
 
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(_MINIMAL_STUB, ensure_ascii=False, indent=2), encoding="utf-8")
+        stub = deepcopy(_MINIMAL_STUB)
+        if fresh_canonical or path == canonical_config():
+            stub["_config_version"] = 2
+        path.write_text(json.dumps(stub, ensure_ascii=False, indent=2), encoding="utf-8")
         result = deepcopy(DEFAULT_CONFIG)
+        result["vault_path"] = _default_vault_for(path)
         _ensure_relevance_normalized(result)
         # 零配置新装不是失效——不置位。
         return ConfigLoad(result, None, "")
@@ -236,11 +355,19 @@ def load_config_ex(path: Path | None = None) -> ConfigLoad:
             raise ValueError("config root 必须为 object")
         override = {k: v for k, v in override.items() if k not in _CONFIG_META_KEYS}
         result = _deep_merge(DEFAULT_CONFIG, override)
+        # A canonical config that does not explicitly pin vault_path follows
+        # the product-neutral default. Legacy and explicit test paths preserve
+        # the 0.9.x default for non-destructive compatibility.
+        if "vault_path" not in override:
+            result["vault_path"] = _default_vault_for(path)
         _ensure_relevance_normalized(result)
         return ConfigLoad(result, None, "")
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         print(f"[vault-loader] config 损坏，回退默认值：{exc}", file=sys.stderr)
         result = deepcopy(DEFAULT_CONFIG)
+        # 损坏回退同样要按位置取默认——0.9.x 用户的 config 坏掉时，改指新目录会让
+        # 「config 损坏」这个本已置位的失效，叠加一次不可见的 Vault 换址。
+        result["vault_path"] = _default_vault_for(path)
         _ensure_relevance_normalized(result)
         return ConfigLoad(result, "corrupt", str(exc))
 

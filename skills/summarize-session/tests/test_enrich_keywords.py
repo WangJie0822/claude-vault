@@ -89,9 +89,31 @@ def test_main_limit_counts_attempted_calls(tmp_path, monkeypatch):
         calls["n"] += 1
         return None  # 模拟 claude 失败
     monkeypatch.setattr(E, "_call_claude", _fail)
-    rc = E.main(["--vault", str(vault), "--limit", "2"])
+    # `--backend` 必须显式传：本脚本按设计从普通终端手动跑，两个 PLUGIN_ROOT 变量
+    # 都不会有，`auto` 无从推断（SKILL.md 也已要求流程内显式传 `--backend "$RUNTIME"`）。
+    rc = E.main(["--vault", str(vault), "--limit", "2", "--backend", "claude"])
     assert rc == 0
     assert calls["n"] == 2   # 即便全失败，也不超过 limit 次付费调用
+
+
+def test_auto_backend_outside_hook_fails_cleanly(tmp_path, capsys):
+    """`--backend auto` 在 hook 之外必须给可操作提示，而不是裸 traceback。
+
+    `choose_backend("auto")` 在两个 PLUGIN_ROOT 变量都不存在时抛 ValueError，而这个
+    脚本正是「手动 opt-in、不接自动管线」的 CLI ⇒ 默认参数下必然走到。旧实现把它放在
+    循环里，用户看到的是 traceback，且已经先 `processed += 1`；`--dry-run` 提前
+    continue 又让这个坑只在真跑时才现，更隐蔽。
+    """
+    import os
+    vault = tmp_path / "v"
+    vault.mkdir()
+    (vault / "n.md").write_text("---\ntags: [t]\n---\n# x\n", encoding="utf-8")
+    for var in ("PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+        os.environ.pop(var, None)
+
+    rc = E.main(["--vault", str(vault)])
+    assert rc == 2, "应返回可辨识的退出码而不是抛异常"
+    assert "backend" in capsys.readouterr().err.lower()
 
 
 def test_extract_json_handles_nested():

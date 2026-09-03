@@ -7,30 +7,33 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash(date *), Bash(basename *), Ba
 
 # 会话总结与知识沉淀
 
-将当前对话中产生的有价值信息，结构化地沉淀到 Obsidian 知识库和 CLAUDE.md 中，确保跨会话的知识延续。
+将当前对话中产生的有价值信息，结构化地沉淀到 Obsidian 知识库和项目规则文件中，确保 Claude Code 与 Codex 跨会话共享知识。
 
 ## 脚本路径（重要）
 
-本 skill 的脚本随插件分发，安装后在**版本钉死的插件 cache** 里，**不在** `~/.claude/skills/` 源目录（插件化后源目录已退役、只剩 `__pycache__`，旧的 `scripts/` 子路径已无脚本）。每个要跑脚本的 Bash 调用，**在同一次调用内先**用下面这行定位脚本目录（Bash 工具不跨调用保留变量，故每次都要重设；下文 ```bash 代码块已内联此行）：
+本 skill 的脚本随插件分发，安装后位于宿主给出的 skill 目录或版本钉死的插件 cache。优先根据当前加载的 `SKILL.md` 绝对路径取同级 `scripts/`；只有 Claude Code 的 Bash 环境无法取得该路径时，才使用下面的兼容定位器。它同时识别 Codex、新名称和旧 `claude-vault` cache：
 
 ```bash
-SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
 ```
 
 之后统一用 `python3 "$SS/<脚本名>.py"` 调用。
 
-- **禁用 `$CLAUDE_PLUGIN_ROOT`**：它在 skill 的 Bash 上下文未注入（实测为空），不能用作前缀。
+- **不要假设 hook root 环境变量存在**：`PLUGIN_ROOT` / `CLAUDE_PLUGIN_ROOT` 只在 hook 入口可靠，skill shell 未必注入。
 - **禁用源目录形式**：旧文档把脚本写成 `~/.claude/` 下 `skills/<本 skill>` 的 `scripts/` 子路径——插件化后那里无脚本，跑必 No such file。
 - **`--plugin-dir` 本地开发模式**（不走 cache）：把 `SS` 直接指向你本地仓库的 `skills/summarize-session/scripts`。
-- **注意**：`config.json` 等 **runtime 态仍在** `~/.claude/skills/summarize-session/`（稳定持久位置），下文对它的引用保持不变。
+- **PowerShell/Codex**：不要原样执行 Bash 定位器；直接把 `$SS` 设为当前 skill 的绝对 `scripts` 目录。
+- **宿主参数**：当前在 Codex 时记为 `RUNTIME=codex`，Claude Code 时记为 `RUNTIME=claude`。调用 `scan_sessions.py` 必须传 `--runtime "$RUNTIME"`；调用 `enrich_keywords.py` 必须显式传 `--backend "$RUNTIME"`，未知宿主不得自动跨提供商回退。
+- **运行时数据**：1.0 新装统一放在 `~/.context-vault/`；旧 `~/.claude/skills/...` 配置继续兼容读取，迁移前不删除。
 
 ## 知识库路径解析
 
 skill 需要知道 Obsidian Vault 的路径才能正确写入笔记。按以下优先级确定路径：
 
 1. **命令行参数**：`/summarize-session --vault /path/to/vault`
-2. **配置文件默认值**：读取 `~/.claude/skills/summarize-session/config.json` 中的 `default_vault_path`
-3. **默认知识库**：如果以上都未指定，回退到 `~/.claude/knowledge-vault`（与 vault-loader 默认一致，零配置闭环不断裂；该默认路径不存在时由路径解析流程 `mkdir -p` 创建）
+2. **公共配置**：读取 `~/.context-vault/config.json` 中的 `vault_path`
+3. **旧配置兼容**：若公共配置不存在，读取 `~/.claude/skills/summarize-session/config.json::default_vault_path`
+4. **默认知识库**：全新安装回退到 `~/.context-vault/knowledge-vault`；旧配置存在时保持旧路径，不自动搬动
 
 ### 参数说明
 
@@ -38,37 +41,37 @@ skill 需要知道 Obsidian Vault 的路径才能正确写入笔记。按以下�
 |:-----|:-----|:-----|
 | `--vault <path>` | 本次使用的知识库路径（一次性） | `/summarize-session --vault ~/MyVault` |
 | `--log-dir <path>` | 本次使用的工作日志目录（一次性） | `/summarize-session --log-dir ~/WorkLog` |
-| `--set-default <path>` | 将路径保存为默认值并退出 | `/summarize-session --set-default ~/.claude/knowledge-vault` |
+| `--set-default <path>` | 写入公共配置的 `vault_path` 并退出 | `/summarize-session --set-default ~/.context-vault/knowledge-vault` |
 | `--no-log` | 仅记录笔记和 CLAUDE.md，跳过工作日志 | `/summarize-session --no-log` |
 | `--quick` | 轻量模式：只做笔记 + CLAUDE.md，跳过工作日志、文档归集、Memory 沉淀 | `/summarize-session --quick` |
 | `-f` / `--force` | 强制模式：跳过第三步计划确认，按默认值直接执行（计划仍打印供追溯）；不自动跑 baseline / `--fix-frontmatter` / `fix_links` 等需授权操作 | `/summarize-session -f` |
 | `--catch-up [N]` | 回溯模式：扫描最近 N 天（默认 7）未总结的历史会话，补充总结 | `/summarize-session --catch-up 3` |
 | `--show-config` | 显示当前配置并退出 | `/summarize-session --show-config` |
 | `--backfill-archive` | 一次性扫描所有无 vault_path 的 pending-docs 条目并复制到 Vault | `/summarize-session --backfill-archive` |
-| （无参数） | 使用默认配置或 `~/.claude/knowledge-vault` | `/summarize-session` |
+| （无参数） | 使用公共配置或 `~/.context-vault/knowledge-vault` | `/summarize-session` |
 
 ### keywords backfill（可选，手动 opt-in）
 
-`scripts/enrich_keywords.py` 给存量笔记一次性补 `keywords`（供 vault-loader 召回）。**调付费 `claude -p --model haiku`、每篇一次**，须手动运行、不接自动管线。
+`scripts/enrich_keywords.py` 给存量笔记一次性补 `keywords`（供 vault-loader 召回）。每篇一次模型调用，须手动运行、不接自动管线，并必须显式传 `--backend claude|codex`；无法可靠识别宿主时会拒绝执行，不跨提供商回退。
 
 - 先 `--dry-run` 看会处理哪些篇；`--limit N` 限制本次最多发起 N 次付费调用。
 - ⚠️ **成本告警**：大 vault 全量 backfill = 笔记数 × 一次 haiku 调用，先用 `--limit` 小批试。
 - 跑完会改笔记 frontmatter，**需再跑 `rebuild_index.py` 刷新 cache** 召回才生效（脚本结束会提示）。
 - 定位器（每个 Bash 块内联）：
-  `SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)` 后 `python3 "$SS/enrich_keywords.py" --vault "$VAULT" --dry-run`。
+  Claude fallback 可用 `SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)`；随后执行 `python3 "$SS/enrich_keywords.py" --backend "$RUNTIME" --vault "$VAULT" --dry-run`。
 
 ### 配置管理
 
-配置文件 `~/.claude/skills/summarize-session/config.json`：
+唯一写入配置为 `~/.context-vault/config.json`：
 
 ```json
 {
-  "default_vault_path": "~/.claude/knowledge-vault",
-  "work_log_dir": "~/.claude/knowledge-vault/worklog"
+  "vault_path": "~/.context-vault/knowledge-vault",
+  "work_log_dir": "~/.context-vault/knowledge-vault/工作日志"
 }
 ```
 
-- `--set-default <path>`：读取配置 → 更新 `default_vault_path` → 写回 → 确认输出
+- `--set-default <path>`：读取公共配置 → 更新 `vault_path` → 原子写回 → 确认输出
 - `--show-config`：读取配置并展示（文件不存在时提示未配置）
 
 ### 路径解析流程
@@ -77,9 +80,9 @@ skill 需要知道 Obsidian Vault 的路径才能正确写入笔记。按以下�
 
 **Vault 路径**（记为 `$VAULT`）：
 1. 解析 `$ARGUMENTS`，检查是否包含 `--vault <path>`
-2. 如果没有，读取 `~/.claude/skills/summarize-session/config.json` 获取 `default_vault_path`
-3. 如果配置文件也没有，回退到 `~/.claude/knowledge-vault`（与 vault-loader 默认一致）
-4. 验证 `$VAULT`：存在且是目录则继续；若 `$VAULT` 是上一步回退的默认 `~/.claude/knowledge-vault` 且尚不存在，`mkdir -p "$VAULT"` 创建后继续；若是 `--vault` 显式指定的路径却不存在，则报错（不替用户创建其显式指定的路径）
+2. 如果没有，读取 `~/.context-vault/config.json::vault_path`
+3. canonical 不存在时只读兼容旧 `default_vault_path`；两份 legacy 配置冲突则停止并提示迁移
+4. 全新安装回退 `~/.context-vault/knowledge-vault`。默认目录可自动创建；显式 `--vault` 不存在则报错
 
 **工作日志目录**（记为 `$LOG_DIR`，`$NO_LOG=true` 时跳过）：
 1. 解析 `$ARGUMENTS`，检查是否包含 `--log-dir <path>`
@@ -125,7 +128,7 @@ Vault 内资源操作优先通过 Obsidian 官方 CLI（`obsidian` 命令）完�
 **调用约定**：skill 中对 Vault 内资源（`$VAULT/` 下 `.md`）的操作统一通过：
 
 ```bash
-SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$SS/obsidian_cli.py" --vault "$VAULT" <op> [...]
 ```
 
@@ -182,8 +185,7 @@ python3 "$SS/obsidian_cli.py" --vault "$VAULT" <op> [...]
 ⚡ **并行执行**（同一消息中发出多个 tool calls）：
 - Read `~/.claude/skills/summarize-session/config.json`
 - `Bash: date "+%Y-%m-%d %H:%M"`
-- `Bash: SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1); python3 "$SS/scan_sessions.py" --timerange "$PWD"`（从当前会话 JSONL 提取工作时段的推断初值）
-- `Bash: SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1); python3 "$SS/scan_sessions.py" --touched-repos "$PWD"`（扫描本次会话实际修改的 git 仓库集合，解决 cwd 与实际修改仓库错位的问题）
+- Claude Code：从当前 skill scripts 执行 `scan_sessions.py --runtime claude --timerange "$PWD"` 与 `--touched-repos "$PWD"`。Codex 当前会话 transcript 操作仍为 experimental，跳过这两项并明确提示用户，不得回退扫描 Claude 会话。
 - `ToolSearch query="select:AskUserQuestion" max_results=1`（第三步确认环节需要；AskUserQuestion 是 deferred tool，若未预加载会导致直接调用失败。已经在直接工具列表时这步相当于 no-op）
 
 用 config 结果确定 `$VAULT` 和 `$LOG_DIR`。
@@ -355,7 +357,7 @@ python3 "$SS/obsidian_cli.py" --vault "$VAULT" <op> [...]
 
 ```bash
 # 默认 dry-run 预览；--apply 实际改写（自动 .bak）
-SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$SS/fix_links.py" --vault "$VAULT"
 python3 "$SS/fix_links.py" --vault "$VAULT" --apply
 ```
@@ -415,7 +417,7 @@ summary: "2026-03-19 工作记录"
 - **文档归集**（`$SKIP_DOC_COLLECT!=true` 时）：调脚本：
 
   ```bash
-  SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+  SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
   python3 "$SS/sync_pending_docs.py" \
     --vault "$VAULT" --mode incremental --apply \
     --output-json /tmp/summarize_sync_result.json
@@ -438,7 +440,7 @@ summary: "2026-03-19 工作记录"
    - **一次性深度清理**（积压死条目过多时）：`reclaim_and_prune.py` 先对死条目 basename 在 Vault 唯一命中者重建 vault_path（转 active），再清理其余真死条目：
      ```bash
      # 先 dry-run 预览 reclaimed / pruned_planned
-     SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+     SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
      python3 "$SS/reclaim_and_prune.py" --vault "$VAULT"
      # 确认后 --apply（自动 .bak 备份）
      python3 "$SS/reclaim_and_prune.py" --vault "$VAULT" --apply
@@ -446,7 +448,7 @@ summary: "2026-03-19 工作记录"
    - **清理已归集超龄条目**（pending-docs 只增不减时）：已归集（有 vault_path）的条目原文已安全在 Vault，其跟踪记录在归集超过 N 天（默认 30）后可手动清理；`prune_archived.py` 独立手动跑，**不接入 sync、无 config、无自动触发**：
      ```bash
      # 先 dry-run 预览 pruned_planned（--older-than N 调阈值，默认 30 天）
-     SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+     SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
      python3 "$SS/prune_archived.py" --vault "$VAULT"
      # 确认后 --apply（自动 .bak 轮转备份）
      python3 "$SS/prune_archived.py" --vault "$VAULT" --apply
@@ -455,13 +457,13 @@ summary: "2026-03-19 工作记录"
    - 解析 sync 输出 JSON 的 `conflict_vault_edited` 和 `conflict_both_edited` 数组，在第五步输出中提示用户
 2. **触发 Obsidian 重扫**（若 CLI 可用）：
    ```bash
-   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
    python3 "$SS/obsidian_cli.py" --vault "$VAULT" reload
    ```
    `used: fallback` 时跳过（Obsidian 未运行，无需重扫）。
 3. 重建索引：
    ```bash
-   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
    python3 "$SS/rebuild_index.py" --vault "$VAULT" --emit=all
    ```
    脚本输出 JSON 报告（笔记总数、本次更新数、`health_check` 字段等）。缓存规范详见 `references/cache-spec.md`。
@@ -477,12 +479,12 @@ summary: "2026-03-19 工作记录"
 
    若 `category_with_slash + project_field + folder_subcat_missing > 0`：在第五步输出中明确告知用户，建议追加跑一次：
    ```bash
-   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
    python3 "$SS/rebuild_index.py" --vault "$VAULT" --emit=all --fix-frontmatter
    ```
    若 `stale_indexes` 非空：建议归档：
    ```bash
-   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
    python3 "$SS/rebuild_index.py" --vault "$VAULT" --emit=all --archive-stale-indexes
    ```
    归档目标 `.meta/archived-indexes/<date>/`，可回收。
@@ -491,7 +493,7 @@ summary: "2026-03-19 工作记录"
 5. **补全 keywords 缺口**——`keywords` 是 vault-loader 的精确召回通路（权重 5，最强信号），缺失即该篇在提问时召不回来：
 
    ```bash
-   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
    python3 "$SS/keywords_gap.py" --vault "$VAULT" --list --limit 10
    ```
 
@@ -499,7 +501,7 @@ summary: "2026-03-19 工作记录"
    - `total == 0` → 跳过本步，不必输出任何提示
    - 否则**逐篇 Read 笔记正文**，自己生成 3-8 个中文/英文检索扩展词（同义词、别名、跨语言术语），再写回：
      ```bash
-     SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+     SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
      python3 "$SS/keywords_gap.py" --vault "$VAULT" \
        --set "<missing 数组里的路径>" --keywords "词1,词2,词3"
      ```
@@ -509,14 +511,14 @@ summary: "2026-03-19 工作记录"
    - 每次 `--set` 返回 `cache_synced`：为 `false` 时该篇召回要等下次 rebuild 才生效，在第五步输出中如实提示，不要当作成功
    - 归集进来的 spec/plan 正常情况下不该出现在这里——它们的 keywords 由 `archive_doc` 从 pending-docs 条目透传（见「文档归集」）。若持续出现，说明写 pending-docs 时漏填了该字段
 6. 如果新建了笔记，检查是否需在 CLAUDE.md 或其他笔记中添加 `[[wikilink]]` 引用（无需文件夹路径）
-7. 标记当前会话为已总结（避免 `--catch-up` 重复处理）：
+7. Claude Code 标记当前会话为已总结（避免 `--catch-up` 重复处理）；Codex 当前会话标记仍为 experimental，必须跳过并在结果中说明：
    ```bash
-   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
-   python3 "$SS/scan_sessions.py" --mark-current "$PWD"
+   SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   python3 "$SS/scan_sessions.py" --runtime claude --mark-current "$PWD"
    ```
 8. **提交知识库改动（git commit）**——默认开启，`--no-commit` 跳过：
    ```bash
-   SS=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
    python3 "$SS/git_commit_vault.py" --vault "$VAULT" --title "<本次会话标题>"
    ```
    - 用 `git status` 枚举知识库目录内变更/未跟踪 `.md`（笔记/工作日志/CLAUDE.md/系统索引文件）精确 add，**不全量 `-A`**；只 commit 不 push。

@@ -7,6 +7,11 @@ config.json
 *.log
 docs/superpowers/
 packaging/
+# SDD 流程产物本该写在 `.superpowers/sdd/`（已整体 gitignore）下；这两类文件名一旦
+# 误落进分发目录（如 `skills/**`）也一律不追踪——F1（整分支终审，2026-09-02）实测
+# `skills/vault-loader/task-3-report.md` 曾被意外 `git add` 并随插件分发。
+task-*-report.md
+test-output*.txt
 # subagent-driven 开发的 task 简报 / 多维评审草稿：本地开发产物，含源机路径与私人引用。
 # CLAUDE.md 早已声明二者不分发，但此前 `.superpowers/` 实际未被任何 gitignore 规则覆盖
 # （唯一保护是 superpowers 工具自己写的 `.superpowers/sdd/.gitignore`，只覆盖一层），

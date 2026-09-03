@@ -16,6 +16,7 @@ CLAUDE.md 已把分发边界写死，这里直接按那份清单校验，任何�
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -40,6 +41,8 @@ ROOT = Path(__file__).resolve().parent.parent
 # 目录前缀：这些目录下的内容随插件分发。
 ALLOWED_DIR_PREFIXES = (
     ".claude-plugin/",
+    ".codex-plugin/",
+    "context_vault/",
     "hooks/",
     "skills/",
     "commands/",
@@ -52,10 +55,12 @@ ALLOWED_DIR_PREFIXES = (
 ALLOWED_FILES = frozenset({
     "docs/MIGRATION.md",
     "README.md",
+    "AGENTS.md",
     "CLAUDE.md",
     "CHANGELOG.md",
     ".gitattributes",
     ".gitignore",
+    "VERSION",
 })
 
 
@@ -92,6 +97,57 @@ def _tracked_files(root: Path = ROOT) -> list[str]:
 def _outside_allowlist(paths: list[str]) -> list[str]:
     return [p for p in paths
             if p not in ALLOWED_FILES and not p.startswith(ALLOWED_DIR_PREFIXES)]
+
+
+# ---- 分发目录内部的流程产物 denylist（F1，整分支终审 2026-09-02）----
+# `skills/` 整个目录都在 ALLOWED_DIR_PREFIXES 内，allowlist 判据对它完全无感——
+# 但 SDD 流程产物（task-N 简报、临时 pytest 输出重定向）本该写在 `.superpowers/sdd/`
+# 下（已整体 gitignore），不该混进分发目录。实测 `skills/vault-loader/task-3-report.md`
+# 曾被意外 `git add`、随插件分发给每个用户；`skills/vault-loader/test-output.txt`
+# 当时未跟踪但也未被 gitignore，离下一次 `git add -A` 只差一步。
+_PROCESS_ARTIFACT_RE = re.compile(r"-report\.md$")
+
+
+def _process_artifacts_under_skills(paths: list[str]) -> list[str]:
+    """`skills/` 前缀下不该出现的 SDD 流程产物文件名。"""
+    offenders = []
+    for p in paths:
+        if not p.startswith("skills/"):
+            continue
+        name = p.rsplit("/", 1)[-1]
+        if _PROCESS_ARTIFACT_RE.search(name) or name.startswith("test-output"):
+            offenders.append(p)
+    return offenders
+
+
+def test_no_process_artifacts_under_skills():
+    """`skills/` 分发目录内不得混入 SDD 流程产物（F1）。
+
+    写完自验（controller 手动核验，非自动化用例）：把 `task-3-report.md` 加回
+    `skills/vault-loader/` 再跑本用例，必须转红。
+    """
+    offenders = _process_artifacts_under_skills(_tracked_files())
+    assert offenders == [], (
+        f"以下疑似 SDD 流程产物混入了分发目录 skills/：{offenders}\n"
+        f"这类文件应写在 .superpowers/sdd/<task>/ 下（已被 gitignore），不应随插件分发。")
+
+
+def test_process_artifact_guard_catches_known_offenders():
+    """自证区分力：判据必须拦下已知的两类产物文件名，且不得误伤正常分发文件。"""
+    offenders = [
+        "skills/vault-loader/task-3-report.md",
+        "skills/vault-loader/task-12-report.md",
+        "skills/vault-loader/test-output.txt",
+    ]
+    assert _process_artifacts_under_skills(offenders) == offenders
+    # 反向：正常分发文件不得被误伤——含 "report"/"test" 字样但不是这两类命名模式
+    should_pass = [
+        "skills/vault-loader/SKILL.md",
+        "skills/vault-loader/scripts/_topic.py",
+        "skills/vault-loader/tests/test_report_epoch_split.py",
+        "skills/vault-loader/scripts/analyze_metrics.py",
+    ]
+    assert _process_artifacts_under_skills(should_pass) == []
 
 
 def test_tracked_files_within_distribution_allowlist():
@@ -140,11 +196,12 @@ def test_allowlist_rejects_known_non_distributed_paths():
     assert _outside_allowlist(should_be_rejected) == should_be_rejected
     # 反向：真实分发内容必须放行，否则守卫会把正常提交拦成红
     should_pass = [
-        ".claude-plugin/plugin.json", "hooks/run-hook.cmd",
+        ".claude-plugin/plugin.json", ".codex-plugin/plugin.json",
+        "context_vault/runtime.py", "hooks/run-hook.cmd",
         "skills/vault-loader/scripts/_scorer.py", "commands/vault.md",
         "scripts/x.py", "tests/test_no_corpus_in_repo.py",
         "images/cc_preview.png", "docs/MIGRATION.md",
-        "README.md", "CLAUDE.md", ".gitattributes", ".gitignore",
+        "README.md", "AGENTS.md", "CLAUDE.md", ".gitattributes", ".gitignore", "VERSION",
     ]
     assert _outside_allowlist(should_pass) == []
 

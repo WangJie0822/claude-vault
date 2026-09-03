@@ -1,7 +1,30 @@
-# claude-vault 迁移指南（仅原作者）
+# Context Vault 迁移指南
+
+## 0.9.x → 1.0.0（Claude Code + Codex）
+
+1.0.0 将插件 ID 从 `claude-vault` 改为 `context-vault`，并把新装的共享配置/数据根目录改为 `~/.context-vault/`。旧 Vault、配置、metrics、session manifest 和 state 不会自动删除。
+
+先执行只读诊断与 dry-run：
+
+```bash
+python scripts/context_vault_doctor.py
+python scripts/migrate_context_vault.py
+```
+
+若 dry-run 报 loader 与 summarize-session 指向不同 Vault，先人工统一路径；工具不会猜哪一个是正确数据。确认后执行：
+
+```bash
+python scripts/migrate_context_vault.py --apply
+```
+
+迁移采用 staging + 原子配置提交，复制 legacy 数据到 runtime 命名空间，不删除源文件。若 `~/.context-vault/config.json` 已存在则拒绝覆盖。回退时停用/卸载 `context-vault`，重新启用旧 `claude-vault` 即可；旧数据仍在原位。
+
+不要同时启用两个插件 ID：Claude Code/Codex 会分别注册同名 hook，并发执行的 hook 之间不能互相阻止启动。先停用旧 ID，再启用新 ID，并新开会话验证每个事件只有一次注入。旧版专属的手工 settings hook 也必须移除。
+
+以下章节保留 0.9.x 之前从源码/手工 hook 迁移到插件的历史说明。
 
 > ⚠️ 本文档**仅供原作者**——此前在 `~/.claude` 里直接维护这套 vault-loader / summarize-session / vault skill 与 hook 的人。
-> **全新安装的用户请忽略本文档**：你直接 `/plugin install claude-vault` 即可零配置使用，无需任何迁移。
+> **全新安装的用户请忽略历史章节**：直接安装 `context-vault` 即可。
 
 ## 背景：为什么需要迁移
 
@@ -56,7 +79,12 @@
 **第 1 步 · dry-run 预览**（默认行为，只读扫描，不改动任何文件）：
 
 ```bash
-VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+# 两端的插件 cache 根不同，**分别**取各自最新版，不要把两棵树混在一起排序：
+# `sort -V` 排的是整条路径，混排时 .codex 恒排在 .claude 之后，`tail -1` 会取到
+# 版本更低的那一个（本机实测取到 .codex 的 0.9.0，而 .claude 已有 0.9.1）。
+# 拆开写还顺带避开了 `~/.c{a,b}` 花括号展开的可移植性问题（dash 不支持）。
+VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+[ -n "$VL" ] || VL=$(ls -d ~/.codex/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$VL/migrate_config.py"
 ```
 
@@ -76,7 +104,12 @@ python3 "$VL/migrate_config.py"
 **第 2 步 · 确认无误后 apply**（先备份，再原子写回清理后的 config）：
 
 ```bash
-VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+# 两端的插件 cache 根不同，**分别**取各自最新版，不要把两棵树混在一起排序：
+# `sort -V` 排的是整条路径，混排时 .codex 恒排在 .claude 之后，`tail -1` 会取到
+# 版本更低的那一个（本机实测取到 .codex 的 0.9.0，而 .claude 已有 0.9.1）。
+# 拆开写还顺带避开了 `~/.c{a,b}` 花括号展开的可移植性问题（dash 不支持）。
+VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+[ -n "$VL" ] || VL=$(ls -d ~/.codex/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$VL/migrate_config.py" --apply
 ```
 
@@ -85,7 +118,12 @@ python3 "$VL/migrate_config.py" --apply
 **第 3 步 · 如需撤销**（把第 2 步打印的备份路径填进去）：
 
 ```bash
-VL=$(ls -d ~/.claude/plugins/cache/*/claude-vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+# 两端的插件 cache 根不同，**分别**取各自最新版，不要把两棵树混在一起排序：
+# `sort -V` 排的是整条路径，混排时 .codex 恒排在 .claude 之后，`tail -1` 会取到
+# 版本更低的那一个（本机实测取到 .codex 的 0.9.0，而 .claude 已有 0.9.1）。
+# 拆开写还顺带避开了 `~/.c{a,b}` 花括号展开的可移植性问题（dash 不支持）。
+VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
+[ -n "$VL" ] || VL=$(ls -d ~/.codex/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$VL/migrate_config.py" --restore ~/.claude/projects/vault-loader-backups/config-<时间戳>.json
 ```
 
