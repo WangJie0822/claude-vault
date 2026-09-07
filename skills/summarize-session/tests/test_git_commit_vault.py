@@ -138,9 +138,67 @@ def test_is_knowledge_md_new_index_names():
     assert _is_knowledge_md('改进计划/改进计划 索引.md') is True
 
 
-def test_is_knowledge_md_rejects_arbitrary_suffix_note():
-    # 文件名 != 父目录名 + ' 索引.md' 且 top 不在白名单 → 拒绝
-    assert _is_knowledge_md('随便目录/随便 索引.md') is False
+def test_arbitrary_suffix_note_is_not_mistaken_for_a_system_index():
+    """原用例断言 `随便目录/随便 索引.md` 被拒，那依赖「top 不在白名单」这半边。
+    2026-09-03 判据反转为排除法后，它作为**普通笔记**被纳入才是正确行为。
+    本用例改为守住原本真正要守的那一半：文件名前缀 != 父目录名 ⇒ 它不是系统索引，
+    只是恰好叫这个名字（防止伪装成索引的文件走 is_system_index 那条快速放行）。"""
+    from rebuild_index import is_system_index
+    assert is_system_index('随便目录/随便 索引.md') is False
+    assert _is_knowledge_md('随便目录/随便 索引.md') is True
+
+
+def test_notes_outside_the_former_whitelist_are_included():
+    """2026-09-03 回归守卫。
+
+    原白名单只有 工作日志/Claude Code/项目笔记/缺陷全链路/技术笔记/偏好与习惯/参考资料/领域，
+    漏掉了某用户 Vault 里真实存在的 4 个顶层目录。这些目录下只有系统索引能靠
+    is_system_index 放行，普通笔记的新增与修改被**静默**漏提交：实测 6 篇长期滞留，
+    其中 4 篇从未入过 git 且被该用户的 CLAUDE.local.md 直接引用。
+
+    最后一条（未来才新建的目录）是本用例的重点：白名单法每加一个顶层目录就要改代码，
+    忘了改就再次静默漏掉——排除法必须让新目录自动纳入。
+    """
+    for p in ('Windows 系统/AppXSvc 句柄泄漏根因 2026-08-06.md',
+              '改进计划/2026-05-19-x.md',
+              'plans/2026-09-03-y.md',
+              'specs/2026-09-03-z.md',
+              '将来才新建的顶层目录/某笔记.md'):
+        assert _is_knowledge_md(p) is True, p
+
+
+def test_tool_and_metadata_dirs_are_excluded():
+    """排除法的另一半：工具/元数据目录不得被收进来。
+    判据是「顶层段以 . 开头」，一次覆盖 .obsidian/.meta/.trash/.git，
+    不逐个枚举——枚举正是白名单缺陷的成因。"""
+    for p in ('.obsidian/plugins/foo/README.md',
+              '.meta/notes.md',
+              '.trash/deleted.md',
+              '.git/x.md',
+              '.hidden.md'):
+        assert _is_knowledge_md(p) is False, p
+
+
+def test_system_index_form_inside_tool_dirs_is_still_excluded():
+    """判据**顺序**契约：点目录排除必须先于 `is_system_index`。
+
+    `is_system_index` 的规则是「文件名前缀 == 父目录名」，而工具/元数据目录下同样
+    能出现这种形态（`.obsidian/.obsidian 索引.md`）。2026-09-03 引入点目录排除时它被
+    放在 `is_system_index` **之后**，于是这批路径被抢先放行；而同批新增的
+    `test_tool_and_metadata_dirs_are_excluded` 用的样本全是**非**索引形态，正好测不到
+    这个缺口。
+
+    第一条断言是**阳性对照**：若这些路径根本不是 is_system_index 形态，本用例就
+    退化成在测一条与顺序无关的普通排除，必须让它当场失败而不是假绿。
+    """
+    from rebuild_index import is_system_index
+    for p in ('.obsidian/.obsidian 索引.md',
+              '.meta/.meta 索引.md',
+              '.trash/.trash 索引.md',
+              '.git/.git 索引.md'):
+        assert is_system_index(p) is True, (
+            f"阳性对照失败：{p} 不是 is_system_index 形态，本用例已失去判别力")
+        assert _is_knowledge_md(p) is False, p
 
 
 def test_is_knowledge_md_path_traversal_still_blocked():

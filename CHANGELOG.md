@@ -2,6 +2,54 @@
 
 本文件记录 Context Vault（原 claude-vault）的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-09-07
+
+**这一版会改变默认行为，升级前请先读「变更」第一条。** `session_topic` 由默认关改为默认开：
+它让「继续执行」「ok」这类短 prompt 也能召回笔记，代价是**每个会话的首轮会拉起一个 `claude -p
+--model haiku` 子进程，消耗你的额度**，并把该轮 prompt 原文与若干候选笔记的路径+摘要发给它。
+是**每会话一次**，不是每轮：spawn 之后立刻落 in-flight 标记，同一会话在 TTL 窗口内不再重复拉起。
+不想要就在配置的 `relevance` 段写 `"session_topic": false`。
+
+### 新增
+
+- **会话主题词参与召回打分**（`session_topic`，**本版起默认开**，见「变更」首条）：从近期会话提炼主题词，只参与打分、不进注入正文，权重刻意低于精度闸门。提炼在 detached 子进程里做，固定 argv 与超时，全链路 fail-open。
+- **层 1 闸门**：纯指代型 prompt（「继续」「那个呢」这类）不再触发召回注入。
+- `analyze_metrics.py --review-web`：在浏览器里批量勾选标注，一次提交写回。
+- SessionStart 通道的 metrics 落盘 —— 此前该通道的注入成本完全不落盘，在「值不值」的账上整个缺席。
+- 人工标注落盘 `context_ids`，使标注可关联到**具体哪次提问**。缺这个关联时标注无法用于计算 precision，此前累积的 74 条因此不可用。
+
+### 变更
+
+- **`obsidian_cli` 由默认启用改为默认禁用**（`summarize-session`）。CLI 路径要求 Obsidian GUI 正在运行且已注册 CLI，两个前提在多数环境不成立；不成立时每次操作都要先付一次 `probe()` 的子进程开销才降级，而文件 I/O 路径覆盖全部 op、功能不缺失。启用：canonical config 写 `{"obsidian_cli": {"enabled": true}}`，或单次调用加 `--enable-cli`。
+- **`session_topic` 由默认关改为默认开（行为变更，影响所有未显式配置该键的用户）。** 目的是救回被
+  `too_few_keywords` 闸门拦下的那批轮次——作者本机 4032 轮实测中它拦下 555 轮（13.8%），这些轮次
+  当前一篇笔记都召不回。三项代价请自行权衡：
+  1. **消耗额度**：每会话首轮拉起一个 detached `claude -p --model haiku` 子进程。失败或超时不会每轮
+     重试（负缓存收敛为「每 `user_prompt_submit.state_ttl_hours` 窗口最多一次」）。
+  2. **暴露面**：该子进程收到本轮 prompt 原文 + `session_topic_top_n`（默认 10）篇候选笔记的路径与
+     摘要，经 stdin 传入（不落 argv/进程表）。提炼产物只写本机 state 文件，不上传、不进 metrics。
+  3. **对存量用户即时生效**：该键晚于「停止首跑全量物化」引入，因此没有任何用户的 `config.json`
+     物化过它——升级后所有未显式写该键的用户都会被打开，不是只影响新装。
+
+  关掉：`relevance` 段显式写 `"session_topic": false`，显式值永远覆盖默认。
+- **程序化调用不再注入**（`claude -p`、SDK 等非人类发起的会话）。
+- `summarize-session` 写入 Vault 的纳入判据由「顶层目录白名单」改为**排除法**：除顶层段以 `.` 开头的工具/元数据目录外一律纳入，新建顶层目录自动生效。原白名单每新增一个顶层目录就要改代码，忘了改则**静默漏提交**。
+  > ⚠️ 该判据只看**顶层段**，嵌套在笔记目录下的工具目录（`技术笔记/.trash/` 等）仍会被提交 —— 这是既有行为，非本次引入。
+- **宿主拒绝写入时不再永久静默**：改为登记一条带冷却的 `degraded` 诊断（同一目录一天最多一次）。原先无条件吞掉全部 `PermissionError`，而 Windows 上「文件被占用」抛的也是它，于是「用户目录权限真的配坏了」同样无声。
+- Codex/Windows 的 `commandWindows` 改为**只做 verbatim 前缀归一化**，根的选择交回 `run-hook.cmd`。
+
+### 修复
+
+- **Windows 下每轮 UPS 闪一个控制台窗口**（随 `session_topic` 默认开暴露）。`spawn_topic_extraction` 用 `DETACHED_PROCESS` 起的子进程自身没有控制台，它再调 `claude` 时 Windows 会给这个孙子进程分配**可见控制台窗口**——Claude Code 只抑制自己直接 spawn 的 hook。已给内外两处加 `CREATE_NO_WINDOW`（非 Windows 传 0，无影响）。
+- **同一会话 20 秒内连续提问会并发堆积多个付费 LLM 子进程**（随 `session_topic` 默认开暴露）。负缓存此前要等提炼子进程跑完才建立，而它要等 LLM 往返（中位 21s）；这段空窗里每轮 UPS 都会再拉起一个，与「每个 TTL 窗口最多一次」的既定语义不符。现在 spawn 成功后父进程立即落 in-flight 占位，失败则不落、保留重试。
+- **Codex/Windows 下 hook 可能完全不执行**：`commandWindows` 无条件读 `CLAUDE_PLUGIN_ROOT`，该变量缺失时 PowerShell 抛异常、rc=1，wrapper 与目标脚本从未被执行 —— 恰好在它唯一服务的那个 runtime 上 fail-closed。
+- **Codex/Windows 下可能静默执行另一份插件副本**：`commandWindows` 用 `CLAUDE_PLUGIN_ROOT` 覆盖宿主给的 `PLUGIN_ROOT`，使 wrapper 的择根失效。两条路径退出码都是 0，无任何征兆。双 runtime 用户在同一终端里会自然触发。
+- 工具/元数据目录下的「系统索引」形态（`.obsidian/.obsidian 索引.md`）绕过排除被提交。
+- 精度标注抽样按 kind 分配额 —— 全文侧此前被结构性挤出，该侧标注恒为 0。
+- 报表口径三处订正：全量成因分布、全文注入率按阈值分期、埋点时代切分。
+- 两个 near-miss 榜的「N 次」量纲不同，此前可被误读成可直接比大小。
+- `.tmp/` 未被忽略，导致工作树永远不干净、发布门禁「Codex 产物构建」**永久跳过**且汇总显示为 PASS。
+
 ## [1.0.0] - 2026-08-28
 
 ### 新增

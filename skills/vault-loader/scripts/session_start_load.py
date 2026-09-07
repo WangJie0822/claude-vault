@@ -14,6 +14,32 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def _report_nonfatal(message: str, exc: BaseException) -> None:
+    """真实故障走 stderr；宿主拒绝写入降级为一条**带冷却的诊断**，而非永久静默。
+
+    与 `prompt_submit_load._report_nonfatal` 保持同一行为；判据单点在
+    `context_vault/degrade.py`（此前两处各写了一份 `isinstance(exc, PermissionError)`，
+    另有第三份内联在 `_metrics.flush()` 里）。改动理由见该模块 docstring：
+    Windows 上「文件被占用」抛的同样是 `PermissionError`，永久静默会把它与
+    「用户目录权限真的配坏了」一并吞掉。
+    """
+    denied = False
+    try:
+        from context_vault.degrade import is_host_write_denied
+        denied = is_host_write_denied(exc)
+    except Exception:  # noqa: BLE001 — 拿不到公共层判据时**不猜**，按真实故障处理
+        pass
+    if denied:
+        try:
+            from scripts._diagnostics import host_write_denied, notify
+            notify(host_write_denied(message))
+        except Exception:  # noqa: BLE001 — 诊断绝不阻断召回
+            pass
+        return
+    print(f"[vault-loader] {message}：{exc}", file=sys.stderr)
+
+
 # 确保能 import 同级模块
 sys.path.insert(0, str(Path(__file__).parent.parent))
 _PLUGIN_ROOT = Path(__file__).resolve().parents[3]
@@ -358,7 +384,7 @@ def main() -> int:
             ):
                 return 0
         except Exception as exc:
-            print(f"[vault-loader] 事件去重失败，继续执行：{exc}", file=sys.stderr)
+            _report_nonfatal("事件去重失败，继续执行", exc)
 
     # ↓↓↓ 停用闸门到此为止，从这里开始才允许登记诊断 ↓↓↓
     if cfg_fallback == "corrupt":
@@ -468,7 +494,7 @@ def main() -> int:
         from scripts._state import save_injected
         save_injected(cwd, [e.path for e in project_notes] + top_worklogs)
     except Exception as exc:
-        print(f"[vault-loader] state 写入失败：{exc}", file=sys.stderr)
+        _report_nonfatal("state 写入失败", exc)
 
     # SessionStart 的注入开销此前完全不落盘（本文件对 _metrics 的引用数曾是 0），
     # 于是这条通道在「值不值」的账上整个缺席。落一条极简记录：只记规模与开销，
@@ -484,8 +510,7 @@ def main() -> int:
             _m.flush(Path.home(),
                      config.get("metrics", {}).get("retention_days", 90))
         except Exception as exc:  # noqa: BLE001
-            print(f"[vault-loader] SessionStart metrics 落盘失败：{exc}",
-                  file=sys.stderr)
+            _report_nonfatal("SessionStart metrics 落盘失败", exc)
 
     return _finish(config, cwd, additional_context=injection_text, system_message=summary)
 

@@ -15,6 +15,28 @@ from typing import Any
 
 OBSIDIAN_PROC = "Obsidian"
 DEFAULT_TIMEOUT = 5.0
+
+# Obsidian CLI 默认**禁用**。降级路径（纯文件 I/O）覆盖全部 op 且无外部依赖，
+# 而启用态要求 Obsidian GUI 正在运行 + CLI 已注册，两个前提在多数环境不成立；
+# 不成立时每次 op 都要先付一次 probe 的子进程开销（tasklist/pgrep + which）才降级。
+# 想启用：canonical config 写 {"obsidian_cli": {"enabled": true}}，或构造时传 enabled=True。
+DEFAULT_ENABLED = False
+CANONICAL_CONFIG = Path.home() / ".context-vault" / "config.json"
+
+
+def _config_enabled() -> bool:
+    """读 canonical config 的 obsidian_cli.enabled。
+
+    任何异常（文件缺失、JSON 损坏、类型不对）一律回落 DEFAULT_ENABLED —— 与本模块
+    其余部分同一降级方向：读不到配置时选那个「不依赖外部进程」的分支，而不是反过来。
+    只认 bool，字符串 "true" 不算：配置里写错类型时应当维持默认而不是被静默解读。
+    """
+    try:
+        data = json.loads(CANONICAL_CONFIG.read_text(encoding="utf-8"))
+        v = data.get("obsidian_cli", {}).get("enabled")
+        return v if isinstance(v, bool) else DEFAULT_ENABLED
+    except Exception:  # noqa: BLE001 — 配置不可读不应让整个 skill 失败
+        return DEFAULT_ENABLED
 # Windows 上 Obsidian 1.12.x CLI single-instance forward 协议在大 argv 下崩主进程
 # （envelope JSON 多关一次 `]` → socket 接收端 JSON.parse 失败）
 # 实证：单次 8KB content 必触发；4KB 作保守阈值兜底。命中时跳过 CLI 直接走 fallback 文件 I/O。
@@ -91,9 +113,13 @@ class Degraded:
 
 
 class ObsidianCLI:
-    def __init__(self, vault_path: str, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(self, vault_path: str, timeout: float = DEFAULT_TIMEOUT,
+                 enabled: bool | None = None) -> None:
         self.vault_path = Path(vault_path).expanduser().resolve()
         self.timeout = timeout
+        # None = 未显式指定 ⇒ 查配置（配置也没有则 DEFAULT_ENABLED=False）。
+        # 显式传值优先，供测试与命令行 --enable-cli 使用。
+        self.enabled = _config_enabled() if enabled is None else bool(enabled)
         self.degraded = Degraded()
         self._probe_cache: dict | None = None
         self._vault_name: str | None = None  # 多 Vault 时需要指定
@@ -109,6 +135,12 @@ class ObsidianCLI:
         - Windows：tasklist + shutil.which('obsidian')
         """
         if self._probe_cache is not None:
+            return self._probe_cache
+
+        # 禁用态在**这里**短路，而不是在每个 op 里判：所有 op 都经 _ensure_ready() →
+        # probe()，所以一处即可让全部操作走 fallback，且省掉 probe 自身的子进程开销。
+        if not self.enabled:
+            self._probe_cache = {"ok": False, "reason": "disabled-by-config"}
             return self._probe_cache
 
         is_windows = sys.platform == "win32"
@@ -521,6 +553,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Obsidian CLI 封装层")
     p.add_argument("--vault", required=True)
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    p.add_argument("--enable-cli", action="store_true",
+                   help="本次调用启用 Obsidian CLI（默认禁用，全程走文件 I/O）")
     sub = p.add_subparsers(dest="op", required=True)
 
     sub.add_parser("probe")
@@ -563,7 +597,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
-    cli = ObsidianCLI(args.vault, timeout=args.timeout)
+    cli = ObsidianCLI(args.vault, timeout=args.timeout,
+                      enabled=True if args.enable_cli else None)
 
     dispatch = {
         "probe": lambda: cli.probe(),

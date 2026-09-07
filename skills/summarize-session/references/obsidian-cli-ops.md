@@ -46,6 +46,7 @@ stdout 统一输出 JSON：
 
 | 触发条件 | reason 取值 |
 |---|---|
+| **CLI 未启用（默认）** | `disabled-by-config` |
 | `pgrep -x Obsidian` 未命中 | `obsidian-not-running` |
 | `command -v obsidian` 未命中 | `cli-not-registered` |
 | pgrep 超时（>5s） | `pgrep-timeout` |

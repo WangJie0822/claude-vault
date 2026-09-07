@@ -17,7 +17,14 @@ test-output*.txt
 # （唯一保护是 superpowers 工具自己写的 `.superpowers/sdd/.gitignore`，只覆盖一层），
 # `.full-review/` 则只被 per-clone 的 `.git/info/exclude` 挡着、新 clone 完全没有。
 .superpowers/
-.full-review/
+# 带 `*` 是因为归档会话会落成 `.full-review-archive-<日期>/` 这样的兄弟目录。
+.full-review*/
+# 本地调试与评审的临时产物：`pytest --basetemp` 的落点、探针脚本、评审草稿等。
+# 不忽略它会让**工作树永远不干净**，进而使 `run_gates.py` 里那道要求干净树的
+# 「Codex 产物构建」门禁**永久跳过**——而跳过在汇总表里渲染成 `PASS`，与「跑过并
+# 通过」不可区分。2026-09-07 实测：`git status -uall` 的 670 项里 663 项来自这里，
+# 该门禁因此从未真正执行过，且本仓库无任何 CI，没有第二个机制会发现。
+.tmp/
 # git worktree 的物理目录（EnterWorktree 默认落在这里）：纯运行时产物，且里面是另一份
 # 完整工作树，误 add 会把整个仓库副本连同其 .full-review/.superpowers 一起提交进来。
 .claude/

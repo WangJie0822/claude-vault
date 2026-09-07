@@ -40,6 +40,7 @@ CODE_VAULT_UNREACHABLE = "vault_unreachable"
 CODE_CACHE_BROKEN = "cache_broken"
 CODE_VAULT_PATH_MISMATCH = "vault_path_mismatch"
 CODE_NEAR_MISS_NUDGE = "near_miss_nudge"
+CODE_HOST_WRITE_DENIED = "host_write_denied"
 
 # 外部可控文本的长度上限。诊断进 systemMessage，过长会淹没终端。
 _MAX_FIELD = 200
@@ -229,6 +230,29 @@ def vault_path_mismatch(vl_path: object, ss_path: object, config_fell_back: bool
             f"summarize-session={safe_field(ss_path, 80)}"
         ),
         hint="写入与读取会落在不同目录。运行 /summarize-session --set-default 或手动对齐。",
+    )
+
+
+def host_write_denied(detail: object) -> Diagnosis:
+    """宿主拒绝写入：召回仍在工作（读路径不受影响），但状态/指标写不进去。
+
+    级别取 `degraded` 而非 `fatal` —— 本轮召回照常发生，受影响的是注入去重与指标落盘。
+
+    ⚠️ 这是「判据一律偏向沉默」（模块 docstring 第 3 条）之下**刻意保留**的一次发声。
+    权衡如下：此前这类异常被无条件、永久静默，代价是「用户目录权限真的配坏了」
+    也完全无声；而 Windows 上文件被占用（WinError 5/32，本机 Obsidian 与安全代理属
+    常态）同样抛 `PermissionError`，两者在异常类型上不可区分。既然无法只报真问题，
+    就让 hint 把「哪种情况无需处理」写死，使即便落在误报那一侧的读者也能一眼判断
+    不必行动 —— 这比「永久沉默」与「无差别报警」都更接近该条约束的本意。
+    按 code+cwd 的 TTL 冷却保证同一目录一天最多出现一次。
+    """
+    return Diagnosis(
+        code=CODE_HOST_WRITE_DENIED,
+        level=LEVEL_DEGRADED,
+        message=f"宿主拒绝写入，本轮已降级为只读：{safe_field(detail)}",
+        hint="若你在 Codex 的 workspace-write 沙箱、只读挂载，或该文件正被 Obsidian "
+             "等程序占用，这是预期降级、召回不受影响，无需处理；"
+             "若都不是，请检查 ~/.claude 与 ~/.context-vault 的目录权限。",
     )
 
 

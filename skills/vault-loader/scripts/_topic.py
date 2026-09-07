@@ -26,6 +26,25 @@ MAX_TOPIC_WORDS = 8         # 每个会话最多几个主题词（与 spec 的 3
 MAX_TOPIC_WORD_LEN = 100    # 每个词的最大长度（UTF-8 中文 3B/字 ⇒ 最多 300B；
                             # 5×8×300B=12KB，远小于 102KB 上限 ⇒ topics 体量恒有界）
 
+# Windows 控制台弹窗抑制。非 Windows 上 subprocess 无此常量，getattr 兜底为 0
+# （0 是 creationflags 的中性值，POSIX 分支本就不传它）。
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _no_window_flags() -> int:
+    """给**同步** subprocess.run 用的 creationflags。
+
+    为什么内层这一处才是弹窗真凶：`spawn_topic_extraction` 用 DETACHED_PROCESS 起的
+    子进程**自身没有控制台**，而它接着用 subprocess.run 调 `claude`——在无控制台的父
+    进程下，Windows 会给 console 子系统的子进程**分配一个可见控制台窗口**。Claude Code
+    只对它直接 spawn 的 hook 做窗口抑制，这个孙子进程逃在抑制之外。
+
+    实证形态见知识库「Windows Claude Code 会话启动控制台弹窗根因与修复」：同一机制
+    此前由 worktree GC 的 detached worker 触发过一次。session_topic 从 opt-in 改为
+    默认开之后，每个 Windows 用户的每轮 UPS 都会走到这里，故必须抑制。
+    """
+    return _NO_WINDOW if os.name == "nt" else 0
+
 
 def load_session_topic(cwd: Path, session_id: str, ttl_hours: float) -> list[str]:
     """读该会话的主题词。缺失 / 损坏 / 过期 / 结构不对 → 空列表，绝不抛异常。"""
@@ -225,7 +244,7 @@ def _call_model(prompt_text: str) -> str | None:
              "--no-session-persistence"],
             input=prompt_text, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=TOPIC_TIMEOUT_SEC,
-            env=env, shell=False)
+            env=env, shell=False, creationflags=_no_window_flags())
     except Exception:                           # noqa: BLE001
         return None
     return r.stdout if r.returncode == 0 else None
@@ -257,7 +276,8 @@ def spawn_topic_extraction(cwd: Path, session_id: str, prompt: str,
                         "cwd": str(Path(__file__).resolve().parents[1])}
         if os.name == "nt":
             kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
-                                       | subprocess.CREATE_NEW_PROCESS_GROUP)
+                                       | subprocess.CREATE_NEW_PROCESS_GROUP
+                                       | _NO_WINDOW)
         else:
             kwargs["start_new_session"] = True
         proc = subprocess.Popen(argv, **kwargs)  # noqa: S603 — argv 全部由本模块构造
@@ -268,6 +288,17 @@ def spawn_topic_extraction(cwd: Path, session_id: str, prompt: str,
             proc.stdin.close()
         except Exception:                        # noqa: BLE001
             pass
+        # in-flight 标记：Popen 成功后**父进程立即**落一个空 words 的时间戳占位。
+        #
+        # 不落的话，`has_recent_topic_attempt` 要等子进程跑完才为真，而子进程中位耗时
+        # 21s（LLM 往返）——这段空窗里每一轮 UPS 都会再 spawn 一个新的提炼子进程，
+        # 与调用方注释声称的「每个 TTL 窗口最多一次」不符。实测：7 次采样在 3s 内跑完，
+        # 7 次全部重复 spawn。生产上表现为「首轮后 20 秒内连续提问 ⇒ 并发堆积多个付费
+        # LLM 子进程」。F2（2026-09-02）只堵了「失败之后」，没堵「进行中」。
+        #
+        # 子进程完成时用真实结果再 save 一次覆盖它（ts 一并刷新），故占位不会让提炼
+        # 结果丢失；spawn 失败（Popen 抛异常）走外层 except，不落标记，保留重试。
+        save_session_topic(cwd, session_id, [])
         return True
     except Exception as exc:                     # noqa: BLE001 — fail-open
         print(f"[vault-loader] 主题提炼拉起失败：{exc}", file=sys.stderr)

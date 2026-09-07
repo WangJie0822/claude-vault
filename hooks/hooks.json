@@ -2,10 +2,29 @@
   "description": "context-vault: auto-inject local knowledge into session context",
   "hooks": {
     "SessionStart": [
-      { "matcher": "startup|clear|compact", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/session_start_load.py", "additionalContextLimit": 12000 }] }
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/session_start_load.py",
+            "additionalContextLimit": 12000,
+            "commandWindows": "powershell.exe -NoProfile -NonInteractive -Command \"foreach ($n in 'PLUGIN_ROOT','CLAUDE_PLUGIN_ROOT') { $v = [Environment]::GetEnvironmentVariable($n); if ($v) { [Environment]::SetEnvironmentVariable($n, $v.Replace('\\\\?\\UNC\\','\\\\').Replace('\\\\?\\','')) } }; $r = $env:PLUGIN_ROOT; if (-not $r) { $r = $env:CLAUDE_PLUGIN_ROOT }; if ($r) { $w = Join-Path $r 'hooks/run-hook.cmd'; if (Test-Path $w) { & $w 'skills/vault-loader/scripts/session_start_load.py'; exit 0 } }; [Console]::Error.WriteLine('[context-vault] hook wrapper not found (tried PLUGIN_ROOT, CLAUDE_PLUGIN_ROOT)'); exit 0\""
+          }
+        ]
+      }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/prompt_submit_load.py", "additionalContextLimit": 12000 }] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/prompt_submit_load.py",
+            "additionalContextLimit": 12000,
+            "commandWindows": "powershell.exe -NoProfile -NonInteractive -Command \"foreach ($n in 'PLUGIN_ROOT','CLAUDE_PLUGIN_ROOT') { $v = [Environment]::GetEnvironmentVariable($n); if ($v) { [Environment]::SetEnvironmentVariable($n, $v.Replace('\\\\?\\UNC\\','\\\\').Replace('\\\\?\\','')) } }; $r = $env:PLUGIN_ROOT; if (-not $r) { $r = $env:CLAUDE_PLUGIN_ROOT }; if ($r) { $w = Join-Path $r 'hooks/run-hook.cmd'; if (Test-Path $w) { & $w 'skills/vault-loader/scripts/prompt_submit_load.py'; exit 0 } }; [Console]::Error.WriteLine('[context-vault] hook wrapper not found (tried PLUGIN_ROOT, CLAUDE_PLUGIN_ROOT)'); exit 0\""
+          }
+        ]
+      }
     ]
   }
 }

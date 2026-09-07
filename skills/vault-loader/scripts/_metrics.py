@@ -872,7 +872,26 @@ def flush(home: Path, retention_days: int | None = None) -> None:
                 mark_pruned(home)
         except Exception as exc:  # noqa: BLE001 — 清理绝不影响主流程
             import sys
-            print(f"[vault-loader] metrics 清理失败：{exc}", file=sys.stderr)
+            # 宿主拒绝写入（Codex workspace-write 沙箱把 per-user 目录放在可写区之外、
+            # 只读挂载、或文件被占用）不是本插件的故障，不该变成 host 可见的 hook 失败。
+            #
+            # 判据单点在 `context_vault/degrade.py`：此处曾内联第三份
+            # `isinstance(exc, PermissionError)`，与两个入口脚本里的两份副本并存 ——
+            # 而该内联版**漏掉了只读文件系统**（POSIX 上是 OSError(EROFS)，CPython
+            # 不将其映射为 PermissionError）。
+            #
+            # 与两个入口脚本不同，这里**刻意不**升级为用户可见诊断：prune 只是保留期
+            # 清理，失败没有后续影响；且本模块被每次 UserPromptSubmit 无条件 import，
+            # 不引入对诊断层的依赖。真正需要用户知道的写失败由调用方的
+            # `_report_nonfatal` 负责上报。
+            denied = False
+            try:
+                from context_vault.degrade import is_host_write_denied
+                denied = is_host_write_denied(exc)
+            except Exception:  # noqa: BLE001 — 拿不到公共层判据时按真实故障处理
+                pass
+            if not denied:
+                print(f"[vault-loader] metrics 清理失败：{exc}", file=sys.stderr)
 
 
 def prune_expired(home: Path, retention_days: int) -> int:

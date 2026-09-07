@@ -265,7 +265,21 @@ def test_spawn_returns_false_when_cli_missing(tmp_path: Path, monkeypatch) -> No
 
 
 def test_spawn_does_not_block(tmp_path: Path, monkeypatch) -> None:
-    """承重守卫：spawn 必须立即返回。UPS 有 300ms 预算，而 LLM 要 21 秒。"""
+    """承重守卫：spawn 必须立即返回。UPS 有 300ms 预算，而 LLM 要 21 秒。
+
+    阈值 1.0s 的依据（本机实测，各 n=30，FakePopen 不起真进程）：
+      健康态 spawn+in-flight 写：median 12.3ms / p90 17.3ms / max 39.5ms
+        （其中 save_session_topic 单独就有 median 15.7ms / max 72.9ms —— 磁盘抖动主导）
+      阻塞态（真等子进程跑完 LLM）：中位 21s，超时上限 120s
+    两个总体相差约 288 倍，阈值取两侧几何中心 sqrt(73ms × 21000ms) ≈ 1.24s，
+    落在 1.0s 时健康态留 13 倍余量、阻塞态留 21 倍余量。
+
+    **原阈值 50ms 与被测操作同量级，天生 flaky**：in-flight 标记（父进程 spawn 后立即
+    落时间戳占位，见 spawn_topic_extraction）是一次读-改-写文件 IO，单独就能摸到 72.9ms。
+    该用例因此在机器繁忙时随机转红——不是实现回归，是阈值贴着健康态上界取的。
+    调宽不削弱判别力：它要抓的失效是「spawn 改成等子进程」，那是 21s 量级，与 1s 差 21 倍。
+    改阈值前请先重测上面两个区间，只看阈值数字无法判断它是否仍成立。
+    """
     import time as time_mod
     started = {}
 
@@ -282,7 +296,8 @@ def test_spawn_does_not_block(tmp_path: Path, monkeypatch) -> None:
     t0 = time_mod.perf_counter()
     ok = spawn_topic_extraction(tmp_path, "s", "prompt", [("a.md", "x")], {})
     assert ok is True
-    assert (time_mod.perf_counter() - t0) < 0.05, "spawn 阻塞了"
+    elapsed = time_mod.perf_counter() - t0
+    assert elapsed < 1.0, f"spawn 阻塞了：{elapsed*1000:.1f}ms（健康态实测 max 39.5ms）"
     # argv 应为 [python, -m, scripts._topic, cwd, session_id]——F4（终审 2026-09-02）
     # 后不再含 prompt/payload，见 test_spawn_sends_prompt_via_stdin_not_argv。
     assert "-m" in started["argv"] and "scripts._topic" in started["argv"], \
@@ -385,7 +400,103 @@ def test_spawn_detach_on_windows(tmp_path: Path, monkeypatch) -> None:
     assert "creationflags" in started["kw"], "Windows 上应设 creationflags"
     assert started["kw"]["creationflags"] == (
         subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        | subprocess.CREATE_NO_WINDOW
     ), f"creationflags 值错误：{started['kw']['creationflags']}"
+
+
+def test_call_model_suppresses_console_window(monkeypatch) -> None:
+    """内层调 claude 必须带 CREATE_NO_WINDOW —— 这一处才是弹窗真凶。
+
+    `spawn_topic_extraction` 用 DETACHED_PROCESS 起的子进程自身没有控制台，它再用
+    subprocess.run 调 `claude` 时，Windows 会给这个 console 子系统的孙子进程分配一个
+    **可见控制台窗口**（Claude Code 只抑制它直接 spawn 的 hook，抑制不到孙子进程）。
+    session_topic 默认开之后每轮 UPS 都会走到这里，不抑制就是每轮闪一次窗。
+
+    钉内层而不只钉外层：外层那条断言全绿时这里照样可以弹窗，两处互不覆盖。
+    """
+    from scripts import _topic
+    seen = {}
+
+    class _R:
+        returncode = 0
+        stdout = "召回, 打分"
+
+    def _fake_run(*a, **kw):
+        seen.update(kw)
+        return _R()
+
+    monkeypatch.setattr("scripts._topic.shutil.which", lambda _n: "/usr/bin/claude")
+    monkeypatch.setattr("scripts._topic.subprocess.run", _fake_run)
+    monkeypatch.setattr("scripts._topic.os.name", "nt")
+    monkeypatch.setattr(_topic, "_NO_WINDOW", subprocess.CREATE_NO_WINDOW)
+    assert _topic._call_model("prompt") == "召回, 打分"
+    assert seen.get("creationflags") == subprocess.CREATE_NO_WINDOW, (
+        f"内层调 claude 未抑制控制台窗口：creationflags={seen.get('creationflags')!r}")
+
+
+def test_call_model_no_window_flag_is_noop_off_windows(monkeypatch) -> None:
+    """非 Windows 上必须传 0 而不是 Windows 常量——POSIX 的 CreateProcess 不认它。
+
+    与上一条成对：只钉 nt 分支的话，把 `_no_window_flags` 写成无条件返回常量也全绿，
+    而那在 Linux/macOS 上会给 subprocess 传一个无意义的非零值。
+    """
+    from scripts import _topic
+    seen = {}
+
+    class _R:
+        returncode = 0
+        stdout = "x"
+
+    def _fake_run(*a, **kw):
+        seen.update(kw)
+        return _R()
+
+    monkeypatch.setattr("scripts._topic.shutil.which", lambda _n: "/usr/bin/claude")
+    monkeypatch.setattr("scripts._topic.subprocess.run", _fake_run)
+    monkeypatch.setattr("scripts._topic.os.name", "posix")
+    assert _topic._call_model("prompt") == "x"
+    assert seen.get("creationflags") == 0, (
+        f"非 Windows 上 creationflags 应为 0，实为 {seen.get('creationflags')!r}")
+
+
+def test_spawn_marks_attempt_immediately(tmp_path: Path, monkeypatch) -> None:
+    """spawn 成功后**父进程立即**落 attempt 标记，不等子进程跑完。
+
+    子进程要等 LLM 往返（中位 21s）才 save，若父进程不落标记，这段空窗里
+    `has_recent_topic_attempt` 恒为 False —— 每一轮 UPS 都会再拉起一个提炼子进程，
+    与调用方声称的「每个 TTL 窗口最多一次」不符。生产表现是「首轮后 20 秒内连续
+    提问 ⇒ 并发堆积多个付费 LLM 子进程」，测试里表现为 UPS 性能用例超标。
+
+    这里刻意**不**让子进程真的运行（FakePopen），标记若仍存在，就只可能来自父进程。
+    """
+    class FakePopen:
+        def __init__(self, *a, **kw):
+            self.stdin = mock.MagicMock()
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr("scripts._topic.shutil.which", lambda _n: "/usr/bin/claude")
+    monkeypatch.setattr("scripts._topic.subprocess.Popen", FakePopen)
+    assert has_recent_topic_attempt(tmp_path, "sess-inflight", 24) is False, "前置：应无标记"
+    assert spawn_topic_extraction(tmp_path, "sess-inflight", "p", [], {}) is True
+    assert has_recent_topic_attempt(tmp_path, "sess-inflight", 24) is True, (
+        "spawn 后应立即有 in-flight 标记，否则 TTL 窗口内会重复 spawn")
+
+
+def test_spawn_failure_leaves_no_attempt_marker(tmp_path: Path, monkeypatch) -> None:
+    """spawn 失败时**不得**落标记——否则一次偶发失败会锁死整个 TTL 窗口的重试。
+
+    与上一条成对：只钉「成功要落标记」的话，把 save 无条件提到 Popen 之前也全绿。
+    """
+    def _boom(*a, **kw):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr("scripts._topic.shutil.which", lambda _n: "/usr/bin/claude")
+    monkeypatch.setattr("scripts._topic.subprocess.Popen", _boom)
+    assert spawn_topic_extraction(tmp_path, "sess-boom", "p", [], {}) is False
+    assert has_recent_topic_attempt(tmp_path, "sess-boom", 24) is False, (
+        "spawn 失败不应落标记，否则该 TTL 窗口内不再重试")
 
 
 def test_spawn_detach_on_posix(tmp_path: Path, monkeypatch) -> None:

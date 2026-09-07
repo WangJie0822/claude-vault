@@ -12,6 +12,36 @@ import sys
 import time
 from pathlib import Path
 
+
+def _report_nonfatal(message: str, exc: BaseException) -> None:
+    """真实故障走 stderr；宿主拒绝写入降级为一条**带冷却的诊断**，而非永久静默。
+
+    2026-09-07 改：原实现无条件 `return` 掉全部 `PermissionError`。但 Windows 上
+    「文件被占用」（WinError 5/32，本机 Obsidian 与安全代理属常态）抛的同样是该异常
+    —— `skills/summarize-session/scripts/_fs.py` 正为此做指数退避重试。永久静默会把它
+    与「用户目录权限真的配坏了」一并吞掉，而后者需要用户知道。
+
+    判据单点在 `context_vault/degrade.py`：此前这里、`session_start_load` 与
+    `_metrics.flush()` 各写了一份 `isinstance(exc, PermissionError)`，改一处漏两处，
+    且任何一处漏改都不会让测试转红。延迟 import 是因为本函数定义在 sys.path 注入
+    之前，而它只在异常路径被调用。
+    """
+    denied = False
+    try:
+        from context_vault.degrade import is_host_write_denied
+        denied = is_host_write_denied(exc)
+    except Exception:  # noqa: BLE001 — 拿不到公共层判据时**不猜**，按真实故障处理
+        pass
+    if denied:
+        try:
+            from scripts._diagnostics import host_write_denied, notify
+            notify(host_write_denied(message))
+        except Exception:  # noqa: BLE001 — 诊断绝不阻断召回
+            pass
+        return
+    print(f"[vault-loader] {message}：{exc}", file=sys.stderr)
+
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 _PLUGIN_ROOT = Path(__file__).resolve().parents[3]
 # 只有**确实像插件根**才插入 sys.path。legacy 独立布局
@@ -569,7 +599,7 @@ def _finish_with_metrics(config: dict, cwd: Path,
         retention_days = mcfg.get("retention_days", 90) if enabled else None
         _metrics.flush(Path.home(), retention_days=retention_days)
     except Exception as exc:  # noqa: BLE001 — 指标绝不阻断召回
-        print(f"[vault-loader] metrics 写入失败：{exc}", file=sys.stderr)
+        _report_nonfatal("metrics 写入失败", exc)
     return rc
 
 
@@ -673,7 +703,7 @@ def main() -> int:
             ):
                 return 0
         except Exception as exc:
-            print(f"[vault-loader] 事件去重失败，继续执行：{exc}", file=sys.stderr)
+            _report_nonfatal("事件去重失败，继续执行", exc)
 
     # ↓↓↓ 停用闸门到此为止，从这里开始才允许登记诊断 ↓↓↓
     if cfg_fallback == "corrupt":
@@ -705,7 +735,12 @@ def main() -> int:
                 # （渲染期异常）加这个检查也堵不住。
                 _metrics.mark_nudged(Path.home())
         except Exception as exc:  # noqa: BLE001 — 提示绝不阻断召回
-            print(f"[vault-loader] near-miss 提示失败：{exc}", file=sys.stderr)
+            # 2026-09-07 补路由：这个 except 包裹的 nudge_due / bump_near_miss_counts /
+            # mark_nudged 全都写 `metrics_dir(home)`（`bump_near_miss_counts` 还会
+            # mkdir + chmod）——正是 `_metrics.flush()` 那处降级注释所援引的目录。
+            # 此前它无条件 print，于是宿主只读时「七处里六处安静、这一处每轮刷屏」，
+            # 而部分覆盖比完全没有更糟：看起来已经解决了。
+            _report_nonfatal("near-miss 提示失败", exc)
 
     vault_path = Path(config["vault_path"]).expanduser()
     # 零配置：非 dry-run 且 vault_path 仍是默认值时才自动建目录（幂等；失败由顶层
@@ -892,7 +927,7 @@ def main() -> int:
                 ft_topical=config["relevance"].get("fulltext_topical_threshold"),
             ))
         except Exception as exc:  # noqa: BLE001
-            print(f"[vault-loader] metrics 构造失败：{exc}", file=sys.stderr)
+            _report_nonfatal("metrics 构造失败", exc)
 
     if not decision.admitted:
         # 触发点2：关键词足够但 topical 全失配。relaxed 静默；非 relaxed 加 state 冷却
@@ -951,7 +986,7 @@ def main() -> int:
         ft_paths = [fulltext_title] if fulltext_title else None
         save_injected(cwd, injected_paths, fulltext_paths=ft_paths)
     except Exception as exc:
-        print(f"[vault-loader] state 写入失败：{exc}", file=sys.stderr)
+        _report_nonfatal("state 写入失败", exc)
 
     return _finish_with_metrics(config, cwd, additional_context=injection_text, system_message=summary)
 

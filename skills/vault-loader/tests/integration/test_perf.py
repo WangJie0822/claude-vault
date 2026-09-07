@@ -108,17 +108,28 @@ def test_prompt_submit_under_300ms(tmp_home: Path, large_vault: Path) -> None:
     cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(large_vault)}))
 
     _UPS_PROMPT = "召回 扩展词 相关性打分 回归测试 语义检索 关键词匹配 怎么优化实现"
+    # 必须传 session_id：生产的 hook payload 一定带它，而 `has_recent_topic_attempt`
+    # 里 `if not session_id: return False` 使空值下负缓存**恒失效** —— 不传就变成每轮都
+    # 拉起一次 session_topic 提炼子进程，测的是生产中不存在的最坏情况。
+    # session_topic 默认关时这条路径恒不执行，所以此前不传也测不出差别；1.1.0 默认开
+    # 之后它就成了形态偏差。首轮那一次 spawn 的开销由下面的
+    # test_first_turn_topic_spawn_overhead_bounded 单独守，不是被这里放过。
+    _SID = "sess-perf-ups"
     for _ in range(WARMUP):
-        _run_script("prompt_submit_load.py", NEUTRAL_CWD, prompt=_UPS_PROMPT)
+        _run_script("prompt_submit_load.py", NEUTRAL_CWD, prompt=_UPS_PROMPT,
+                    extra={"session_id": _SID})
     samples = [
         _run_script(
             "prompt_submit_load.py", NEUTRAL_CWD,
             prompt="召回 扩展词 相关性打分 回归测试 语义检索 关键词匹配 怎么优化实现",
+            extra={"session_id": _SID},
         )[0]
         for _ in range(SAMPLES)
     ]
 
-    p95 = statistics.median(samples)
+    # 变量名曾叫 `p95`，但取的一直是 median（L-10 换统计量时漏改名）。
+    # 那个名字会让 assert 失败消息读起来像在报 p95，据此解读数据会错。
+    observed = statistics.median(samples)
     # 诚实标注：300ms 是 **500 篇合成 fixture 的参考基线**，本用例通过**不代表**生产规模
     # 也在 300ms 内。2026-08-04 本机实测（同 prompt、同 builder，各 n=9 子进程端到端）：
     #   500 篇 fixture      ：median 289ms / 359ms（两轮），min 247ms / 319ms
@@ -133,7 +144,19 @@ def test_prompt_submit_under_300ms(tmp_home: Path, large_vault: Path) -> None:
     #
     # 超支主导项是解释器启动 + O(N) 打分主循环 + 进程 spawn。此处保持 500 篇是为避免
     # 更大规模在内存压力下 flaky；真正的 scaling 天花板需要倒排索引，属独立议题。
-    assert p95 < 0.3, f"UserPromptSubmit 性能超标: {p95:.3f}s（500 笔记参考基线）"
+    # ⚠️ 本用例对**机器负载**敏感。红了先看有没有并发任务在跑，别急着当成回归。
+    # 2026-09-07 本机实测（同 fixture、同 prompt、median of 7）：
+    #   空闲：约 0.20s，5/5 通过，余量约 30%；`run_gates.py` 全量跑时同样全绿
+    #   两个 subagent 并发时：0.32~0.49s，必红
+    # 判定是否**确定性**回归必须做 A/B 交替的 median of N，并看 median 与 min 是否
+    # **同步位移**——只有同步位移才是确定性差异（CLAUDE.md「开发与测试」）。
+    #
+    # 同日的一次实证教训值得记住：固定「先跑新版、后跑旧版」的顺序做 A/B，在负载
+    # 单调下降时会给**先跑者**系统性劣势——第一组数据显示新版慢 1.21s，反序复测却
+    # 显示新版快 0.30s，两组方向相反。真正成立的是「先跑的那个更慢」，与代码无关。
+    # 所以 A/B 必须交替（ABBA），且不要在有并发 agent 的机器上下性能结论。
+    assert observed < 0.3, (
+        f"UserPromptSubmit 性能超标: {observed:.3f}s（500 笔记参考基线，中位数）")
 
 
 def test_prompt_submit_with_metrics_enabled_stays_within_budget(

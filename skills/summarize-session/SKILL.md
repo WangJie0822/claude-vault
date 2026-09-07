@@ -113,15 +113,24 @@ skill 需要知道 Obsidian Vault 的路径才能正确写入笔记。按以下�
 
 不是所有对话都值得记录。只提取**对未来工作有参考价值**的内容，忽略临时性的调试过程和一次性操作。
 
-## Obsidian CLI 前置依赖
+## Obsidian CLI（**默认禁用**）
 
-Vault 内资源操作优先通过 Obsidian 官方 CLI（`obsidian` 命令）完成，通过 `scripts/obsidian_cli.py` 统一封装。
+Vault 内资源操作经 `scripts/obsidian_cli.py` 统一封装。该封装有两条路径：Obsidian 官方 CLI
+（`obsidian` 命令）与纯文件 I/O。**1.1.0 起默认走文件 I/O，不尝试调用 CLI。**
 
-**运行条件**：
+**为什么默认禁用**：CLI 路径要求 Obsidian GUI 正在运行且已注册 CLI，这两个前提在多数环境不
+成立；不成立时每次操作都要先付一次 `probe()` 的子进程开销（tasklist/pgrep + which）才降级。
+而文件 I/O 路径覆盖全部 op、无外部依赖，功能上并不缺失。
+
+**启用**（两种方式，显式传参优先）：
+- canonical config `~/.context-vault/config.json` 写 `{"obsidian_cli": {"enabled": true}}`
+- 单次调用加 `--enable-cli`
+
+**启用后的运行条件**（任一不满足仍自动降级，reason 见 references 的降级矩阵）：
 - Obsidian 1.12.4+ 已安装并在 GUI 中 Register CLI（Settings → General → Command line interface 启用并注册）
-- Obsidian GUI 进程运行中（由 skill 首步的 `probe()` 探测确认）
+- Obsidian GUI 进程运行中（由 `probe()` 探测确认）
 
-**未满足时**：自动降级到文件 I/O。降级不影响 skill 功能，仅会导致：
+**走文件 I/O 时**：功能不受影响，仅会导致：
 - Obsidian 内正在打开的笔记与文件系统短暂不一致（Obsidian 下次重扫/重启后同步）
 - 查重走 `Glob + Grep` 而非 Obsidian 全文索引
 
@@ -521,7 +530,9 @@ summary: "2026-03-19 工作记录"
    SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
    python3 "$SS/git_commit_vault.py" --vault "$VAULT" --title "<本次会话标题>"
    ```
-   - 用 `git status` 枚举知识库目录内变更/未跟踪 `.md`（笔记/工作日志/CLAUDE.md/系统索引文件）精确 add，**不全量 `-A`**；只 commit 不 push。
+   - 用 `git status` 枚举知识库目录内变更/未跟踪 `.md`，精确 add，**不全量 `-A`**；只 commit 不 push。
+     纳入判据是**排除法**：除顶层段以 `.` 开头的工具/元数据目录（`.obsidian` / `.meta` / `.trash` / `.git` …）外一律纳入，新建的顶层目录自动生效。
+     ⚠️ 该判据只看**顶层段**，因此嵌套在笔记目录下的工具目录（如 `技术笔记/.trash/`、`工作日志/.obsidian/`、`笔记/node_modules/`）**仍会被提交**——这与索引器 `scan_vault` 的「任意深度排除」不一致，是既有行为（2026-09-03 由白名单改排除法之前同样如此）。若你的 Vault 里有这类嵌套目录，提交前请自行确认。
    - 解析输出 JSON `status`：`committed`（成功）/ `skipped`（非 git 或 --no-commit）/ `nothing`（无知识库改动）/ `failed`（占用/冲突，**不阻塞**后续）。
    - 若 `baseline_suggested=true`（历史 untracked > 20）：先跑 `--baseline-preview` 列清单，用 AskUserQuestion 让用户确认后再 `--baseline` 全量基线提交。**`$FORCE=true` 时不弹确认、也不自动 baseline**，仅在第五步输出中提示"建议另行运行 `--baseline-preview` 审阅后基线提交"（避免 `git add -A` 全量提交未脱敏文件）。
    - **commit 前确认笔记内容已按文档规范脱敏**（不含密码/token/凭据路径）。

@@ -82,21 +82,43 @@ def _patch_spawn_recorder(monkeypatch):
     return calls
 
 
-def test_disabled_by_default_no_topic_gate(tmp_home: Path, tmp_vault: Path,
-                                           write_frontmatter_cache,
-                                           monkeypatch, capsys):
-    """默认关：session_topic 未开启时，一次都不得拉起提炼子进程。
+def test_enabled_by_default_spawns(tmp_home: Path, tmp_vault: Path,
+                                   write_frontmatter_cache,
+                                   monkeypatch, capsys):
+    """1.1.0 起默认开：**空配置**（不写 relevance.session_topic）必须拉起提炼子进程。
+
+    钉的是「DEFAULT_CONFIG 的默认值」这一条路径，而不是「显式传 True」——后者由
+    test_session_topic_on_triggers_spawn_with_candidates 覆盖，把默认值改回 False
+    它照样全绿，抓不到这次变更被回退。
 
     用拦截取代「读 state 文件里有没有 topics 键」——后者依赖真实子进程完成写盘，
     在隔离测试环境里恒不发生，见模块 docstring。
     """
-    cwd = tmp_home.parent / "p-off"
+    cwd = tmp_home.parent / "p-default-on"
     cwd.mkdir()
     _setup(tmp_home, tmp_vault, write_frontmatter_cache, {})
     calls = _patch_spawn_recorder(monkeypatch)
     rc, out, err = _run_main_inprocess(monkeypatch, capsys, cwd, "先修 fulltext 配额")
     assert rc == 0
-    assert calls == [], "session_topic 默认关闭时不得调用 spawn_topic_extraction"
+    assert len(calls) == 1, "session_topic 默认开启时应恰好触发一次提炼"
+
+
+def test_explicit_opt_out_blocks_spawn(tmp_home: Path, tmp_vault: Path,
+                                       write_frontmatter_cache,
+                                       monkeypatch, capsys):
+    """显式 false 必须仍能关掉：默认值反转后，**关闭**这条路径是唯一的逃生阀。
+
+    默认开之后若只把上面那条断言反向，关闭路径就再无覆盖——deep-merge 把显式值
+    读丢、或接线改成无视配置，都不会有任何用例转红。
+    """
+    cwd = tmp_home.parent / "p-optout"
+    cwd.mkdir()
+    _setup(tmp_home, tmp_vault, write_frontmatter_cache,
+           {"relevance": {"session_topic": False}})
+    calls = _patch_spawn_recorder(monkeypatch)
+    rc, out, err = _run_main_inprocess(monkeypatch, capsys, cwd, "先修 fulltext 配额")
+    assert rc == 0
+    assert calls == [], "显式 session_topic:false 时不得调用 spawn_topic_extraction"
 
 
 def test_dry_run_blocks_spawn(tmp_home: Path, tmp_vault: Path,

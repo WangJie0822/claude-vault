@@ -160,7 +160,7 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 | `relevance.exclude_note_tags` | `["archived"]` | 召回池排除这些 tag 的笔记（SessionStart 与 UserPromptSubmit 共用；`[]` 关闭；`/vault` 手动检索不受影响） |
 | `relevance.use_tag_idf` | `true` | tag 命中按 IDF 加权（泛 tag 降权、singleton tag 满分）；false 为止血开关，数值等价回到旧等权行为 |
 | `relevance.tag_idf_floor` | `0.5` | 泛 tag 的保底加权因子，值域下界。设 `0` 会让泛 tag 归零、行为剧变；调高（如 `0.7`）减弱降权强度 |
-| `relevance.session_topic` | `false` | 会话首轮异步提炼 3-8 个主题词，后续轮次用作辅助召回信号（让「继续执行」这类短 prompt 也能召回会话相关笔记）。**默认关**：开启后会拉起一个 `claude -p` 子进程（模型固定 `haiku`），**把你本轮 prompt 原文与 `session_topic_top_n` 篇候选笔记的路径+摘要一并发给它**用于提炼关键词。prompt 原文与候选内容经 stdin 传给子进程（不落 argv/进程表），提炼产物（主题词本身）落盘在本机 state 文件，不上传、不进 metrics |
+| `relevance.session_topic` | `true` | 会话首轮异步提炼 3-8 个主题词，后续轮次用作辅助召回信号（让「继续执行」这类短 prompt 也能召回会话相关笔记）。**1.1.0 起默认开**，代价请先读完：它会拉起一个 `claude -p` 子进程（模型固定 `haiku`、每会话首轮一次、**消耗你的额度**），并**把你本轮 prompt 原文与 `session_topic_top_n` 篇候选笔记的路径+摘要一并发给它**用于提炼关键词。prompt 原文与候选内容经 stdin 传给子进程（不落 argv/进程表），提炼产物（主题词本身）落盘在本机 state 文件，不上传、不进 metrics。提炼失败/超时不会每轮重试（负缓存见 `user_prompt_submit.state_ttl_hours`）。**关掉**：本段显式写 `"session_topic": false` |
 | `relevance.session_topic_top_n` | `10` | 首轮送进提炼子进程的候选笔记篇数（路径+摘要，`Entry` 无 `title` 字段）。注入给你的仍是 top-3，这个数只影响提炼的输入 |
 
 > ⚠️ **阈值与权重耦合**：`relevance` 的三个阈值（`min_topical_score` / `fulltext_topical_threshold` / `confidence_bands.high`）是按当前 `scoring` 权重标定的——默认权重（tag 4 / summary 2 / keywords 5、floor 0.5）下话题分上界为 11。**改 `scoring` 权重后必须同步复核这三个阈值**，否则闸门会整体偏松或偏紧（例如把 `prompt_tag_hit` 提到 8，单个泛 tag 命中就能越过全文阈值）。

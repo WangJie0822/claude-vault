@@ -158,9 +158,22 @@ DEFAULT_CONFIG: dict = {
         # 关闭后数值等价回到旧行为，不杀整个 loader。
         "use_tag_idf": True,
         "tag_idf_floor": 0.5,       # 泛 tag 的保底因子；0 会让泛 tag 归零、行为剧变
-        # 层 3（2026-09-02）：会话主题预热。**默认关**——它会拉起外部进程，
-        # 不得对存量用户静默启用（同 metrics.enabled 的 opt-in 边界）。
-        "session_topic": False,
+        # 层 3（2026-09-02 引入，1.1.0 起默认开）：会话主题预热。
+        # **默认开**——让「继续执行」「ok」这类短 prompt 也能召回会话相关笔记。
+        # 依据：本机 4032 轮实测中 too_few_keywords 闸门拦下 555 轮（13.8%），
+        # 这批轮次当前一篇都召不回。
+        #
+        # 与 metrics.enabled 的 opt-in 边界**刻意不同**，三项代价必须写明：
+        # 1. 每会话首轮拉起一个 detached `claude -p --model haiku` 子进程，**消耗用户
+        #    额度**。失败/超时由 has_recent_topic_attempt 的负缓存收敛为「每
+        #    user_prompt_submit.state_ttl_hours 窗口最多一次」，不会每轮重试。
+        # 2. 该子进程收到本轮 prompt 原文 + session_topic_top_n 篇候选笔记的路径与
+        #    摘要（经 stdin，不落 argv/进程表）。产物只写本机 state，不上传、不进 metrics。
+        # 3. 该键自 a26e9d1（2026-09-02）引入，晚于停止首跑全量物化的 42f3fc8
+        #    （2026-08-03）⇒ 没有任何用户的 config.json 物化过它，故本次默认值变更对
+        #    **全部**未显式配置的用户（含存量）即时生效，不是只影响新装。
+        # 关掉：config 的 relevance 段显式写 "session_topic": false（显式值覆盖默认）。
+        "session_topic": True,
         # 首轮送进提炼子进程的候选笔记篇数。取 10 不是 30：注入给用户的是 top-3，
         # 送出去的越多、暴露面越大；精排 PoC 用 30 篇时 prompt 已 2-4KB。
         "session_topic_top_n": 10,
