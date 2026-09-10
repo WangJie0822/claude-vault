@@ -120,19 +120,122 @@ def adopt_runtime(ns: str) -> None:
                 if ns in {"claude", "codex"} else "legacy")
 
 
+def _hash_path(p: Path) -> str:
+    """对**已规范化**的路径取短 hash。
+
+    抽出来是为了让 `session_topics_path` 能跳过一次多余的 `resolve()`——
+    `_repo_root` 返回的已经是 resolve 过的路径，再走 `_cwd_hash` 会二次 resolve，
+    性能评审实测那一次占本次热路径增量的 80%（本地）/92%（慢盘冷元数据）。
+    两个调用方共用本函数，hash 算法仍是单点，不会分叉。
+    """
+    return hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:16]
+
+
 def _cwd_hash(cwd: Path) -> str:
     """对 cwd 绝对路径取短 hash，用于隔离不同项目的 state。"""
-    canonical = str(cwd.resolve() if cwd.exists() else cwd.absolute())
-    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:16]
+    return _hash_path(cwd.resolve() if cwd.exists() else cwd.absolute())
+
+
+def _looks_like_git_dir(p: Path) -> bool:
+    """`p` 是否是一个**有效**的 `.git` 标记，判据与 git 自身对齐。
+
+    - 目录形态：必须含 `HEAD`（空目录 git 报 `not a git repository`）
+    - 文件形态：内容必须以 `gitdir:` 开头（零字节或任意内容 git 报
+      `fatal: invalid gitfile format`）
+
+    只读前 8 字节做前缀判断，**不解析也不使用其中的路径** —— 那会引入一条
+    「文件内容 → 落点」的重定向通路。任何 IO 异常一律判 False（保守：宁可
+    不认这个根、回落到更上层或 cwd，也不要把两个项目混进一份文件）。
+    """
+    try:
+        if p.is_dir():
+            return (p / "HEAD").exists()
+        if p.is_file():
+            with open(p, "rb") as fh:
+                return fh.read(8).startswith(b"gitdir:")
+    except OSError:
+        return False
+    return False
+
+
+def _repo_root(cwd: Path) -> Path:
+    """向上找第一个含 `.git` 的目录；找不到就回落 cwd 自身。
+
+    **纯 stat 探测，刻意不 fork `git rev-parse --show-toplevel`。** 本机实测
+    （2026-09-10，median of 15，每轮 3 次调用 = 一次 UPS 的调用数）：
+    fork git **168~174ms**，stat 探测 **0.74~1.27ms**，差两个数量级；而 UPS 的
+    性能守卫阈值是 300ms（`tests/integration/test_perf.py`），fork 方案会吃掉
+    大半预算。本机每个新进程都被安全代理注入，别的机器上 fork 会便宜些，但把一个
+    与环境强相关的开销放进热路径本身就不划算。
+    与 `git rev-parse --show-toplevel` 的一致性实测 7/7（含非 git 目录回落 cwd）。
+
+    `.git` 既可能是目录（普通检出）也可能是文件（worktree / submodule），
+    两种形态都认 —— worktree 因此归一到**它自己的**根而不是主检出，
+    这正是要的语义：不同 worktree 是不同工作副本，不该共享主题词。
+
+    ⚠️ **判据是「像不像 git 仓库」而不是「有没有 `.git` 这个名字」**（见
+    `_looks_like_git_dir`）。首版只判 `.exists()`，安全评审实测：在两个项目的
+    **共享父目录**里放一个**零字节的 `.git` 文件**，就能把它们合并进同一份 topics
+    文件（隔离键被外部内容操纵，CWE-653）；空 `.git/` 目录同样被收下。而
+    `git rev-parse` 对这两种标记都是 `rc=128 fatal: invalid gitfile format` 明确拒绝的。
+
+    ⚠️ **本仓库有第二个「项目根」定义**：`session_start_load._get_git_toplevel()`
+    走 `git rev-parse --show-toplevel`，决定项目 CLAUDE.md 的 disable/tags 作用域。
+    常规检出下两者一致（`test_topic_repo_scope.py` 有一致性守卫）。**此处此前写着
+    「一致性实测 7/7」，是过强断言**——那 7 个样本全是常规检出，没覆盖上面那两种
+    退化标记。已知允许分叉的情形：git 不在 PATH（fork 版返回 None，本函数照常工作）、
+    `.git` 指向已被删除的 gitdir。改动任一处时请一并核对另一处。
+    """
+    try:
+        p = cwd.resolve() if cwd.exists() else cwd.absolute()
+    except OSError:
+        p = cwd.absolute()
+    for cand in (p, *p.parents):
+        if _looks_like_git_dir(cand / ".git"):
+            return cand
+    return p
 
 
 def state_path_for_cwd(cwd: Path) -> Path:
-    """返回该 cwd 对应的 state.json 路径。"""
+    """返回该 cwd 对应的 state.json 路径。
+
+    ⚠️ 这里**刻意按 cwd 而非项目根**隔离，勿"顺手"改成 `_repo_root(cwd)` 对齐
+    `session_topics_path` —— 注入去重（`paths`/`fulltext_paths`）按 cwd 隔离是
+    `configure_context` 里写明的有意设计，改成项目根会让同一仓库不同子目录共享
+    去重集，语义变化远超本次意图。两者判据不同是**结果**，不是遗漏。
+    """
     if _RUNTIME != "legacy":
         return context_home() / "state" / _RUNTIME / f"{_cwd_hash(cwd)}.json"
     return (
         Path.home() / ".claude" / "projects" / _cwd_hash(cwd) / "vault-loader-state.json"
     )
+
+
+def session_topics_path(cwd: Path) -> Path:
+    """会话主题词的落点：按**项目根**隔离，不按 cwd。
+
+    与 `state_path_for_cwd` 分家的理由（2026-09-10 实测）：主题词是 **per-session**
+    数据（字典 key 是 session_id），而它此前和 per-cwd 的注入去重共用一个文件，
+    于是同一会话在项目子目录里读不到根目录已提炼的词 —— 实测一次会话中
+    `n_topic_words` 在切到 `skills/vault-loader` 的那一轮掉到 0，并白白多调一次
+    haiku（落在子目录那份，此后再没被读到）。
+
+    **为什么不做成全局单文件**（按 session_id 一个文件、或所有 session 一个文件）：
+    ① `_config_loader.py` 的 `session_topic_hit=2` 可叠加把无关笔记推过
+    `fulltext_topical_threshold`（`test_session_topic_scoring.py` 已把该行为钉死），
+    cwd 键是当前唯一挡住跨项目主题污染的东西，去掉它等于让 A 项目的主题词把 B 项目
+    的笔记顶进全文注入；② 全局单文件会把 `lease_lock` 的争用从「每 cwd 少数进程」
+    放大到「全部会话」，而本机实测 8 进程 × 60 次并发写该锁会丢 5 条
+    （`PermissionError` 逃出 `atomic.py` 只捕 `FileExistsError` 的重试循环），
+    per-cwd 对照 0 丢 —— 放大争用正好踩中它。
+    按项目根分文件同时避开这两条。
+    """
+    # `_repo_root` 返回的路径已 resolve 过，故走 `_hash_path` 而非 `_cwd_hash`，
+    # 省掉一次 resolve（性能评审实测占本次热路径增量的 80%）。
+    key = _hash_path(_repo_root(cwd))
+    if _RUNTIME != "legacy":
+        return context_home() / "state" / _RUNTIME / "topics" / f"{key}.json"
+    return Path.home() / ".claude" / "vault-loader-topics" / f"{key}.json"
 
 
 def diagnostics_path_for_cwd(cwd: Path) -> Path:

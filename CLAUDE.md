@@ -26,6 +26,11 @@ This file is the single project guidance source for Claude Code and Codex when w
   > Windows 守卫必须执行声明中的**完整命令**并核对 stdin 到达脚本；且必须覆盖「只有 `PLUGIN_ROOT`」「两者都无」「两者不一致」三种形态 —— 只测「两者都设且相同」会把上述缺陷全部漏掉（首版 8 组用例正是如此）。另：不要把整条声明再塞进一个 `powershell -Command` 里当作一种「形态」——它以 `powershell.exe` 开头，嵌套后外层会先把内层 `$var` 展开成空，给出与实现无关的假信号。
 - plugin root 优先级固定为 `PLUGIN_ROOT`（Codex）→ `CLAUDE_PLUGIN_ROOT`（Claude Code）→ wrapper 相对路径；二者都指向插件 cache/加载根，不是用户态 skills 目录。
 - runtime 适配集中在 `context_vault/`：payload 优先识别宿主（`turn_id`/`model` → Codex，`prompt_id`/`agent_type` → Claude，其后才看环境变量；两者都不给时**若 payload 带 `hook_event_name` 则判 Claude**——Codex 两个事件的 required 都含 `model`，而 Claude 的 SessionStart 实测只有 `cwd/hook_event_name/session_id/source/transcript_path`，且 `CLAUDE_PLUGIN_ROOT` **不在 hook 子进程环境里**，没有这条兜底它会落 UNKNOWN 并与同会话的 UPS 分裂到两个命名空间）。共享 config/Vault；**state 与 metrics 按 runtime 隔离，注入去重仍按 cwd**（不按 session：隔离要解决的是两个 runtime 互相踩踏，再切一层 session 会让跨会话去重失效、且 sessions 目录单调增长无清理）；事件 marker 用 `O_EXCL` 保证重复 hook 静默退出。
+- **会话主题词按「项目根」隔离，与注入去重分属两个文件**（`session_topics_path` vs `state_path_for_cwd`，2026-09-10）。主题词是 **per-session** 数据（字典 key 是 session_id），此前与 per-cwd 的注入去重同住一个 state 文件，于是同一会话 `cd` 进子目录就读不到根目录已提炼的词——实测一次真实会话中 `n_topic_words` 在切到 `skills/vault-loader` 的那一轮由 8 掉到 0，并白白多调一次 haiku（落在子目录那份，此后再没被读到）；`has_recent_topic_attempt` 的 docstring 承诺「每个 TTL 窗口最多一次」，按 cwd 隔离时真实粒度是「每个 **(cwd, session)** 窗口一次」，兑现不了。项目根用**纯 stat 向上找 `.git`**（`_repo_root`）而非 `git rev-parse --show-toplevel`：本机实测 fork 三次 168~174ms 而 UPS 性能守卫阈值是 300ms，stat 同口径 0.74~1.27ms（去掉一次多余 resolve 后 0.43ms/次，每轮 UPS 约 1.3ms = 预算的 0.43%）。**项目根的判据是「像不像 git 仓库」而非「有没有 `.git` 这个名字」**（`_looks_like_git_dir`：目录须含 `HEAD`、文件须以 `gitdir:` 开头，与 git 自身对齐）——只判 `.exists()` 时，在两个项目的**共享父目录**放一个零字节 `.git` 文件就能把它们合并进同一份 topics（隔离键被外部内容操纵，CWE-653），而 `git rev-parse` 对这种标记是明确拒绝的；只读前 8 字节做前缀判断、**不解析其中路径**，那会引入「文件内容 → 落点」的重定向通路。⚠️ 此处此前写着「与 rev-parse 一致性实测 7/7」，是**过强断言**：那 7 个样本全是常规检出，没覆盖上述退化标记。
+- **主题词文件的大小保证在 `TOPIC_TRIM_BYTES`(80KB) 的字节裁剪，不在条数上限**。一条 entry 的字节数跨字符集差 3 倍以上（满尺寸实测 ASCII 1041B / 3 字节中文 2625B / 4 字节非 BMP 3417B），而本功能提炼的就是**中文**；只按条数设限时非 BMP 输入下写到第 31 条即越过 `MAX_STATE_BYTES`，`update_json` 把整份文件当损坏重置（实测 entries 31→1，一次抹掉 30 个会话、每个再付一次 haiku）。该常量此前的论证「满尺寸约 991B、32 条约 31KB、距 `TRIM_STATE_BYTES` 3 倍余量」**三处都错**：991B 是 ASCII 口径，且 `TRIM_STATE_BYTES` 的唯一消费点是 `_state.save_injected`、对本文件从不生效。守卫必须**用宽字符**——用 ASCII 测这条永远绿，正是当初漏掉它的原因；且判据要能区分「正常裁剪」与「整份重置」（后者只剩 1 条、文件反而变小，`size` 断言会通过）。**两条刻意不做**：① 不做全局单文件/按 session_id 存——cwd 键是当前唯一挡住跨项目主题污染的东西（`session_topic_hit=2` 可叠加把无关笔记推过 `fulltext_topical_threshold`，`test_session_topic_scoring.py` 已把该行为钉死），且全局单文件会把 `lease_lock` 争用从「每 cwd 少数进程」放大到「全部会话」，而**该锁在 Windows 上本就会丢写**（见下条）；② 不做「读不到就回退旧位置」——回退会永久掩盖新落点失效，且让「把落点改回 `state_path_for_cwd`」这一变异不转红，等于本次修复的唯一目的没有守卫。`state_path_for_cwd` 的 docstring 里写明了「勿顺手对齐成项目根」，并由用例钉住两者判据必须不同。
+- ⚠️ **`lease_lock` 在 Windows 上曾静默丢写（2026-09-10 已修）**：`atomic.py` 的重试循环此前只捕 `FileExistsError`，而锁文件处于 delete-pending 时 `os.open(O_CREAT|O_EXCL)` 抛的是 `PermissionError`（winerror=5），它逃出重试循环、再被上层 fail-open 吞掉 —— 调用方看到成功、数据却没了。实测 8 进程 × 60 次写**同一文件**丢 5 条，per-cwd 分散写 0 丢；也是 `test_concurrent_bumps_do_not_lose_updates` 高负载偶发转红的成因。**平台分界是实现的一部分**：POSIX 没有 delete-pending 语义，那里的 `PermissionError` 就是真权限问题，继续原样抛出（重试只会白等到 timeout 再换个异常类型失败），`test_atomic_concurrent_writes.py` 用注入故障把两边都钉住了。
+  - **残留限制（未处理）**：2s 租约在 8 路极端争用下偶尔不够，抛 `TimeoutError`。它与上面那个的性质**不同** —— 是调用方可见的失败，不是静默丢写。
+  - 那条端到端并发用例的判据因此不是「零丢失」而是「**每一条丢失都有已知异常可解释**」：写成零丢失会被 `TimeoutError` 拖成 flaky，很快没人当真；写成现在这样，任何**无法解释**的丢失（= 静默丢写）都会红。⚠️ 它的判别力来自**规模**：6 进程 × 25 次时变异 3 次只红 1 次，8 × 60 才稳定，调小等于让守卫掷骰子。真实竞态守卫天生概率性，故另配一条注入 `PermissionError` 的**确定性**用例，变异下 3/3 稳定转红。
 - **测试必须无条件隔离 HOME，`conftest` 的 autouse fixture 负责这件事**：`state_path_for_cwd` 的两个分支（canonical `~/.context-vault/state/<runtime>/`、legacy `~/.claude/projects/<hash>/`）**都以 `Path.home()` 为根**，所以只复位 `_state._RUNTIME` 不解决问题——那只是换个子树写。实测一次全套跑的增量：只复位 `_RUNTIME` 是 canonical +0 / legacy **+36**，无条件隔离 HOME 才是两处都 +0。2026-09-10 曾因此在真实 `~/.context-vault/state/claude/` 留下 **252 个**测试文件（该目录真实数据只有 16 个），legacy 侧历史积累更达 2658 个、其中 topic 条目只有 18 条属真实会话。守卫是 `test_topic_namespace.py` 末尾**成对**的两条用例：前一条故意污染、后一条断言已复位——少了前一条，后一条在「从未有人污染过」时也恒真。
 - **runtime 命名空间是进程级全局，凡新起的子进程都必须显式再配一次**：`_state._RUNTIME` 默认 `legacy`，detached 子进程**不继承**父进程的 `configure_context`。`spawn_topic_extraction` 因此把 `current_runtime()`——父进程**实际生效**的那个归一化值，不是按 payload/config 重新推导的——写进子进程 argv，`run_extraction_child` 用 **`adopt_runtime()`**（而非 `configure_context()`）据此配一次。**这两个函数的区别就是「单点」成不成立**：`current_runtime()` 交出的是**输出域**的值（已生效的命名空间），`configure_context()` 接受的是**输入域**的值（原始 runtime id），两个域取值字符串重叠、类型相同、语义不同，把前者喂回后者是一次**有损往返**——`claude` 是其中唯一的非不动点，而它恰好是绝大多数用户所在的那一档。父子之间 `use_canonical_namespace()` 一旦翻转（`has_legacy_data` 的三个探针里有两个是**其它组件**可能创建的路径）落点即分裂，且分裂后完全静默。`adopt_runtime()` 去掉的**只有**那次二次推导；`{claude, codex}` 白名单与 `_safe_component` 清洗必须原样保留——`_RUNTIME` 会被 `state_path_for_cwd` 拼进目录路径，放行任意字符串等于把它变成任意路径 JSON 写原语（安全评审已 PoC 复现 `..\..\..\PWNED` 写到预期范围之外）。**走 argv 不走 stdin**：后者是 best-effort 通道（写入异常被吞、且刻意不影响 spawn 的成功判定），把决定落点的参数放在那里，一次管道回收就让子进程静默回落 legacy。2026-09-09 实证漏配这一步的后果：`session_topic` 提炼 18/18 成功却全部写进 legacy，而 hook 从 canonical 读，功能默认开一周、每会话付一次 haiku，召回侧零收益且全程无声。守卫（`test_topic_namespace.py`）**必须真起子进程**——同进程用例继承父进程的 `_RUNTIME`、写读天然一致，这类分裂对它们**结构性不可见**，既有 7 条 wiring 用例全是同进程形态，缺陷因此带着全绿跑了一周。
 - **`run-hook.cmd` 是 polyglot 脚本**：同一文件既是合法的 Windows batch 又是合法的 POSIX sh（顶部 `: << 'BATCH'` heredoc 让 sh 跳过 batch 段）。单文件而非 `.cmd`+`.sh` 两份，是因为 Claude Code 在 Windows 上对含 `.sh` 的命令会前置 bash，导致双文件 wrapper 失效。改这个文件务必保持两种解释器都能正确解析，并保持 LF 行尾（`.gitattributes` 对 `*.sh`/`*.cmd` 强制 `eol=lf`，CRLF 会破坏 shebang / heredoc）。
@@ -124,7 +129,7 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 >
 > 补丁是 `packaging/scan_commit_messages.py`（不分发，已接进 `run_gates.py`）。默认范围 `origin/master..HEAD`：在发布分支上这正是本次要发布的全部提交；在开发谱系上与 `origin/master` 无共同祖先、没有发布语义，**自动跳过并说明**——若在日常分支恒红，这条检查很快会被无视，等于没有。**开发谱系的历史 message 不改写**：那些提交本就不推公开远端（pre-push 守卫保证），为此重写历史的风险大于收益。
 
-**发布流程（重要）**：对外发布只走 release 分支——从 `origin/master`（干净首版）拉分支、cherry-pick 修复 + 版本 bump，FF 推送回 `origin/master`。**禁止把 `dev` 或其任何衍生分支推向公开/内网远端**：脱敏闸门只扫工作树、**不扫 git 历史**，clone 后可经 `git show <旧commit>:<file>` 取回历史内容——闸门拦不住这类泄露，只有推送策略能。发布修复时同步 bump `plugin.json` + `marketplace.json` 版本，使 `/plugin update` 按版本识别更新。
+**发布流程（重要）**：对外发布只走 release 分支——从 `origin/master`（干净首版）拉分支、cherry-pick 修复 + 版本 bump，FF 推送回 `origin/master`。**禁止把 `dev` 或其任何衍生分支推向公开/内网远端**：脱敏闸门只扫工作树、**不扫 git 历史**，clone 后可经 `git show <旧commit>:<file>` 取回历史内容——闸门拦不住这类泄露，只有推送策略能。发布修复时版本号要同步 bump **四处**：`VERSION`、`.claude-plugin/plugin.json`、`.codex-plugin/plugin.json`、`.claude-plugin/marketplace.json` 的自身条目，使 `/plugin update` 按版本识别更新。⚠️ 此处此前只列了后两者中的两个（`plugin.json` + `marketplace.json`），照它做会漏掉 `VERSION` 与 **Codex 侧的 manifest** —— 1.2.1 发布时实测漏改 `.codex-plugin/plugin.json`，由 `tests/test_plugin_version_sync.py::test_all_manifests_follow_root_version` 拦下。**别靠记忆数这几个文件，跑门禁**（`packaging/run_gates.py`）。
 
 ## 开发与测试
 
@@ -149,10 +154,42 @@ python -m pytest packaging/
 **发布前一次跑完全部门禁**（DO-M1）：`python packaging/run_gates.py` 串起上面四个 pytest 根 + 脱敏闸门 + 推送守卫安装态 + commit message 脱敏，共 7 项，逐项报、有一项红则整体红（`--list` 只列不跑）。各 gate 的 cwd 必须不同——三个 skill 根的导入约定不兼容，共用 rootdir 会 import 失败，这正是它们容易被漏跑的原因。
 
 已实测（2026-09-10，Windows 本机，`--color=no -p no:cacheprovider`）：
-`tests/` **121 passed / 1 skipped**、vault-loader **846 passed / 3 skipped**、
+`tests/` **124 passed / 1 skipped**、vault-loader **867 passed / 3 skipped**、
 packaging **32 passed / 1 skipped**；summarize-session 本轮零改动、未重跑，
 上次实测（2026-09-07）为 **316 passed / 2 skipped**。
-vault-loader 由 815 增至 846 分三批：先是 session_topic 落点修复与可观测性
+⚠️ **vault-loader 那个数字是空闲态实测**：`tests/integration/test_perf.py` 两条与
+`test_near_miss_nudge.py::test_concurrent_bumps_do_not_lose_updates` 都对机器负载
+敏感，本机跑着二三十个并发进程时实测会红（同批 full-review 的两个 reviewer 各自
+独立测得 858/1 与 857/2，均为这几条）。它们**单跑全绿**（含一次 45s 的 `test_relaxed_zero_candidates_stays_silent`，
+失败形态是子进程 5s 超时而非断言不成立）；那条并发用例红的成因就是下面记的
+`lease_lock` 丢写。⚠️ 此处此前写「前两条与主题词改动**零代码路径交集**」，
+被性能维核验**推翻**——`_config_loader.py` 的 `session_topic: True` 使 perf 用例
+确实走该路径，只是该路径仅贡献 +0.09ms/轮（需解释量的 0.09%~1.8%），结论不变
+但措辞是错的；真正的干扰源是 warmup 轮会真发 haiku。写这类数字时要带上测量条件，否则读者在
+有负载的机器上复现不出来，会误判成回归。
+vault-loader 由 846 增至 867：会话主题词改按项目根隔离（`test_topic_repo_scope.py`
+21 条——跨 cwd 可读、跨项目隔离、attempt 标记跨 cwd、非 git 回落、`.git` 为文件的
+worktree、路径含 runtime 段、与注入去重分属两文件且 cwd 即项目根时也不撞名、
+一天内同仓库多会话不互挤、容量绝对下界、两个「项目根」定义一致、三种无效 `.git`
+标记不合并项目、宽字符满载不越字节预算），另有 3 条既有用例因分家而重写契约。
+变异验证分三轮共 12 个变异、全部 KILLED，其中 **6 个第一轮
+存活并各暴露一个真实缺口**：①「去掉 topics 路径段」只在 **cwd 恰是项目根**时才撞名
+（既有断言拿子目录比，路径天然不同）；②「legacy 分支去掉目录段」是 legacy 分支
+零覆盖——追查它时发现 `_state._RUNTIME` 模块级默认值为 `"legacy"`，**凡不显式
+`configure_context` 的用例全部跑在 legacy 分支**，而真实用户绝大多数在 canonical，
+故新用例按 runtime 参数化；③ full-review 抓出 `MAX_TOPIC_SESSIONS=5` 是按 per-cwd
+定的尺寸，换 key 后同一仓库 24h 内的**全部**会话共享 5 槽，第 6 个即被挤掉并重新
+付费提炼——复现的正是本次要修的症状；④ `test_session_topic_wiring.py` 仍往旧落点
+写损坏数据（改了 `test_session_topic.py` 六处却漏了它），已补前置探针使其能区分
+「读到损坏数据」与「压根没读到」；⑤ **专为安全评审 S1 写的回归守卫自己是空网**——
+两个项目各自建了有效 `.git`，`_repo_root` 第一层就命中、根本走不到共享父目录那个
+无效标记，用例跑绿却零判别力；⑥ 宽字符字节守卫只杀 3 字节中文、放过 4 字节非 BMP，
+因为后者越限后被 `update_json` **整份重置**、文件反而变小，`size` 断言与
+`len(topics) >= 1` 双双通过 —— 判据改成 `>= 8` 才能区分「正常裁剪」与「整份重置」。
+**这三轮里另有一次假信号**：验证 wiring 落点时变异转红了，但原因是 `NameError`
+（连 import 一起改掉 ⇒ 变异不合法），差点被读成「守卫生效」；核对转红**原因**而非
+只看转红，才拿到正确的 `AssertionError`。
+此前 vault-loader 由 815 增至 846 分三批：先是 session_topic 落点修复与可观测性
 （`test_topic_namespace.py` + `test_topic_observability.py`），再是 full-review
 四维评审的整改（`adopt_runtime` 契约与白名单、坏值不得打掉整份报表、报表不得
 指责被关掉的功能、提炼 prompt 的净化），最后是测试沙箱隔离与 stdin 泄漏

@@ -1,7 +1,7 @@
 {
   "name": "context-vault",
   "description": "Capture and recall a local knowledge vault from Claude Code and Codex.",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": { "name": "context-vault contributors" },
   "license": "MIT"
 }

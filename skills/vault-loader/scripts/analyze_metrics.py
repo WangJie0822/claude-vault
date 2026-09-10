@@ -449,7 +449,9 @@ def _render_topic(s: dict) -> str:
     hit = s.get("topic_rounds", 0)
     if not hit:
         return (f"session_topic：{hit}/{n} 轮生效 —— **一次都没生效**。"
-                "先查 state 里 topics 的 words 是不是全为空："
+                "先查 <state>/<runtime>/topics/<项目根hash>.json 里 words 是不是全为空"
+                "（2026-09-10 起主题词不再存在 state.json 的 topics 字段里，"
+                "那里已被用例断言不存在）："
                 "常见成因是提炼子进程与读取端落在不同 runtime 命名空间、"
                 "state_ttl_hours 过短、或提炼持续失败。"
                 "⚠️ 但每个会话的**首轮**、以及其后约 20s（提炼仍在飞行中）必然为 0，"

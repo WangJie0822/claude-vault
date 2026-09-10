@@ -55,7 +55,21 @@ def lease_lock(target: Path, *, timeout: float = 2.0,
             finally:
                 os.close(fd)
             break
-        except FileExistsError:
+        except (FileExistsError, PermissionError) as exc:
+            # ⚠️ **Windows 上争用这把锁抛的不一定是 FileExistsError。** 当持有者
+            # 刚 `unlink` 而句柄尚未全部关闭时，该文件进入 delete-pending 状态，
+            # 此时 `os.open(O_CREAT|O_EXCL)` 抛的是 `PermissionError`
+            # （winerror=5, ERROR_ACCESS_DENIED）而不是 `FileExistsError`。
+            # 只捕 FileExistsError 时它**逃出整个重试循环**，再被上层的 fail-open
+            # 吞掉 —— 表现为静默丢写。本机实测：8 进程 × 60 次写同一文件丢 5 条
+            # （全部为 PermissionError），per-cwd 分散写 0 丢；N=16 时丢 3.1%。
+            # 它也是 `test_concurrent_bumps_do_not_lose_updates` 在高负载下偶发
+            # 转红的成因。
+            #
+            # POSIX 上没有 delete-pending 语义，`PermissionError` 就是真正的权限
+            # 问题，继续原样抛出 —— 在那里重试只会白等到 timeout 再换个异常类型失败。
+            if isinstance(exc, PermissionError) and os.name != "nt":
+                raise
             try:
                 age = time.time() - lock.stat().st_mtime
                 if age > stale_after and not _owner_alive(lock):

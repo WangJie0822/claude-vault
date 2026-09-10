@@ -13,7 +13,7 @@ from unittest import mock
 
 import pytest
 
-from scripts._state import state_path_for_cwd
+from scripts._state import session_topics_path, state_path_for_cwd
 from scripts._topic import (MAX_TOPIC_SESSIONS, MAX_TOPIC_WORDS,
                             load_session_topic, save_session_topic,
                             has_recent_topic_attempt)
@@ -35,7 +35,7 @@ def test_keeps_only_most_recent_sessions(tmp_path: Path) -> None:
     for i in range(MAX_TOPIC_SESSIONS + 3):
         save_session_topic(tmp_path, f"s{i}", [f"w{i}"])
         time.sleep(0.01)          # 拉开 ts，避免同秒歧义
-    data = json.loads(state_path_for_cwd(tmp_path).read_text(encoding="utf-8"))
+    data = json.loads(session_topics_path(tmp_path).read_text(encoding="utf-8"))
     assert len(data["topics"]) == MAX_TOPIC_SESSIONS
     assert load_session_topic(tmp_path, "s0", 24) == [], "最旧的应被淘汰"
     assert load_session_topic(tmp_path, f"s{MAX_TOPIC_SESSIONS + 2}", 24) != []
@@ -61,7 +61,7 @@ def test_word_count_capped(tmp_path: Path) -> None:
 
 def test_ttl_expired_returns_empty(tmp_path: Path) -> None:
     save_session_topic(tmp_path, "s", ["召回"])
-    p = state_path_for_cwd(tmp_path)
+    p = session_topics_path(tmp_path)
     data = json.loads(p.read_text(encoding="utf-8"))
     data["topics"]["s"]["ts"] = time.time() - 99 * 3600
     p.write_text(json.dumps(data), encoding="utf-8")
@@ -102,7 +102,7 @@ def test_attempt_false_after_ttl_expired(tmp_path: Path) -> None:
     """尝试记录本身也受 TTL 约束：过期后视为"从未尝试"，允许重新 spawn
     （不会永久关掉这个功能）。"""
     save_session_topic(tmp_path, "s", [])
-    p = state_path_for_cwd(tmp_path)
+    p = session_topics_path(tmp_path)
     data = json.loads(p.read_text(encoding="utf-8"))
     data["topics"]["s"]["ts"] = time.time() - 99 * 3600
     p.write_text(json.dumps(data), encoding="utf-8")
@@ -119,7 +119,7 @@ def test_attempt_isolated_per_session(tmp_path: Path) -> None:
                                   '{"topics": {"s": "not-a-dict"}}'])
 def test_attempt_corrupt_state_never_raises(tmp_path: Path, body: str) -> None:
     """损坏一律降级为 False（fail-open：允许尝试），绝不抛异常。"""
-    p = state_path_for_cwd(tmp_path)
+    p = session_topics_path(tmp_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(body, encoding="utf-8")
     assert has_recent_topic_attempt(tmp_path, "s", 24) is False
@@ -130,31 +130,51 @@ def test_attempt_corrupt_state_never_raises(tmp_path: Path, body: str) -> None:
                                   f'{{"topics": {{"s": {{"words": "not-a-list", "ts": {time.time()}}}}}}}'])
 def test_corrupt_state_never_raises(tmp_path: Path, body: str) -> None:
     """损坏一律降级为空，绝不抛异常 —— hook fail-open 不变量。"""
-    p = state_path_for_cwd(tmp_path)
+    p = session_topics_path(tmp_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(body, encoding="utf-8")
     assert load_session_topic(tmp_path, "s", 24) == []
 
 
 def test_save_does_not_clobber_injected_paths(tmp_path: Path) -> None:
-    """写 topics 不得冲掉去重用的 paths —— 两者共用一个文件。"""
+    """写 topics 不得冲掉去重用的 paths。
+
+    2026-09-10 起两者**不再共用一个文件**（topics 按项目根、paths 按 cwd），
+    所以这条用例的原判别力已经消失——分家之后互不冲掉是平凡成立的。
+    补上「确实分属两个文件」的断言，它才重新对「把 topics 落点改回
+    `state_path_for_cwd`」这个变异有判别力。
+    """
     from scripts._state import load_already_injected, save_injected
     save_injected(tmp_path, ["a.md", "b.md"])
     save_session_topic(tmp_path, "s", ["召回"])
     assert load_already_injected(tmp_path, 24) == {"a.md", "b.md"}
     assert load_session_topic(tmp_path, "s", 24) == ["召回"]
+    assert session_topics_path(tmp_path) != state_path_for_cwd(tmp_path), \
+        "topics 与注入去重必须分属两个文件，否则本用例退化为平凡断言"
+    assert "topics" not in json.loads(
+        state_path_for_cwd(tmp_path).read_text(encoding="utf-8")), \
+        "state.json 不应再出现 topics 字段"
 
 
-def test_save_uses_zero_timestamp_setdefault(tmp_path: Path) -> None:
-    """F5（整分支终审，2026-09-02）：顶层 `timestamp` 字段必须走
-    `setdefault("timestamp", 0)`，与既有两个写入方对齐——`_state.py::save_fallback_ts`
-    与 `save_diag_ts` 都这么写，理由就在它们旁边：不得刷新 paths 的 timestamp，
-    否则会变相续命注入去重 TTL。首次写入（无既有 state 文件）时 `save_session_topic`
-    不应把顶层 timestamp 设成当前 epoch。"""
+def test_save_never_touches_injection_state_file(tmp_path: Path) -> None:
+    """`save_session_topic` 不得碰注入去重的 state 文件。
+
+    这条取代了原 `test_save_uses_zero_timestamp_setdefault`（F5，2026-09-02）。
+    原契约是「顶层 `timestamp` 必须 setdefault 成 0」，理由是不得刷新 paths 的
+    TTL 而变相续命注入去重。2026-09-10 topics 迁到独立文件后，该约定的**前提**
+    （与 paths 同住一个文件）已不存在，`setdefault` 那行也随之删掉——若仍断言
+    `data["timestamp"] == 0` 就是在为一个不再成立的理由做守卫。
+
+    新契约更强也更直接：**根本不碰那个文件**。它同时守住了原来要防的东西
+    （碰不到就谈不上续命 TTL），且对「落点改回 state_path_for_cwd」这一变异
+    直接转红。
+    """
     save_session_topic(tmp_path, "s", ["召回"])
-    data = json.loads(state_path_for_cwd(tmp_path).read_text(encoding="utf-8"))
-    assert data["timestamp"] == 0, (
-        f"顶层 timestamp 不应被 save_session_topic 刷新为当前时间，实际 {data['timestamp']}")
+    assert not state_path_for_cwd(tmp_path).exists(), \
+        "save_session_topic 不应创建/写入注入去重的 state 文件"
+    data = json.loads(session_topics_path(tmp_path).read_text(encoding="utf-8"))
+    assert "timestamp" not in data, \
+        "topics 文件里没有 paths，不应再有那个为 paths TTL 而设的 timestamp 字段"
 
 
 def test_save_respects_byte_limit(tmp_path: Path) -> None:
@@ -166,7 +186,9 @@ def test_save_respects_byte_limit(tmp_path: Path) -> None:
     # 写一个很大的 topics（长列表），超过上限
     save_session_topic(tmp_path, "s", ["w" * 100 for _ in range(200)])
     # 检查文件大小是否合理（应被裁过）
-    p = state_path_for_cwd(tmp_path)
+    # 大小上限现在要看 topics 自己的文件——分家后它不再写进 state.json，
+    # 继续量 state.json 等于量一个与本用例无关的对象。
+    p = session_topics_path(tmp_path)
     assert p.exists()
     size = p.stat().st_size
     assert size <= MAX_STATE_BYTES, f"文件大小 {size} 超过上限 {MAX_STATE_BYTES}"
@@ -203,11 +225,11 @@ def test_long_words_do_not_overflow_state(tmp_path: Path) -> None:
     assert len(saved_paths) == len(paths_to_save), \
         f"paths 不应被冲掉：期望 {len(paths_to_save)} 条，实际 {len(saved_paths)}"
 
-    # ② 文件不超限
-    p = state_path_for_cwd(tmp_path)
+    # ② 文件不超限（同上：分家后要量 topics 文件，不是 state.json）
+    p = session_topics_path(tmp_path)
     size = p.stat().st_size
     assert size <= MAX_STATE_BYTES, \
-        f"state 文件超限：{size} > {MAX_STATE_BYTES}"
+        f"topics 文件超限：{size} > {MAX_STATE_BYTES}"
 
     # ③ 每个词被截断（长度应 ≤ 定义的上限）
     from scripts._topic import MAX_TOPIC_WORD_LEN

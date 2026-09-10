@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
-"""会话主题词：产生（detached spawn）与存取（搭 state 文件）。
+"""会话主题词：产生（detached spawn）与存取（按项目根隔离的独立文件）。
 
-为什么搭 state 文件而不新建目录：CLAUDE.md 记过「切一层 session 会让 sessions
-目录单调增长无清理」。state 文件已有单 timestamp 控 TTL 与 MAX_STATE_BYTES 膨胀
-保护，topics 再限最近 MAX_TOPIC_SESSIONS 个 session，文件大小即有界。
+**存储位置（2026-09-10 起）**：`_state.session_topics_path()`，即
+`<state>/<runtime>/topics/<sha1(项目根)>.json`。此前搭在 per-cwd 的 state 文件里，
+而主题词是 per-session 数据（字典 key 是 session_id），于是同一会话 `cd` 进子目录
+就读不到根目录已提炼的词——实测 `n_topic_words` 由 8 掉到 0 并多付一次 haiku。
+按**项目根**而非 session 分文件，是因为「所有 session 共享一份」会拆掉当前唯一
+挡住跨项目主题污染的键（`session_topic_hit=2` 可叠加推过 `fulltext_topical_threshold`）。
+完整理由见 `_state.session_topics_path` 的 docstring。
+
+仍不按 session 分文件的原因不变：CLAUDE.md 记过「切一层 session 会让 sessions
+目录单调增长无清理」。文件大小仍有界——`MAX_STATE_BYTES` 膨胀保护 + 只留最近
+`MAX_TOPIC_SESSIONS` 个 session。
 
 为什么独立成文件而不并进 _state.py：本模块除读写外还要管理子进程，
 把「拉起进程」混进「读写 JSON」会让后者的职责失焦。
@@ -21,9 +29,38 @@ from pathlib import Path
 
 from ._output import sanitize_injected_text
 from ._state import (MAX_STATE_BYTES, adopt_runtime, current_runtime,
-                     state_path_for_cwd, update_json)
+                     session_topics_path, update_json)
 
-MAX_TOPIC_SESSIONS = 5      # topics 字典最多保留几个 session（文件大小有界的保证）
+
+# topics 字典最多保留几个 session。
+# ⚠️ **取值随「按什么分文件」而变，改落点时必须重算。** 2026-09-10 落点由
+# per-cwd 改为 per-项目根后，同一仓库**一天内**（`state_ttl_hours` 默认 24h）
+# 跑过的**全部**会话共享这些槽位——不是"同时活跃"的会话数，是"24h 内出现过"的。
+# 原值 5 是按 per-cwd 定的，换 key 后当场变成缺陷：实测第 6 个会话把最旧的挤掉，
+# 该会话的 `has_recent_topic_attempt` 随之转 False → 重新 spawn 一次付费 haiku，
+# 复现的正是本次修复要解决的症状，并再次打破「每个 TTL 窗口最多一次」的承诺。
+#
+# ⚠️ **条数上限单独用不住，文件大小的保证在 `TOPIC_TRIM_BYTES`**（见 save 里的
+# 字节裁剪）。本注释此前写「满尺寸 entry 约 991B、32 条约 31KB、距 TRIM_STATE_BYTES
+# 有 3 倍余量」——三处都不对，已订正：那个 991B 是 **ASCII** 口径，而本功能提炼的是
+# **中文**（满尺寸实测 3 字节中文 2625B / 4 字节非 BMP 3417B，32 条分别为 82KB / 107KB，
+# 后者直接越过 MAX_STATE_BYTES）；且 `TRIM_STATE_BYTES` 的唯一消费点是
+# `_state.save_injected`，对本文件从不生效。
+MAX_TOPIC_SESSIONS = 32
+
+# topics 文件的字节预算。低于 `MAX_STATE_BYTES`(100KB) 是**必须**的：越过那条线
+# `update_json` 会把整份文件当损坏重置（`atomic.py` 的 `max_bytes` 语义），一次抹掉
+# 全部会话的主题词。留 20KB 余量吸收 indent 与后续字段增长。
+TOPIC_TRIM_BYTES = 80 * 1024
+
+
+def _encoded_size(payload: dict) -> int:
+    """按 `atomic.atomic_write_json` 的**同一套参数**估算落盘字节数。
+
+    参数必须与写端逐字一致（`ensure_ascii=False, indent=2`），否则预算会算偏：
+    `ensure_ascii=True` 会把中文变成 6 字节的 \\uXXXX，估出来比实际大一倍多。
+    """
+    return len(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
 MAX_TOPIC_WORDS = 8         # 每个会话最多几个主题词（与 spec 的 3-8 对齐）
 MAX_TOPIC_WORD_LEN = 100    # 每个词的最大长度（UTF-8 中文 3B/字 ⇒ 最多 300B；
                             # 5×8×300B=12KB，远小于 102KB 上限 ⇒ topics 体量恒有界）
@@ -49,11 +86,21 @@ def _no_window_flags() -> int:
 
 
 def load_session_topic(cwd: Path, session_id: str, ttl_hours: float) -> list[str]:
-    """读该会话的主题词。缺失 / 损坏 / 过期 / 结构不对 → 空列表，绝不抛异常。"""
+    """读该会话的主题词。缺失 / 损坏 / 过期 / 结构不对 → 空列表，绝不抛异常。
+
+    `cwd` 只用来定位**项目根**（见 `session_topics_path`），同一项目内任何子目录
+    都读到同一份 —— 这正是 2026-09-10 修掉的那个缺陷：此前按 cwd 隔离，会话中途
+    `cd` 进子目录就读不到已提炼的词，当轮精排失效且白白多调一次 haiku。
+
+    **刻意不做「读不到就回退旧位置」**：回退会永久掩盖新落点失效（新位置一次都
+    没写成也照样"看起来正常"），且会让「把落点改回 `state_path_for_cwd`」这个
+    变异不转红 —— 等于本次修复的唯一目的没有守卫。代价是升级瞬间丢已提炼的词，
+    但那是 24h TTL 的缓存，下一轮 UPS 自动重提炼。
+    """
     try:
         if not session_id:
             return []
-        p = state_path_for_cwd(cwd)
+        p = session_topics_path(cwd)
         if not p.exists() or p.stat().st_size > MAX_STATE_BYTES:
             return []
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -93,7 +140,7 @@ def has_recent_topic_attempt(cwd: Path, session_id: str, ttl_hours: float) -> bo
     try:
         if not session_id:
             return False
-        p = state_path_for_cwd(cwd)
+        p = session_topics_path(cwd)
         if not p.exists() or p.stat().st_size > MAX_STATE_BYTES:
             return False
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -158,16 +205,40 @@ def save_session_topic(cwd: Path, session_id: str, words) -> None:
                     ))
                 topics = dict((k, v) for _, k, v in ordered[-MAX_TOPIC_SESSIONS:])
 
+            # 条数裁剪之后再做**字节裁剪**。条数上限单独用不住：一条 entry 的字节数
+            # 跨字符集差 3 倍以上（实测满尺寸 ASCII 1041B / 3 字节中文 2625B /
+            # 4 字节非 BMP 3417B），而本功能的提炼 prompt 第一句就是「提炼**中文**
+            # 关键词」。只按条数设限时，非 BMP 输入下写到第 31 条即越过
+            # `MAX_STATE_BYTES`，`update_json` 会把**整份文件重置**（实测 entries
+            # 31→1，一次抹掉 30 个会话的主题词，每个都要再付一次 haiku）。
+            # 从最旧的开始丢，直到编码后小于预算；至少保留刚写入的这一条，
+            # 否则新会话永远存不进去。
             payload["topics"] = topics
-            # F5（整分支终审，2026-09-02）：既有两个写入方（_state.py:save_fallback_ts /
-            # save_diag_ts）一律 `setdefault("timestamp", 0)`，理由就写在它们旁边——
-            # 不得刷新 paths 的 timestamp，否则会变相续命注入去重 TTL。此前这里传 `now`，
-            # 今天无害（`timestamp` 字段后续总会被 save_injected 无条件覆盖），但背离了
-            # 正是为防这类 bug 而立的约定，故对齐改成 0。
-            payload.setdefault("timestamp", 0)
+            while len(topics) > 1 and _encoded_size(payload) > TOPIC_TRIM_BYTES:
+                oldest = min(
+                    topics,
+                    key=lambda k: (topics[k].get("ts", 0)
+                                   if isinstance(topics[k].get("ts", 0), (int, float))
+                                   else 0))
+                if oldest == session_id:        # 绝不丢刚写入的这条
+                    remaining = [k for k in topics if k != session_id]
+                    if not remaining:
+                        break
+                    oldest = min(
+                        remaining,
+                        key=lambda k: (topics[k].get("ts", 0)
+                                       if isinstance(topics[k].get("ts", 0), (int, float))
+                                       else 0))
+                del topics[oldest]
+                payload["topics"] = topics
+
+            # 2026-09-10：落点挪到按项目根隔离的独立文件（`session_topics_path`）后，
+            # 这里不再 `setdefault("timestamp", 0)`。那行原本是为了不刷新 state.json 里
+            # `paths` 的 TTL（理由见 _state.py 的 save_fallback_ts / save_diag_ts），
+            # 而新文件里根本没有 `paths`，留着只会凭空多一个语义不明的字段误导后来者。
             return payload
 
-        update_json(state_path_for_cwd(cwd), mutate, max_bytes=MAX_STATE_BYTES)
+        update_json(session_topics_path(cwd), mutate, max_bytes=MAX_STATE_BYTES)
     except Exception as exc:                       # noqa: BLE001 — fail-open
         print(f"[vault-loader] 写会话主题失败：{exc}", file=sys.stderr)
 

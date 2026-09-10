@@ -220,10 +220,25 @@ def test_broken_topic_state_does_not_break_injection(tmp_home: Path, tmp_vault: 
     cwd.mkdir()
     _setup(tmp_home, tmp_vault, write_frontmatter_cache,
            {"relevance": {"session_topic": True}})
-    from scripts._state import state_path_for_cwd
-    p = state_path_for_cwd(cwd)
+    # 2026-09-10：必须写进主题词自己的文件。此前这里写 state_path_for_cwd，
+    # 而读路径改落点后根本不打开那个文件 —— 用例照常全绿却什么都没验证
+    # （full-review 抓出的空网守卫；同批订正了 test_session_topic.py 六处，
+    # 唯独漏了本文件）。
+    from scripts._state import session_topics_path
+    from scripts._topic import load_session_topic, save_session_topic
+    p = session_topics_path(cwd)
     p.parent.mkdir(parents=True, exist_ok=True)
+
+    # 前置探针：先放一份**合法**数据并确认读得回来。
+    # 没有这一步，本用例区分不了「读到了损坏数据仍 fail-open」与「压根没读到」——
+    # 文件不存在时链路同样不挂，两种情形下 rc/stdout 完全一样。探针失败即说明
+    # 写入路径不在读路径上（正是此前那个空网的形态）。
+    save_session_topic(cwd, "sess-T", ["探针词"])
+    assert load_session_topic(cwd, "sess-T", 24) == ["探针词"], \
+        "写入路径不在读路径上，本用例退化为空网守卫"
+
     p.write_text('{"topics": "坏结构"}', encoding="utf-8")
+    assert load_session_topic(cwd, "sess-T", 24) == [], "损坏数据应降级为空"
     r = _run(cwd, "先修 fulltext 配额")
     assert r.returncode == 0
     assert r.stdout.strip(), "损坏的 topics 让整条注入链路挂了"
