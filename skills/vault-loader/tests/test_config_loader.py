@@ -484,7 +484,13 @@ def test_load_config_ex_distinguishes_fresh_install_from_corrupt(tmp_path):
     r3 = load_config_ex(bad)
     assert r3.fallback_reason == "corrupt", "config 损坏必须置位"
     assert r3.detail, "应带异常文本供诊断"
-    assert r3.config["vault_path"] == DEFAULT_CONFIG["vault_path"], "损坏时确实回退了默认"
+    # 判据刻意**不用** `DEFAULT_CONFIG["vault_path"]`：它是**模块导入时**用当时的
+    # `Path.home()` 求值的快照（`_config_loader.py:56` 的 `str(default_vault())`），
+    # 而回退路径在**调用时**求值 —— 两者在任何改动过 HOME 的环境里都不相等，
+    # 断言会因测试环境而非被测行为转红。换成 HOME 无关的字段，契约不变：
+    # 「回退全默认」的实质是整份 config 被换掉，vault_path 只是其中一项。
+    assert r3.config["vault_path"] != "D:/V", "损坏时不得沿用损坏文件里的值"
+    assert r3.config["scoring"] == DEFAULT_CONFIG["scoring"], "损坏时确实回退了默认"
     assert bad.read_text(encoding="utf-8") == '{"vault_path": "D:/V", }', "损坏文件不得被覆盖"
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator
@@ -105,7 +106,8 @@ SUPPORTED_SCHEMAS = frozenset({1, 2})
 
 # 顶层数值字段。值非数值时**删键**而不是置 0：下游用 `"inj_chars" in r` 判存在，
 # 置 0 会把「这条记录写于加字段之前」和「它真的是 0」混成同一个值。
-_NUMERIC_TOP_FIELDS = ("n_admitted", "inj_chars", "n_excluded", "ts")
+_NUMERIC_TOP_FIELDS = ("n_admitted", "inj_chars", "n_excluded", "ts",
+                       "n_topic_words")
 
 
 def _drop_bad_numeric_fields(r: dict) -> int:
@@ -125,8 +127,14 @@ def _drop_bad_numeric_fields(r: dict) -> int:
         if k not in r:
             continue
         v = r[k]
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            # bool 是 int 的子类，但 `inj_chars: true` 显然是坏值，不该当 1 用
+        if (isinstance(v, bool) or not isinstance(v, (int, float))
+                or not math.isfinite(v)):
+            # bool 是 int 的子类，但 `inj_chars: true` 显然是坏值，不该当 1 用。
+            # `math.isfinite` 这一半是补的：`isinstance(float('inf'), float)` 为 True，
+            # 非有限浮点原本能**穿过**本函数，而 `json.loads` 默认就接受 `Infinity`
+            # 与 `1e999`。下游 `int(inf)` 抛 `OverflowError`（`int(nan)` 抛
+            # `ValueError`），`summarize` 在 `main` 里是裸调用 ⇒ 整份 `--report`
+            # exit=1、stdout 全空，正是本函数 docstring 写下的那个反目标。
             del r[k]
             dropped += 1
     return dropped
@@ -148,7 +156,9 @@ class _Acc:
                  "max_notes_seen", "src_dist", "n", "n_ok", "n_admitted",
                  "ft", "n_legacy_near", "inj_chars", "inj_n",
                  "dedup_full", "n_dedup_full", "n_dedup_legacy",
-                 "n_pre_epoch", "ft_by_threshold", "ss_n", "ss_inj_chars")
+                 "n_pre_epoch", "ft_by_threshold", "ss_n", "ss_inj_chars",
+                 "topic_rounds", "topic_words_sum", "topic_field_n",
+                 "topic_off_n")
 
     def __init__(self) -> None:
         self.arm: Counter = Counter()
@@ -160,6 +170,11 @@ class _Acc:
         self.src_dist: Counter = Counter()
         self.n = self.n_ok = self.n_admitted = self.ft = 0
         self.n_legacy_near = self.inj_chars = self.inj_n = 0
+        # session_topic 生效率。`topic_field_n` 是**携带该字段的**记录数，
+        # 不是全部记录数：落盘该指标之前的旧记录不进分母，否则生效率会被
+        # 历史数据永久稀释、这栏刚上线就失去判别力。
+        self.topic_rounds = self.topic_words_sum = self.topic_field_n = 0
+        self.topic_off_n = 0        # 显式关闭该功能的轮次，单独计、不进生效率分母
         # 全量成因计数（新记录）与被截断窗口口径（旧记录）严格分开：混算既不是
         # 全量也不是窗口，而两者的 dedup 占比实测差一个数量级以上。
         self.dedup_full: Counter = Counter()
@@ -303,6 +318,34 @@ def _acc_epoch_and_threshold(r: dict, a: _Acc) -> None:
         slot[1] += 1
 
 
+def _acc_topic(r: dict, a: _Acc) -> None:
+    """session_topic 的生效率。
+
+    只看「本轮读到几个主题词」，不看它有没有把某篇推过闸门——后者要在这里重算一遍
+    `_prompt_topical_hits` 的判据，等于把判据抄成两份。生效率恒 0 已经足以定性
+    「层 3 没在工作」，而那正是这栏要回答的问题。
+    """
+    if r.get("topic_on") is False:
+        # 显式关闭（或 dry_run）的轮次单独计。旧记录没有这个键 ⇒ `.get()` 得 None，
+        # 不等于 False ⇒ 照旧走下面的分母，向后兼容。
+        a.topic_off_n += 1
+        return
+    v = r.get("n_topic_words")
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        # 走到这里只剩两种可能：**旧记录**（没有这个键），或坏值已被
+        # `_drop_bad_numeric_fields` 删键 —— 后者已在那里计数并经 stderr 报出。
+        # 刻意**不**在这里另写一份坏值判据：`n_topic_words` 是顶层数值字段，
+        # 清洗归 `_NUMERIC_TOP_FIELDS` 单点管。就地重写会让 `true` 被 `int()`
+        # 吃成 1（把「一次都没生效」这条告警整个换掉），也会让 `"abc"` 静默漏出
+        # 分母而无任何计数 —— 两种口径分叉都实测过。
+        return
+    n = int(v)
+    a.topic_field_n += 1
+    if n > 0:
+        a.topic_rounds += 1
+        a.topic_words_sum += n
+
+
 def _acc_to_dict(a: _Acc) -> dict:
     return {
         "n_events": a.n, "n_ok": a.n_ok, "n_admitted": a.n_admitted,
@@ -321,6 +364,10 @@ def _acc_to_dict(a: _Acc) -> dict:
         "n_legacy_near_records": a.n_legacy_near,
         "max_notes_dist": dict(a.max_notes_seen),
         "src_dist": dict(a.src_dist),
+        "topic_rounds": a.topic_rounds,
+        "topic_words_sum": a.topic_words_sum,
+        "topic_field_n": a.topic_field_n,
+        "topic_off_n": a.topic_off_n,
         "near_miss_dedup_dist": dict(a.near_dedup),
     }
 
@@ -351,6 +398,7 @@ def summarize(records: Iterable[dict]) -> dict:
         _acc_cost(r, a)
         _acc_near_miss(r, a)
         _acc_epoch_and_threshold(r, a)
+        _acc_topic(r, a)
     return _acc_to_dict(a)
 
 
@@ -380,6 +428,34 @@ def _shown_path(p: str, show_paths: bool) -> str:
     """
     return sanitize_injected_text(p, keep_newlines=False)[:80] if show_paths \
         else _stable_path_id(p)
+
+
+def _render_topic(s: dict) -> str:
+    """session_topic 生效率。**恒 0 必须点破，不能只给个百分比。**
+
+    2026-09-09：该功能默认开一周、每会话付一次 haiku，提炼 18/18 成功却因写读落在
+    不同 runtime 命名空间而一次都没被读到。当时报表里没有任何一栏跟它有关，于是
+    「开着但完全没工作」这件事没有任何通道能被发现。补这栏时若只渲染 `0.0%`，
+    读者仍要自己意识到「0 意味着坏了」——把话说出来才是它存在的意义。
+    """
+    n = s.get("topic_field_n", 0)
+    off = s.get("topic_off_n", 0)
+    if not n:
+        if off:
+            return (f"session_topic：{off} 轮均处于关闭状态"
+                    "（relevance.session_topic=false 或 dry_run），不计生效率")
+        return "session_topic：无记录携带该字段（落盘该指标之前的旧记录）"
+    tail = f"；另有 {off} 轮该功能处于关闭状态，不计入" if off else ""
+    hit = s.get("topic_rounds", 0)
+    if not hit:
+        return (f"session_topic：{hit}/{n} 轮生效 —— **一次都没生效**。"
+                "先查 state 里 topics 的 words 是不是全为空："
+                "常见成因是提炼子进程与读取端落在不同 runtime 命名空间、"
+                "state_ttl_hours 过短、或提炼持续失败。"
+                "⚠️ 但每个会话的**首轮**、以及其后约 20s（提炼仍在飞行中）必然为 0，"
+                "故「每次只问一两句」的工作负载下低生效率属预期而非故障" + tail)
+    return (f"session_topic：{hit}/{n} 轮生效（{hit / n:.1%}），"
+            f"生效轮平均 {s.get('topic_words_sum', 0) / hit:.1f} 词{tail}")
 
 
 def _render_span(s: dict) -> str:
@@ -424,6 +500,7 @@ def render_report(s: dict, show_paths: bool = False) -> str:
                 if n_ok else ""), ""]
     lines.append(f"全文注入 {s.get('n_fulltext', 0)} 次 = 走到打分轮次的 "
                  f"{s['fulltext_rate']:.1%}")
+    lines.append(_render_topic(s))
     if inj_n:
         # 标明「UPS」：SessionStart 通道完全不落 metrics（该文件对 _metrics 引用数为 0），
         # 不标注的话读者会把这个数当成 vault-loader 的注入开销总量。

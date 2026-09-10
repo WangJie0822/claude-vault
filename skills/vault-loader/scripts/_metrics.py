@@ -340,7 +340,9 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
                  near_miss_k: int = 10, admitted_k: int = 20,
                  max_notes: int = 3,
                  min_topical: float | None = None,
-                 ft_topical: float | None = None) -> dict:
+                 ft_topical: float | None = None,
+                 n_topic_words: int = 0,
+                 topic_on: bool = True) -> dict:
     """把一次 UPS 决策压成一条可落盘记录。纯计算、无 IO。
 
     隐私边界（不可协商，见 task-6-brief.md）：
@@ -446,6 +448,19 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
         # 是一种生产中从未存在过的形态，因此永远发现不了）。
         "src": src,
         "gate": decision.gate_reason,
+        # 本轮实际读到、参与打分的 session_topic 主题词数。**无条件落，0 也要落**：
+        # 恒 0 正是「层 3 没生效」的信号，条件落会让它退化成「字段不存在」，与旧记录
+        # 混淆。2026-09-09 实测该功能默认开一周、18/18 次提炼全部读不到，而决策面
+        # 记录里当时没有任何一栏跟它有关 ⇒ 报表全程无变化、全套用例全绿。
+        # 不记逐条 hit：那要么改 `_prompt_topical_hits` 的热路径签名，要么在这里按
+        # 同一规则重算一遍——后者等于把判据抄成两份，是本仓库反复记过的漂移源头。
+        "n_topic_words": int(n_topic_words),
+        # 本轮该功能开着没有。**自描述配置字段**，与 max_notes/min_topical/
+        # ft_topical 同一惯例（analyze_metrics 不读 config）。缺了它，报表会对
+        # 显式关掉 session_topic（或开着 dry_run）的用户断言「功能开着却恒空」
+        # 并给出三条一条都不适用的排查方向——关闭时 signals.session_topic_words
+        # 恒为空集，而接线无条件落 len(...) ⇒ 每轮都往分母里塞一个 0。
+        "topic_on": bool(topic_on),
         "relaxed": bool(decision.relaxed),
         "admitted": [
             {"path": ed.path, "topical": round(ed.topical, 3),

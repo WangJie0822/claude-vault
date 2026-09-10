@@ -84,6 +84,42 @@ def configure_context(runtime: str, session_id: str = "") -> None:
                     if runtime in {"claude", "codex"} else "legacy")
 
 
+def current_runtime() -> str:
+    """当前进程实际生效的 state 命名空间（已归一化，即 `state_path_for_cwd` 用的那个）。
+
+    存在的理由是**单点**：需要把落点告诉别人（如 detached 子进程）时，必须交出
+    这个已生效的值，而不是让对方按 payload/config 再推导一次 —— 两个各自算落点的
+    地方正是 2026-09-09 那个缺陷的形态（父进程 canonical、子进程 legacy，写读分裂、
+    全程静默）。注意它返回的是**归一化后**的结果：`configure_context("claude")` 在
+    未迁移的机器上会落成 `"legacy"`，此处如实返回 `"legacy"`。
+    """
+    return _RUNTIME
+
+
+def adopt_runtime(ns: str) -> None:
+    """采信调用方**已归一化**的命名空间，不再重判环境。仅供跨进程交接使用。
+
+    与 `configure_context` 的唯一差别是**不查 `use_canonical_namespace()`**。这不是
+    优化，是「单点」这句话得以成立的前提：`current_runtime()` 交出的是**输出域**的值
+    （已生效的命名空间），而 `configure_context` 接受的是**输入域**的值（原始 runtime
+    id）。两个域的取值字符串重叠（`legacy`/`claude`/`codex`）、类型相同、语义不同，
+    把前者喂回后者是一次**有损往返** —— `claude` 是其中唯一的非不动点，而它恰好是
+    绝大多数用户所在的那一档。父子之间 `use_canonical_namespace()` 一旦翻转
+    （`has_legacy_data` 的三个探针里，`~/.claude/skills/summarize-session/config.json`
+    与 `~/.claude/vault-loader-metrics/` 都是**其它组件**可能创建的路径），落点即分裂，
+    且分裂后 100% 静默：子进程 stdout/stderr 全 DEVNULL，而父进程已落 in-flight 占位，
+    `has_recent_topic_attempt` 会把重试压制到 `state_ttl_hours`（默认 24 小时）。
+
+    ⚠️ **白名单必须保留，去掉的只能是二次推导。** `_RUNTIME` 会被
+    `state_path_for_cwd` 拼进目录路径；放行任意字符串等于把它变成路径组件 sink，
+    即一个任意路径 JSON 写原语（`_RUNTIME='..\\..\\..\\PWNED'` 可写到预期范围之外）。
+    这里的清洗与 `configure_context` 的 else 分支**逐字同源**，两处不得分叉。
+    """
+    global _RUNTIME
+    _RUNTIME = (_safe_component(ns, "legacy")
+                if ns in {"claude", "codex"} else "legacy")
+
+
 def _cwd_hash(cwd: Path) -> str:
     """对 cwd 绝对路径取短 hash，用于隔离不同项目的 state。"""
     canonical = str(cwd.resolve() if cwd.exists() else cwd.absolute())

@@ -925,6 +925,11 @@ def main() -> int:
                 # 不落盘则报表只能给出跨制度的合并值（实测 65.4% vs 40.1%）。
                 min_topical=config["relevance"].get("min_topical_score"),
                 ft_topical=config["relevance"].get("fulltext_topical_threshold"),
+                # 取 `signals.session_topic_words` 而不是重新读一次 state：落盘的必须
+                # 是**本轮真正参与打分**的那一份，重读会在 TTL 边界上给出与打分不一致
+                # 的数，让这条本来用于发现失效的指标自己变成噪声源。
+                n_topic_words=len(signals.session_topic_words),
+                topic_on=bool(rel_cfg.get("session_topic", False)),
             ))
         except Exception as exc:  # noqa: BLE001
             _report_nonfatal("metrics 构造失败", exc)
