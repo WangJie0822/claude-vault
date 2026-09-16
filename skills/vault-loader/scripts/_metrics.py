@@ -342,7 +342,15 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
                  min_topical: float | None = None,
                  ft_topical: float | None = None,
                  n_topic_words: int = 0,
-                 topic_on: bool = True) -> dict:
+                 topic_on: bool = True,
+                 pin_on: bool = True,
+                 n_pool: "int | None" = None,
+                 n_pool_proj: "int | None" = None,
+                 llm_pinned: "list[str] | None" = None,
+                 llm_pinned_rank: "list[int | None] | None" = None,
+                 llm_pinned_dedup: "list[str | None] | None" = None,
+                 topic_extracted_h: "list[str] | None" = None,
+                 n_topic_extracted: "int | None" = None) -> dict:
     """把一次 UPS 决策压成一条可落盘记录。纯计算、无 IO。
 
     隐私边界（不可协商，见 task-6-brief.md）：
@@ -512,6 +520,34 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
     if _RUNTIME != "legacy":
         record["runtime"] = _RUNTIME
         record["event_id"] = _EVENT_ID or prompt_id or ""
+    # `pin_on`：本轮会话级固定注入是否生效（session_topic 且 session_pin_enabled 且 session_pin_max>0）。
+    # 与 `topic_on` 同族的自描述字段：没有它，报表分不开「功能关着」与「功能开着却一次都没点名」——
+    # 后者正是这条功能静默死掉的形态（1A-M1 / 1B-M-2）。无条件落盘。
+    record["pin_on"] = bool(pin_on)
+    # 候选池构成（1B-H-1）：只在触发提炼的那一轮由调用方传入。`n_pool_proj` 是池中来自项目笔记片的
+    # 篇数——组件 A 退化成纯 admitted 时功能照常工作，这是唯一能把退化照出来的数。None 不落键。
+    if n_pool is not None:
+        record["n_pool"] = int(n_pool)
+    if n_pool_proj is not None:
+        record["n_pool_proj"] = int(n_pool_proj)
+    # 对账字段（spec §2.5）：只在「首个读到 pinned、admitted 非空且未记账」的轮次由调用方传入；
+    # None 不落键，使旧记录与非记账轮次形态一致。主题词只落加盐 hash（与 kw_h 同盐同法），不落明文。
+    # `llm_pinned_dedup` 与 `llm_pinned_rank` 逐位对应：rank 为 None 时它说明是「被跨轮去重压掉」
+    # （"candidate_injected" / "fulltext_injected"）还是真不在本轮 admitted（None）——终审 I-3。
+    # `n_topic_extracted` 在 Phase 1 与 `n_topic_words` 按构造相等（同一份 words，只差 set 去重）；
+    # 两者要到 Phase 2 停用词过滤落地后才分开（前者是提炼出的、后者是参与打分的）。**别把它当
+    # 冗余删掉**（1A-L1 / 1B-L-3）。
+    if llm_pinned is not None:
+        record["llm_pinned"] = [p for p in llm_pinned if isinstance(p, str)]
+    if llm_pinned_rank is not None:
+        record["llm_pinned_rank"] = [r if (isinstance(r, int) and not isinstance(r, bool)) else None
+                                     for r in llm_pinned_rank]
+    if llm_pinned_dedup is not None:
+        record["llm_pinned_dedup"] = [d if isinstance(d, str) else None for d in llm_pinned_dedup]
+    if topic_extracted_h is not None:
+        record["topic_extracted_h"] = [x for x in topic_extracted_h if isinstance(x, str)]
+    if n_topic_extracted is not None:
+        record["n_topic_extracted"] = int(n_topic_extracted)
     return record
 
 
@@ -816,7 +852,12 @@ def stage(record: dict) -> None:
 # `build_record` 用了稳定排序且上游预排过 —— 而 `build_record` 的注释恰恰声明
 # 「不依赖上游已按 (-total, -mtime) 预排序这一隐式前提」。任何人照那句注释去改
 # 排序键，全部历史与未来记录的「用户看到了什么」都会静默错位，且没有任何用例会红。
-_ANNOTATE_ALLOWED = frozenset({"inj_chars", "shown"})
+# `shown` **只覆盖机械召回通道**（清单 / 全文那几篇）。pinned 通道的「用户看到了什么」由
+# `pinned_injected`（每轮篇数）+ `llm_pinned`（该会话的点名集合，一次性落）刻画，**刻意不并入**
+# `shown`——并入会让 `sample_admitted` 把 pinned 当 admitted_list 抽进标注池（1B-M-1 取 (b)）。
+# `pinned_injected` 的落盘口径：凡走到打分阶段的轮次一律落（含 0），闸门早退不落——它的存在性是
+# 报表「功能开着却一次都没点名」那一档的分母，与 `inj_chars`「只在有正文时记」刻意不同（1A-L12）。
+_ANNOTATE_ALLOWED = frozenset({"inj_chars", "shown", "pinned_injected"})
 
 
 def annotate(**fields: object) -> None:

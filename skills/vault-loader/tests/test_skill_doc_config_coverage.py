@@ -84,8 +84,15 @@ def test_skill_md_session_topic_hit_row_does_not_overclaim():
     （`min_topical_score`）成立，对全文阈值（`fulltext_topical_threshold`）不成立：
     叠加 prompt 关键词已有的 topical 分，主题词可以把笔记推过全文阈值。"""
     text = _skill_text()
-    rows = [line for line in text.splitlines() if "scoring.session_topic_hit" in line]
+    rows = [line for line in text.splitlines() if "`scoring.session_topic_hit`" in line]
     assert rows, "SKILL.md 未找到 scoring.session_topic_hit 这一行"
     assert "只能锦上添花" not in rows[0], f"文档仍残留已被 F3 推翻的表述：{rows[0]}"
     assert "fulltext_topical_threshold" in rows[0], (
         "文档应提及可越过全文阈值这一已知且被测试锁定的行为")
+
+
+def test_pin_header_names_a_real_config_key():
+    """1A-L11：`PIN_HEADER` 是用户可见文案，里面嵌的配置键名必须真实存在于 DEFAULT_CONFIG。"""
+    from scripts.prompt_submit_load import PIN_HEADER, PIN_SWITCH_KEY
+    assert PIN_SWITCH_KEY in DEFAULT_CONFIG["relevance"]
+    assert f"`relevance.{PIN_SWITCH_KEY}: false`" in PIN_HEADER

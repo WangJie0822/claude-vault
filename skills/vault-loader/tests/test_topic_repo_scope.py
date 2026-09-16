@@ -307,6 +307,55 @@ def test_file_stays_under_byte_budget_with_wide_chars(tmp_path: Path,
         "字节裁剪把刚写入的会话丢掉了，该会话将永远存不进主题词"
 
 
+@pytest.mark.parametrize("charset,ch", [("cjk3", "词"), ("nonbmp4", "𝄞")])
+@pytest.mark.parametrize("n_pins,floor", [
+    (1, 12),          # 默认 session_pin_max=1：spec §3.1 的容量下界 ≥12（实算 23 / 18）
+    (None, 4),        # 硬上限 8 篇：实算 9 / 6，只钉「不是整份重置」（重置只剩 1）
+])
+def test_file_stays_under_byte_budget_with_pins(tmp_path: Path, charset: str, ch: str,
+                                                n_pins, floor: int) -> None:
+    """spec §3.1 的字节守卫此前只按 1 篇 pinned 推算（1B-L-5 / 终审 Phase 2 登记的 spec→plan 漏项）。
+    这里按 `MAX_PIN_HARD_CAP` 篇 × `MAX_PIN_PATH_CHARS` 宽字符 + 8 词 × `MAX_TOPIC_WORD_LEN`
+    满载写 36 个会话：文件不得越过预算、不得整份重置、当前会话必须活着。容量数字见
+    `_topic.py` 里 `MAX_PIN_PATH_CHARS` 的注释；该常量从 1024 收到 256 正是为了让 8 篇满载
+    下容量不掉到 2。"""
+    from scripts._topic import (MAX_PIN_HARD_CAP, MAX_PIN_PATH_CHARS, MAX_TOPIC_WORD_LEN,
+                                TOPIC_TRIM_BYTES, load_session_pinned)
+    repo = _mkrepo(tmp_path / "proj")
+    k = MAX_PIN_HARD_CAP if n_pins is None else n_pins
+    word = ch * MAX_TOPIC_WORD_LEN
+    for i in range(MAX_TOPIC_SESSIONS + 4):
+        # 恰好顶到 MAX_PIN_PATH_CHARS（3 位序号 + 1 位 j + ".md" = 7 字符）：超过即被读端丢弃（B-L9）
+        pins = [f"{ch * (MAX_PIN_PATH_CHARS - 7)}{i:03d}{j}.md" for j in range(k)]
+        save_session_topic(repo, f"sess-{i}", [word] * 8, pinned=pins, accounted=False)
+
+    p = session_topics_path(repo)
+    size = p.stat().st_size
+    assert size <= TOPIC_TRIM_BYTES, f"[{charset}/{k}pins] 文件 {size}B 越过字节预算"
+    assert size < MAX_STATE_BYTES, f"[{charset}/{k}pins] 越过 MAX_STATE_BYTES，会触发整份重置"
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert len(data["topics"]) >= floor, (
+        f"[{charset}/{k}pins] 只剩 {len(data['topics'])} 条（下界 {floor}）")
+    last = f"sess-{MAX_TOPIC_SESSIONS + 3}"
+    assert load_session_topic(repo, last, 24), "字节裁剪把刚写入的会话丢掉了"
+    assert len(load_session_pinned(repo, last, 24)) == k, "当前会话的 pinned 必须完整保留"
+
+
+@pytest.mark.parametrize("ch", ["a", "词", "𝄞"])
+def test_encoded_size_matches_bytes_on_disk(tmp_path: Path, ch: str) -> None:
+    """`_encoded_size` 必须与真实写端 `atomic_write_json` 逐字节一致——字节裁剪循环以它为判据，
+    估少了裁剪就停在预算线上方。Windows 文本模式的 `\\r\\n` 正是那种「参数都一样、字节却不一样」
+    的差异，只有拿真实写端对账才抓得住。"""
+    from context_vault.atomic import atomic_write_json
+    from scripts._topic import _encoded_size
+    payload = {"topics": {f"s{i}": {"words": [ch * 50] * 8, "ts": 1.7e9 + i,
+                                    "pinned": [ch * 40 + ".md"], "accounted": False}
+                          for i in range(5)}}
+    target = tmp_path / "x.json"
+    atomic_write_json(target, payload)
+    assert target.stat().st_size == _encoded_size(payload)
+
+
 def test_session_capacity_has_absolute_floor() -> None:
     """钉住绝对下界，而不是与别的常量的相对关系。
 

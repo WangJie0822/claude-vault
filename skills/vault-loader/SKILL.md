@@ -113,7 +113,7 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 | 键 | 默认 | 作用 |
 |---|---|---|
 | `user_prompt_submit.enabled` | `true` | UserPromptSubmit hook 开关 |
-| `user_prompt_submit.max_notes` | `3` | 清单注入的笔记条数上限 |
+| `user_prompt_submit.max_notes` | `3` | 清单注入的笔记条数上限（不含 `session_pin_enabled` 的固定注入篇，那是额外名额） |
 | `user_prompt_submit.fulltext_max_bytes` | `8192` | 全文注入的字节上限，超出截断 |
 | `user_prompt_submit.min_keyword_count` | `2` | prompt 关键词数下限，不足即静默早退（纯 CJK 单词可被 `relax_pure_cjk_single` 放宽） |
 | `user_prompt_submit.state_ttl_hours` | `24` | 去重状态、兜底提示冷却的有效期（小时）。**同一个值也约束 `relevance.session_topic` 主题词**：既是已提炼主题词的有效期，也是"本会话是否已尝试过提炼（含失败）"负缓存的有效期——过期后才会重新拉起提炼子进程（F6，整分支终审 2026-09-02） |
@@ -160,8 +160,12 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 | `relevance.exclude_note_tags` | `["archived"]` | 召回池排除这些 tag 的笔记（SessionStart 与 UserPromptSubmit 共用；`[]` 关闭；`/vault` 手动检索不受影响） |
 | `relevance.use_tag_idf` | `true` | tag 命中按 IDF 加权（泛 tag 降权、singleton tag 满分）；false 为止血开关，数值等价回到旧等权行为 |
 | `relevance.tag_idf_floor` | `0.5` | 泛 tag 的保底加权因子，值域下界。设 `0` 会让泛 tag 归零、行为剧变；调高（如 `0.7`）减弱降权强度 |
-| `relevance.session_topic` | `true` | 会话首轮异步提炼 3-8 个主题词，后续轮次用作辅助召回信号（让「继续执行」这类短 prompt 也能召回会话相关笔记）。**1.1.0 起默认开**，代价请先读完：它会拉起一个 `claude -p` 子进程（模型固定 `haiku`、每会话首轮一次、**消耗你的额度**），并**把你本轮 prompt 原文与 `session_topic_top_n` 篇候选笔记的路径+摘要一并发给它**用于提炼关键词。prompt 原文与候选内容经 stdin 传给子进程（不落 argv/进程表），提炼产物（主题词本身）落盘在本机 state 文件，不上传、不进 metrics。提炼失败/超时不会每轮重试（负缓存见 `user_prompt_submit.state_ttl_hours`）。**关掉**：本段显式写 `"session_topic": false` |
-| `relevance.session_topic_top_n` | `10` | 首轮送进提炼子进程的候选笔记篇数（路径+摘要，`Entry` 无 `title` 字段）。注入给你的仍是 top-3，这个数只影响提炼的输入 |
+| `relevance.session_topic` | `true` | 会话首轮异步提炼 3-8 个主题词并点名至多 `session_pin_max` 篇，后续轮次用作辅助召回信号（让「继续执行」这类短 prompt 也能召回会话相关笔记）。**1.1.0 起默认开**，代价请先读完：它会拉起一个 `claude -p` 子进程（模型固定 `haiku`、每会话首轮一次、**消耗你的额度**），并**把你本轮 prompt 原文与 `session_topic_top_n` 篇候选笔记的路径+摘要一并发给它**用于提炼关键词。prompt 原文与候选内容经 stdin 传给子进程（不落 argv/进程表），提炼产物（主题词与点名篇）落盘在本机 state 文件；开启 `metrics` 后另落主题词的加盐 hash 与点名篇路径到 metrics 记录（`--purge` 可清）。提炼失败/超时不会每轮重试（负缓存见 `user_prompt_submit.state_ttl_hours`）。**关掉**：本段显式写 `"session_topic": false` |
+| `relevance.session_topic_top_n` | `30` | 首轮送进提炼子进程的 admitted 候选篇数；与 `session_topic_project_top_k` 并集后封顶 `session_topic_pool_max`。显式写过的值不会被 `migrate_config` 动 |
+| `relevance.session_topic_project_top_k` | `20` | 当前项目 `项目笔记/<仓库名>/`（含项目 CLAUDE.md 的 `extra_paths`）下按 mtime 最新的 N 篇并入首轮提炼候选池；worktree 内按主仓库名取。显式写过的值不会被 `migrate_config` 动 |
+| `relevance.session_topic_pool_max` | `50` | 首轮提炼候选池封顶：admitted 前 `session_topic_top_n` 全保留，**被截掉的是项目笔记那一片**——本轮 admitted 实际篇数达到本值时项目笔记一篇都进不了池（要保住项目片就把本值随 `session_topic_top_n` 一起调大；开 `metrics` 后报表「候选池」行会点破「项目笔记恒为 0」）。显式写过的值不会被 `migrate_config` 动 |
+| `relevance.session_pin_enabled` | `true` | 会话级固定注入总开关（**需 `relevance.session_topic` 同时为 `true`**——点名来自同一个提炼子进程，`session_topic: false` 时本开关无效）：首轮 LLM 点名的笔记在整个会话（`state_ttl_hours` 内）每轮注入其 summary，**独占额外名额**（不占 `user_prompt_submit.max_notes`），机械召回为空时也注入；闸门早退（指代型/关键词不足/subagent 事件通知）轮次不注入。关掉则提炼 prompt 与候选池回到 1.2.1 形态 |
+| `relevance.session_pin_max` | `1` | 首轮最多点名几篇；读端每轮也按此值收口（TTL 内调低立即少注入；`0` 等价于关掉点名），读写两侧硬上限 8。首版取 1：点错时只污染一篇 |
 
 > ⚠️ **阈值与权重耦合**：`relevance` 的三个阈值（`min_topical_score` / `fulltext_topical_threshold` / `confidence_bands.high`）是按当前 `scoring` 权重标定的——默认权重（tag 4 / summary 2 / keywords 5、floor 0.5）下话题分上界为 11。**改 `scoring` 权重后必须同步复核这三个阈值**，否则闸门会整体偏松或偏紧（例如把 `prompt_tag_hit` 提到 8，单个泛 tag 命中就能越过全文阈值）。
 

@@ -28,6 +28,9 @@ d3c134b 与孤儿提交 cb3a214（origin/master 干净首版）两处"新增"该
     - enabled/dry_run 等结构性开关键——任何情况下不删（EXCLUDED_KEYS 按 leaf 名
       在任意路径深度命中即排除，覆盖 session_start.enabled/user_prompt_submit.enabled
       等嵌套出现的场景）。
+    - 「送出去多少篇」的 int 型隐私旋钮（session_topic_top_n / session_topic_project_top_k /
+      session_topic_pool_max）——虽是数值键，但用户显式写过的值等于一次隐私决定，恒不判残留
+      （同在 EXCLUDED_KEYS）。
 """
 from __future__ import annotations
 
@@ -38,6 +41,12 @@ ALLOWLIST_PREFIXES = ("scoring.", "relevance.", "session_start.", "user_prompt_s
 EXCLUDED_KEYS = {
     "enabled", "dry_run", "vault_path", "opt_out_paths", "display",
     "telemetry", "keyword_to_tags",
+    # int 型隐私旋钮（SKILL.md 把它们文档化为「送出去多少篇」的开关），用户显式写过的值
+    # 永不被 migrate 判为残留删除——与布尔开关同一例外理由。三个键管的是同一件事
+    # （admitted 片 / 项目笔记片 / 池封顶），只排除其中一个说不通（1B-L-2）。
+    "session_topic_top_n",
+    "session_topic_project_top_k",
+    "session_topic_pool_max",
 }
 
 # 值为「该键曾经当过的默认值集合」（history，非当前唯一默认）；表覆盖 ALLOWLIST
@@ -87,8 +96,9 @@ HISTORICAL_DEFAULTS: dict[str, list] = {
     "relevance.max_prompt_keywords": [30],
     # 665cf63（2026-07-22）引入 tag_idf_floor=0.5，此后未变。
     "relevance.tag_idf_floor": [0.5],
-    # Task 4（2026-09-02，会话主题预热接线）新增，仅一个历史值。
-    # 注：同批新增的 relevance.session_topic 是布尔开关，不入本表
-    # （iter_leaf_segments 显式排除 bool，见模块 docstring「收敛范围」一节）。
-    "relevance.session_topic_top_n": [10],
+    # 注：relevance.session_topic 是布尔开关；relevance.session_topic_top_n /
+    # session_topic_project_top_k / session_topic_pool_max 三个「送出去多少篇」旋钮已进
+    # EXCLUDED_KEYS，均不入本表（iter_leaf_segments 显式排除 bool，见模块 docstring「收敛范围」一节）。
+    # spec 2026-09-15 Phase 1 新增，只一个历史值。
+    "relevance.session_pin_max": [1],
 }

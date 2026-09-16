@@ -2,6 +2,44 @@
 
 本文件记录 Context Vault（原 claude-vault）的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.0] - 2026-09-16
+
+**首轮提炼不再只产主题词——同一次 haiku 调用还会从候选里点名 1 篇「本会话固定上下文」，整个会话每轮注入其摘要。**
+此前 LLM 的判断只作为 +2 加分喂给机械打分，而作者本机一个决定性案例里三篇真正相关的笔记根本不在
+机械候选 57 篇之内、加分无处可加；现在 LLM 点名的篇**独占额外名额**、不参与打分、机械召回为空时也
+注入。候选池由 admitted 前 30 篇 ∪ 当前项目 `项目笔记/<仓库名>/` 按 mtime 最新 20 篇组成（封顶 50），
+worktree 内按主仓库名取。
+
+### 新增
+
+- 配置键 `relevance.session_pin_enabled`（默认开，需 `session_topic` 同时开）、`session_pin_max`
+  （默认 1，读端每轮也按此收口，硬上限 8）、`session_topic_project_top_k`（20）、
+  `session_topic_pool_max`（50）；`session_topic_top_n` 默认 10 → 30。三个「送出去多少篇」旋钮
+  显式写过的值不再被 `migrate_config` 动。
+- 注入正文多一段「📌 本会话固定上下文」（自带隔离声明），用户摘要显示 📌 标题；`session_pin_enabled:
+  false` 时提炼 prompt 与候选池逐字回到 1.2.1 形态。
+- metrics（opt-in）：走到打分阶段的每轮落 `pinned_injected` / `pin_on`（闸门早退的极简记录不落）；
+  触发提炼的轮次落 `n_pool` / `n_pool_proj`（pin 关着时不落后者）；
+  首个有 admitted 的 pinned 轮次一次性落 `llm_pinned` / `llm_pinned_rank` / `llm_pinned_dedup` /
+  `topic_extracted_h`（主题词加盐 hash）/ `n_topic_extracted`。`--report` 新增 pinned 对账行（三态
+  分开：功能关 / 旧记录 / 开着却一次都没点名）与候选池行（项目笔记恒 0 时点破组件未生效）；
+  `--review` 新增 `kind=llm_pinned` 独立配额。
+
+### 修复
+
+- topics 文件的字节预算估算漏了 Windows 文本模式的 `\r\n`，满载时裁剪停在预算线上方（实测
+  81930B > 81920B）；pinned 路径存储上限 1024 → 256（作者 vault 实测最长 113），8 篇满载下容量不再
+  掉到 2 条。
+- 主题词读端与写端同走一份过滤，手工改过的文件里的纯数字 / 单字符 ASCII 不再漏进打分。
+- 提炼输出解析容忍 `**PINNED:**` / `- PINNED:` 等 markdown 装饰与同行 `PINNED: 3 WORDS: …`；
+  `3 (none of the rest)` 这类附注不再被整段判成 NONE。
+
+### 已知限制
+
+- 点名篇路径以明文存于 topics 文件与 metrics（与已注入 path 同一保护边界）；主题词只落加盐 hash。
+- 首轮候选与 prompt 原文经 stdin 送进 `claude -p --model haiku` 子进程，送出量随 `session_topic_top_n`
+  与项目笔记片增大；主会话跑第三方 provider 时外传量随之扩大。
+
 ## [1.2.1] - 2026-09-10
 
 **1.2.0 修好了「主题词写在哪」，这一版修的是「换个目录就读不到」。**

@@ -77,7 +77,7 @@ try:
     )
     from scripts._state import (
         load_already_injected, load_fulltext_injected, save_injected,
-        fallback_cooldown_expired, save_fallback_ts,
+        fallback_cooldown_expired, save_fallback_ts, _repo_root,
     )
     from scripts._decision import (
         decide_injection, StateView, _hit_keywords, gate_keywords, select_fulltext,
@@ -85,7 +85,11 @@ try:
     )
     from scripts._topic import (
         load_session_topic, spawn_topic_extraction, has_recent_topic_attempt,
+        load_session_pinned, load_pinned_accounted, mark_pinned_accounted,
+        effective_pin_max,
     )
+    from scripts._candidate_pool import (build_topic_pool, count_project_notes, safe_int,
+                                         SUMMARY_CHARS)
 except Exception as _import_exc:  # noqa: BLE001 — fail-open 优先于一切
     if __name__ != "__main__":
         raise
@@ -183,6 +187,10 @@ except Exception as _metrics_exc:  # noqa: BLE001
         def get_salt(home: Path) -> bytes:
             return b""
 
+        @staticmethod
+        def h(text: str, salt: bytes) -> str:
+            return ""
+
         # near-miss 提示分支也走 _metrics（此前漏补，由
         # test_metrics_stub_covers_all_called_interfaces 扫出来）。虽然那段自带
         # try/except，但缺接口会让它每轮走进 except、打一行 stderr。
@@ -200,6 +208,24 @@ except Exception as _metrics_exc:  # noqa: BLE001
 # 故不能用 None 区分"调用方没传"。没传 → 渲染层按 select_fulltext 自行回退计算
 # （仅剩测试/未接决策层的调用点会走到；生产 main() 恒显式传值）。
 _UNSET = object()
+
+# 一次性对账标记（`mark_pinned_accounted`）的延迟登记：只在 `_finish_with_metrics` 里 flush
+# **没抛**之后才翻（1A-M2 / 1B-M-3）。`stage` 是零 IO 缓冲，真正落盘在 flush；此前标记在 stage 之后
+# 立即翻，flush 失败时那份每会话一次的对账数据永久丢失且无任何信号。生产里每轮 hook 是新进程，
+# 这个模块级变量只活一轮；`main()` 入口先清一次，防同进程多轮调用（测试）串味。
+_PENDING_PIN_ACCOUNT: "tuple[Path, str] | None" = None
+
+
+def _register_pin_account(cwd: Path, session_id: str) -> None:
+    global _PENDING_PIN_ACCOUNT
+    _PENDING_PIN_ACCOUNT = (cwd, session_id)
+
+
+def _take_pin_account():
+    global _PENDING_PIN_ACCOUNT
+    v, _PENDING_PIN_ACCOUNT = _PENDING_PIN_ACCOUNT, None
+    return v
+
 
 # 摘要清单里单个标题的字符上限。标题来自 cache 的 path 键（不可信），除净化外还需
 # 截断——否则一个超长标题就能把 systemMessage 撑满、把真实信息挤出视野。
@@ -343,6 +369,45 @@ def _candidate_title(entry, short_chars: int) -> str:
     return sanitize_injected_text(summary, keep_newlines=False)
 
 
+# 用户可见文案里嵌的是**真实配置键名**（1A-L11：键一旦改名，用户会照着一个不存在的键去配）。
+# 守卫 test_skill_doc_config_coverage.py::test_pin_header_names_a_real_config_key 钉住它在 DEFAULT_CONFIG 里。
+PIN_SWITCH_KEY = "session_pin_enabled"
+PIN_HEADER = f"📌 本会话固定上下文（LLM 首轮点名；`relevance.{PIN_SWITCH_KEY}: false` 可关）："
+
+
+def render_pinned_section(pinned_paths, active_entries: dict, already: set, short_chars: int,
+                          with_notice: bool = True):
+    """会话级固定注入小节。返回 (文本 或 "", 实际渲染 path 列表)。
+
+    **默认自带 `INJECTION_NOTICE`**：全文分支的 `out_lines`（`build_injection_text_ups` 里以「📚 vault-loader 强命中」开头的那段）没有外层隔离声明、
+    nonce fence 只包 `ft_body`，pinned 小节若追加在那里就落在任何隔离声明之外（reverse/impact
+    /feasibility 三维各自抓到）。清单分支头部已有一份，调用方传 `with_notice=False` 免重复
+    （1A-L7）；admitted 为空的早退分支小节单独成篇，必须带。path 与 summary 同源自不可信 cache，走 F5 净化。
+    只从 `active_entries` 取（已过 archived 过滤）、`.get()` 跳过缺失——pinned 指向已删除笔记
+    时不得让 KeyError 被顶层 fail-open 吞成「整轮无注入」。
+    """
+    lines: list[str] = []
+    rendered: list[str] = []
+    try:
+        for p in (pinned_paths or []):
+            if not isinstance(p, str) or p in already or p in rendered:
+                continue
+            e = active_entries.get(p)
+            if e is None:
+                continue
+            path_clean = sanitize_injected_text(p, keep_newlines=False)
+            title = _candidate_title(e, short_chars)
+            lines.append(f"- [[{path_clean}]] — {title}")
+            rendered.append(p)
+    except Exception as exc:                     # noqa: BLE001 — fail-open
+        print(f"[vault-loader] pinned 渲染失败：{exc}", file=sys.stderr)
+        return "", []
+    if not lines:
+        return "", []
+    head = [INJECTION_NOTICE.rstrip("\n")] if with_notice else []
+    return "\n".join([*head, PIN_HEADER, *lines]), rendered
+
+
 def build_injection_text_ups(scored, keywords_str, prompt_keywords, ups_cfg, rel_cfg, vault_path,
                              hits_by_path=None, fulltext_path=_UNSET):
     """组装 UserPromptSubmit 注入正文。
@@ -462,10 +527,15 @@ def build_injection_text_ups(scored, keywords_str, prompt_keywords, ups_cfg, rel
 
 
 def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, display_cfg, rel_cfg,
-                      hits_by_path=None):
+                      hits_by_path=None, pinned_paths=None):
     """UserPromptSubmit 用户可见清单摘要。verbosity=off → None。
     items: list[(total, topical, entry)]。
-    hits_by_path: 决策层 {path: hits} 缓存（可选，缺省现算；见 `_make_hits_getter`）。"""
+    hits_by_path: 决策层 {path: hits} 缓存（可选，缺省现算；见 `_make_hits_getter`）。
+    pinned_paths: 本轮渲染的会话级固定笔记 path 列表（`render_pinned_section` 返回的
+        原始 path，即 rendered）；标题经函数内 `_title()` 派生——与其余标题同走
+        `sanitize_injected_text(..., keep_newlines=False)[:MAX_TITLE_CHARS]`（SEC-1），
+        不接受调用方预先算好、未经净化的标题字符串。追加进「N 笔记」计数与摘要尾部的
+        📌 段；None/空列表时行为与加参数前逐字一致。"""
     verbosity = display_cfg.get("verbosity", "compact")
     if verbosity == "off":
         return None
@@ -478,7 +548,7 @@ def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, di
     _hits = _make_hits_getter(prompt_keywords, hits_by_path)
     hit_lists = [_hits(e) for _, _, e in items]
     kw = ", ".join(sorted(set().union(*hit_lists)))
-    n = len(items)
+    n = len(items) + len(pinned_paths or [])
 
     def _title(path):
         """标题源自 cache 的 path 键 —— **不可信外部输入**，必须净化后截断（SEC-1）。
@@ -496,12 +566,17 @@ def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, di
         return sanitize_injected_text(last, keep_newlines=False)[:MAX_TITLE_CHARS]
 
     ft = f" · 全文加载：{_title(fulltext_title)}" if fulltext_title else ""
+    pin = (" · 📌" + "·".join(_title(p) for p in pinned_paths)) if pinned_paths else ""
     if verbosity == "compact":
         titles = "·".join(_title(e.path) for _, _, e in items[:3])
-        more = "…" if n > 3 else ""
-        return (f"📚 vault-loader(提问): {n}笔记[{titles}{more}] "
-                f"命中[{kw}]{size}{ft} · /vault 展开")
-    head = f"📚 vault-loader · 提问注入 · {n} 笔记 · 命中[{kw}]{size}{ft}"
+        more = "…" if len(items) > 3 else ""
+        # pinned-only 轮次（机械召回为空、只剩 pinned）items 为空：省掉空括号 `[]` 与 `命中[]`
+        # （1A-L4）——这一档按设计会常态出现，不能让它看起来像坏了。有内容时形态与改前逐字相同。
+        bracket = f"[{titles}{more}]" if titles else ""
+        hit = f" 命中[{kw}]" if kw else ""
+        return f"📚 vault-loader(提问): {n}笔记{bracket}{hit}{size}{ft}{pin} · /vault 展开"
+    hit = f" · 命中[{kw}]" if kw else ""
+    head = f"📚 vault-loader · 提问注入 · {n} 笔记{hit}{size}{ft}{pin}"
     body = [f"- {_title(e.path)}  [{_confidence_label(top, hit_list, conf_high)}置信]"
             for (_, top, e), hit_list in zip(items, hit_lists)]
     return "\n".join([head, *body, "💡 /vault <关键词> 展开全文"])
@@ -581,6 +656,7 @@ def _finish_with_metrics(config: dict, cwd: Path,
     超期清理与其余全部 metrics 副作用（落盘、near-miss 计数、nudge 提示）同一
     opt-in 前提：未开启时不落盘也不做任何 metrics 目录相关 IO，维持零足迹。
     """
+    pending_pin = _take_pin_account()
     rc = _finish(config, cwd, additional_context, system_message)
     try:
         mcfg = config.get("metrics", {}) or {}
@@ -598,6 +674,10 @@ def _finish_with_metrics(config: dict, cwd: Path,
             _metrics.annotate(inj_chars=len(additional_context))
         retention_days = mcfg.get("retention_days", 90) if enabled else None
         _metrics.flush(Path.home(), retention_days=retention_days)
+        # 1A-M2 / 1B-M-3：一次性对账标记只在记录**真正落盘之后**才翻——flush 里 write_record 抛了
+        # 就走不到这行，下一轮重算重记（at-least-once：多一条对账记录在报表上可见，静默少一条不可见）。
+        if pending_pin is not None:
+            mark_pinned_accounted(*pending_pin)
     except Exception as exc:  # noqa: BLE001 — 指标绝不阻断召回
         _report_nonfatal("metrics 写入失败", exc)
     return rc
@@ -605,6 +685,7 @@ def _finish_with_metrics(config: dict, cwd: Path,
 
 def main() -> int:
     home = Path.home()
+    _take_pin_account()          # 清掉同进程上一轮可能残留的延迟登记（生产每轮新进程，恒为空）
 
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
@@ -817,6 +898,19 @@ def main() -> int:
         except Exception as exc:                 # noqa: BLE001
             print(f"[vault-loader] 主题读取失败：{exc}", file=sys.stderr)
 
+    pinned_paths: list[str] = []
+    pin_session_id = hook_input.get("session_id", "") or ""      # 既有 session_id 定义在上面 try 块内，功能关闭时不存在
+    # 点名上限写读两侧同一单点（`effective_pin_max`）；`pin_on` 是本轮该功能的生效态，随记录落盘
+    # （自描述字段，1A-M1 / 1B-M-2）。读端按配置值收口（1B-M-6），不再按内部常量 8。
+    pin_max = effective_pin_max(config)
+    pin_on = bool(rel_cfg.get("session_topic", False)) and pin_max > 0
+    if pin_on:
+        try:
+            pinned_paths = load_session_pinned(cwd, pin_session_id, ups_cfg["state_ttl_hours"],
+                                               pin_max=pin_max)
+        except Exception as exc:                 # noqa: BLE001
+            print(f"[vault-loader] pinned 读取失败：{exc}", file=sys.stderr)
+
     signals = Signals(
         target_tags=target_tags,
         prompt_keywords=prompt_keywords,
@@ -885,16 +979,35 @@ def main() -> int:
     # 修复：`run_extraction_child` 现在无论成功失败都调用 `save_session_topic` 落一个
     # 带 ts 的标记，`has_recent_topic_attempt` 据此判定"是否已尝试过且未过期"，使
     # 持续失效的代价收敛为"每个 TTL 窗口最多一次"，不再是每轮一次。
+    # (候选池篇数, 其中项目笔记片篇数 | None)，只在真正送出提炼的那一轮有值；pin 关着时池回落纯 admitted、
+    # 第二项为 None（不落键）——否则报表会把「功能关闭」读成「组件 A 未生效」（post-review A-M1）。
+    pool_stats: "tuple[int, int | None] | None" = None
     if (rel_cfg.get("session_topic", False) and not topic_words and not topic_attempted
             and not config.get("dry_run", False)):
         try:
-            top_n = int(rel_cfg.get("session_topic_top_n", 10))
-            cands = [(e.path, (active_entries[e.path].summary or "")[:120])
-                     for e in decision.admitted[:top_n]]
-            if cands:
+            top_n = max(0, safe_int(rel_cfg.get("session_topic_top_n", 30), 30))
+            adm_paths = [ed.path for ed in decision.admitted]
+            n_proj: "int | None" = None
+            if pin_max > 0:
+                root = _repo_root(cwd)
+                extra = list(getattr(i_result, "extra_paths", []) or [])
+                cands = build_topic_pool(
+                    adm_paths, active_entries, root, extra,
+                    top_n, safe_int(rel_cfg.get("session_topic_project_top_k", 20), 20),
+                    safe_int(rel_cfg.get("session_topic_pool_max", 50), 50))
+                # 1B-H-1：按项目前缀归属数池里的项目笔记。组件 A 退化成纯 admitted（basename 归一失败、
+                # admitted 篇数把项目片挤光）时功能照常工作、输出与健康态无差别，只有这个数能把它照出来
+                # （spec §2.1 验收判据「proj 命中计数 > 0」）。前缀与池同源，归一坏了这里就是 0。
+                n_proj = count_project_notes(cands, root, extra)
+            else:
+                cands = [(e.path, (active_entries[e.path].summary or "")[:SUMMARY_CHARS])
+                         for e in decision.admitted[:top_n]]
+            # 门禁保持「admitted 非空」：池扩展只影响送什么，不影响是否送。
+            if cands and decision.admitted:
                 spawn_topic_extraction(
                     cwd, hook_input.get("session_id", "") or "",
                     prompt, cands, config)
+                pool_stats = (len(cands), n_proj)     # 只记真正送出去的那一轮，没送的池不算
         except Exception as exc:                 # noqa: BLE001
             print(f"[vault-loader] 主题提炼触发失败：{exc}", file=sys.stderr)
 
@@ -904,10 +1017,30 @@ def main() -> int:
     # 共用同一出口，near-miss 与命中都要能被记录）。
     if config.get("metrics", {}).get("enabled", False):
         try:
+            salt = _metrics.get_salt(Path.home())
+            # 对账字段（spec §2.5）：只在「本会话首个读到非空 pinned 且尚未记账」的轮次
+            # 填充，填完立即 mark_pinned_accounted 翻标记，后续轮次不再重复记账。
+            # rank_of 按 1-based 位置记 LLM 点名的篇目在本轮机械排名（decision.admitted）
+            # 里排第几——不在其中则为 None（该篇未被机械召回选中）。
+            pin_kwargs: dict = {}
+            # 1B-M-4：admitted 为空的轮次没有机械排名可对（rank 全 None 却零信息），一次性名额留到下一个
+            # 有 admitted 的轮次再花。终审 I-3：rank 为 None 时用决策层自己的 `dedup` 裁决区分
+            # 「被跨轮去重压掉」与「真不在本轮 admitted」。
+            if (pinned_paths and decision.admitted
+                    and not load_pinned_accounted(cwd, pin_session_id, ups_cfg["state_ttl_hours"])):
+                rank_of = {ed.path: i for i, ed in enumerate(decision.admitted, 1)}
+                dedup_of = {ed.path: ed.dedup for ed in decision.excluded if ed.dedup}
+                pin_kwargs = {
+                    "llm_pinned": list(pinned_paths),
+                    "llm_pinned_rank": [rank_of.get(p) for p in pinned_paths],
+                    "llm_pinned_dedup": [None if p in rank_of else dedup_of.get(p) for p in pinned_paths],
+                    "topic_extracted_h": [_metrics.h(w, salt) for w in sorted(topic_words)],
+                    "n_topic_extracted": len(topic_words),
+                }
             # session_id/prompt_id/salt/near_miss_k/admitted_k 一律按关键字传参——
             # build_record 已把 session_id/prompt_id 收紧为 keyword-only（M3 修复），
             # 相邻同类型位置参数一旦被上游误对调会静默错位（session 决定落盘文件名）。
-            _metrics.stage(_metrics.build_record(
+            record = _metrics.build_record(
                 decision, prompt_keywords, cwd,
                 session_id=hook_input.get("session_id", ""),
                 prompt_id=hook_input.get("prompt_id", ""),
@@ -916,7 +1049,7 @@ def main() -> int:
                 # prompt 原文只用来算加盐 hash（build_record 内部），不落盘。
                 # 它是 --review 回查 transcript 取原文的定位键，见 build_record 说明。
                 prompt=prompt,
-                salt=_metrics.get_salt(Path.home()),
+                salt=salt,
                 near_miss_k=config["metrics"].get("near_miss_k", 10),
                 admitted_k=config["metrics"].get("admitted_k", 20),
                 # 渲染层配置，随记录落盘供 analyze_metrics 用（它不读 config）
@@ -930,9 +1063,51 @@ def main() -> int:
                 # 的数，让这条本来用于发现失效的指标自己变成噪声源。
                 n_topic_words=len(signals.session_topic_words),
                 topic_on=bool(rel_cfg.get("session_topic", False)),
-            ))
+                pin_on=pin_on,
+                n_pool=pool_stats[0] if pool_stats else None,
+                n_pool_proj=pool_stats[1] if pool_stats else None,
+                **pin_kwargs,
+            )
+            _metrics.stage(record)
+            if pin_kwargs and record:
+                # 标记延后到 flush 成功之后再翻（见 _PENDING_PIN_ACCOUNT）。放在 stage 之后登记，且要求
+                # record 非空：build_record / stage 抛了不登记；`_MetricsStub`（metrics 模块导入失败的
+                # 降级路径）的 build_record 返回 {}、flush 无声成功，不加这一判会「没记录却翻了标记」
+                # （post-review A-L1）。
+                _register_pin_account(cwd, pin_session_id)
         except Exception as exc:  # noqa: BLE001
             _report_nonfatal("metrics 构造失败", exc)
+
+    # 会话级固定注入：在 admitted 早退之前先渲染，admitted 为空时也要出（那正是机械召回失效的轮次）。
+    # 正常路径在 build_injection_text_ups 之后用更宽的去重集重算，这里只服务 admitted 为空的早退分支。
+    short_chars = rel_cfg["short_summary_chars"]
+    pinned_text, pinned_rendered = "", []
+    if pinned_paths and not decision.admitted:
+        pinned_text, pinned_rendered = render_pinned_section(
+            pinned_paths, active_entries, set(fulltext_injected), short_chars)
+
+    if not decision.admitted:
+        # 落盘口径（1A-L12）：凡走到打分阶段的轮次一律落 `pinned_injected`（含 0），闸门早退不落——
+        # 它的**存在性**是报表「功能开着却一次都没点名」那一档的分母，与 `inj_chars`「只在有正文
+        # 时记」刻意不同。正常路径在渲染后另落一次；两条路径互斥、各落恰好一次。
+        try:
+            _metrics.annotate(pinned_injected=len(pinned_rendered))
+        except Exception:      # noqa: BLE001
+            pass
+
+    if not decision.admitted and pinned_text:
+        display_cfg = config.get("display", {})
+        summary = (build_summary_ups([], prompt_keywords, None, pinned_text, display_cfg, rel_cfg,
+                                     hits_by_path={}, pinned_paths=pinned_rendered)
+                   if display_cfg.get("user_visible", True) else None)
+        # dry_run 契约：本分支是全部主注入出口之一，必须与下方"正常路径"同样只预览、
+        # 不落 additionalContext——否则「admitted 为空、只剩 pinned」这一档会绕过
+        # dry_run（Finding 1，2026-09-15 fix round 1）。
+        if config.get("dry_run", False):
+            return _finish_with_metrics(
+                config, cwd,
+                system_message=(f"[DRY-RUN] 本应注入：\n{summary}" if summary else None))
+        return _finish_with_metrics(config, cwd, additional_context=pinned_text, system_message=summary)
 
     if not decision.admitted:
         # 触发点2：关键词足够但 topical 全失配。relaxed 静默；非 relaxed 加 state 冷却
@@ -965,6 +1140,18 @@ def main() -> int:
     injection_text, injected_paths, fulltext_title = build_injection_text_ups(
         scored, keywords_str, prompt_keywords, ups_cfg, rel_cfg, vault_path,
         hits_by_path=hits_by_path, fulltext_path=decision.fulltext_path)
+    if pinned_paths:
+        # 清单分支头部已有 INJECTION_NOTICE，小节不再重复一份（1A-L7）；全文分支的 out_lines 没有外层
+        # 声明、fence 只包 ft_body，小节仍须自带（`fulltext_title` 非 None 即全文分支）。
+        pinned_text, pinned_rendered = render_pinned_section(
+            pinned_paths, active_entries, set(injected_paths) | set(fulltext_injected), short_chars,
+            with_notice=fulltext_title is not None)
+        if pinned_text:
+            injection_text = injection_text + "\n\n" + pinned_text
+    try:
+        _metrics.annotate(pinned_injected=len(pinned_rendered))
+    except Exception:      # noqa: BLE001
+        pass
     # 权威的「用户看到了哪几篇」——渲染层刚算出来，直接落盘，别让读端去重建。
     try:
         _metrics.annotate(shown=list(injected_paths))
@@ -973,7 +1160,7 @@ def main() -> int:
     summary_items = scored[: ups_cfg["max_notes"]]
     summary = (build_summary_ups(summary_items, prompt_keywords, fulltext_title,
                                  injection_text, display_cfg, rel_cfg,
-                                 hits_by_path=hits_by_path)
+                                 hits_by_path=hits_by_path, pinned_paths=pinned_rendered)
                if user_visible else None)
 
     if dry_run:

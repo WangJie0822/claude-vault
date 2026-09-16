@@ -16,6 +16,21 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# vault-loader **读端**的系统索引判据（单点）：SessionStart 信号 A（本模块，`rglob` 文件系统）与首轮
+# 提炼候选池（`_candidate_pool.is_system_index`，内存 cache 键）共用。此前两边各抄一份、常量也各写
+# 一份——给 vault 新增一类索引名只改这里时，候选池会开始把索引文件的摘要送进 LLM 子进程，而没有任何
+# 用例会红（1A-M4 / 1B-M-7）。守卫：test_candidate_pool.py::test_index_exclusion_parity_with_signal_a。
+# ⚠️ 写端 `summarize-session/scripts/rebuild_index.py::is_system_index` 另有一份、语义略宽窄不同
+# （category 索引那边只认恰好两段 `top/top 索引.md`，这边任意深度都排除），跨 skill 不共享、也没有
+# 守卫——读端宁可多排除，方向保守（post-review B-L5）。
+INDEX_NAMES = ("INDEX.md", "未分类 索引.md")
+
+
+def is_system_index_name(name: str, parent: str) -> bool:
+    """`name` 是文件名、`parent` 是父目录名（都不含路径）：根索引 `未分类 索引.md` /
+    遗留 `INDEX.md` / 文件名 == 父目录名 + ' 索引.md'。"""
+    return name in INDEX_NAMES or name == parent + " 索引.md"
+
 
 # ===== 信号 A =====
 
@@ -36,8 +51,8 @@ def collect_signal_a_project_dir(
         if not d.exists() or not d.is_dir():
             continue
         for md in d.rglob("*.md"):
-            # 排除系统生成的索引文件(根索引 未分类 索引.md / 文件名==父目录名+' 索引.md' / 遗留 INDEX.md)
-            if md.name in ("INDEX.md", "未分类 索引.md") or md.name == md.parent.name + " 索引.md":
+            # 排除系统生成的索引文件——判据单点 is_system_index_name，候选池同用
+            if is_system_index_name(md.name, md.parent.name):
                 continue
             rel = md.relative_to(vault_path)
             paths.add(str(rel).replace("\\", "/"))

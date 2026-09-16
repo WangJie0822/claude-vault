@@ -172,7 +172,7 @@ vault-loader 内置一套**可选**的效果评估机制：记录每轮召回的
    { "metrics": { "enabled": true } }
    ```
 
-3. **记录什么**——prompt 关键词的**加盐 hash**（非明文；盐存在同目录下的 `.salt`，本机静态、启动时自动生成）、被召回笔记的**命中词明文**、笔记相对路径、打分与闸门决策。**不记录 prompt 原文**。
+3. **记录什么**——prompt 关键词的**加盐 hash**（非明文；盐存在同目录下的 `.salt`，本机静态、启动时自动生成）、被召回笔记的**命中词明文**、笔记相对路径、打分与闸门决策。开着 `relevance.session_topic` 时另有：会话主题词的**加盐 hash**（同盐）、LLM 点名篇的相对路径（明文，与其它笔记路径同一口径）、首轮候选池篇数。**不记录 prompt 原文**。
 
    > ⚠️ **`.salt` 的保护是平台相关的，Windows 上没有强制手段。** POSIX 使用 `0600`；Windows 由 `~/.context-vault` 继承 ACL，可用 `icacls "$env:USERPROFILE\.context-vault\metrics"` 检查。介意时不要启用 metrics。
 4. **存在哪 + 体积**——1.0 分别写入 `~/.context-vault/metrics/claude/` 与 `~/.context-vault/metrics/codex/`；0.9.x legacy 数据仍在 `~/.claude/vault-loader-metrics/`。事件按月分桶；辅助文件一直保留到手动 `--purge`。

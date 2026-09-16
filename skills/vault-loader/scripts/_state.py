@@ -185,6 +185,11 @@ def _repo_root(cwd: Path) -> Path:
     「一致性实测 7/7」，是过强断言**——那 7 个样本全是常规检出，没覆盖上面那两种
     退化标记。已知允许分叉的情形：git 不在 PATH（fork 版返回 None，本函数照常工作）、
     `.git` 指向已被删除的 gitdir。改动任一处时请一并核对另一处。
+
+    **第三个消费者（2026-09-15）**：`prompt_submit_load` 把本函数的结果喂给
+    `_candidate_pool.main_repo_basename`，那边**会**顺着 `gitdir:` 找主仓库名——但只用来算
+    首轮提炼候选池的 `项目笔记/<name>/` 前缀，不决定任何落点，所以那边解析、这边不解析
+    并不矛盾（信任边界不同：落点错了是写到别处，候选多几篇只是多送几篇摘要）。
     """
     try:
         p = cwd.resolve() if cwd.exists() else cwd.absolute()

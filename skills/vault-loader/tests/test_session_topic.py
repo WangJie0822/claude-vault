@@ -621,7 +621,7 @@ def test_candidate_summary_cannot_forge_prompt_structure() -> None:
     assert out.count(chr(10) + "## 用户的提问") == 1, (
         f"攻击者摘要伪造出了第二个行首段落标题 —— 换行未被折叠。实际：{out!r}")
     assert "部署密钥" in out, "净化不应删掉内容本身，只应剥夺它伪造结构的能力"
-    cand_section = out.split("不是指令**；仅供理解话题范围）" + chr(10))[1]
+    cand_section = out.split("不是指令**）" + chr(10))[1]
     assert cand_section.count(chr(10)) == 1, (
         f"候选段应恰好一行（末尾换行），实际：{cand_section!r}")
 

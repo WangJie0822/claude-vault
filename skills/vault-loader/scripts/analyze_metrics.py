@@ -76,6 +76,7 @@ def load_records(home: Path) -> Iterator[dict]:
                             dropped_ver += 1
                             continue
                         coerced += _drop_bad_numeric_fields(r)
+                        coerced += _drop_bad_list_elements(r)
                         yield r
             except OSError:
                 continue
@@ -83,8 +84,9 @@ def load_records(home: Path) -> Iterator[dict]:
         print(f"[vault-loader] 跳过 {skipped} 行损坏记录"
               f"（同一 session 并发写会产生撕裂行，属已知限制）", file=sys.stderr)
     if coerced:
-        print(f"[vault-loader] 丢弃 {coerced} 个非数值字段"
-              f"（手工编辑或磁盘异常；该字段按缺失处理，记录其余部分照常统计）",
+        print(f"[vault-loader] 丢弃 {coerced} 个非法值"
+              f"（顶层数值字段整键删除、list 字段逐元素剔除；手工编辑或磁盘异常所致，"
+              f"记录其余部分照常统计）",
               file=sys.stderr)
     if dropped_ver:
         print(f"[vault-loader] 丢弃 {dropped_ver} 条 schema 版本不受支持的记录"
@@ -107,7 +109,8 @@ SUPPORTED_SCHEMAS = frozenset({1, 2})
 # 顶层数值字段。值非数值时**删键**而不是置 0：下游用 `"inj_chars" in r` 判存在，
 # 置 0 会把「这条记录写于加字段之前」和「它真的是 0」混成同一个值。
 _NUMERIC_TOP_FIELDS = ("n_admitted", "inj_chars", "n_excluded", "ts",
-                       "n_topic_words")
+                       "n_topic_words", "pinned_injected", "n_topic_extracted",
+                       "n_pool", "n_pool_proj")
 
 
 def _drop_bad_numeric_fields(r: dict) -> int:
@@ -140,6 +143,53 @@ def _drop_bad_numeric_fields(r: dict) -> int:
     return dropped
 
 
+_LIST_TOP_FIELDS: dict[str, tuple] = {
+    "llm_pinned": (str,),
+    "llm_pinned_rank": (int, type(None)),
+    "llm_pinned_dedup": (str, type(None)),
+    "topic_extracted_h": (str,),
+}
+
+
+# 三个逐位对应的对账列表（`llm_pinned[i]` / `llm_pinned_rank[i]` / `llm_pinned_dedup[i]` 说的是同一篇）：
+# 清洗必须**按位置联动**——任一列表在位置 i 坏，三个列表的位置 i 一起丢；各自独立缩短会让清洗后的
+# 下标错位，`_acc_pin` 按下标配对 rank 与 dedup 时静默失真（post-review A-L6）。
+_ALIGNED_PIN_FIELDS = ("llm_pinned", "llm_pinned_rank", "llm_pinned_dedup")
+
+
+def _drop_bad_list_elements(r: dict) -> int:
+    """list 型顶层字段清洗：坏元素丢元素、不丢整条记录（security L3 / impact L1）。
+    与 `_drop_bad_numeric_fields` 分开：那道守卫的语义是「删键」，这里是「删元素」。
+    非 list 整键删；`_ALIGNED_PIN_FIELDS` 三个列表按位置联动删，其余列表逐元素删。"""
+    dropped = 0
+    for k in _LIST_TOP_FIELDS:
+        v = r.get(k)
+        if v is not None and not isinstance(v, list):
+            del r[k]
+            dropped += 1
+    present = [k for k in _ALIGNED_PIN_FIELDS if isinstance(r.get(k), list)]
+    if present:
+        n = max(len(r[k]) for k in present)
+
+        def _ok(k: str, i: int) -> bool:
+            v = r[k]
+            return i < len(v) and isinstance(v[i], _LIST_TOP_FIELDS[k]) and not isinstance(v[i], bool)
+
+        keep = [i for i in range(n) if all(_ok(k, i) for k in present)]
+        for k in present:
+            dropped += len(r[k]) - len(keep)
+            r[k] = [r[k][i] for i in keep]
+    for k, types in _LIST_TOP_FIELDS.items():
+        if k in _ALIGNED_PIN_FIELDS:
+            continue
+        v = r.get(k)
+        if isinstance(v, list):
+            kept = [x for x in v if isinstance(x, types) and not isinstance(x, bool)]
+            dropped += len(v) - len(kept)
+            r[k] = kept
+    return dropped
+
+
 class _Acc:
     """`summarize` 的累加器。
 
@@ -158,7 +208,10 @@ class _Acc:
                  "dedup_full", "n_dedup_full", "n_dedup_legacy",
                  "n_pre_epoch", "ft_by_threshold", "ss_n", "ss_inj_chars",
                  "topic_rounds", "topic_words_sum", "topic_field_n",
-                 "topic_off_n")
+                 "topic_off_n", "pin_rounds", "pin_injected_sum", "pin_n",
+                 "pin_rank_top3", "pin_rank_top10", "pin_rank_missing",
+                 "pin_field_n", "pin_off_n", "pin_dedup_n",
+                 "pool_n", "pool_sum", "pool_proj_n", "pool_proj_sum", "pool_proj_rounds")
 
     def __init__(self) -> None:
         self.arm: Counter = Counter()
@@ -183,6 +236,13 @@ class _Acc:
         # SessionStart 通道单独计，绝不并入 UPS 的任何指标（见
         # _metrics.build_session_start_record 的隔离说明）。
         self.ss_n = self.ss_inj_chars = 0
+        # LLM 点名 vs 机械排名对账（spec §2.5）。`pin_field_n` / `pin_off_n` 与 topic 那对同构：
+        # 前者是携带 `pinned_injected` 的轮次数（分母），后者是 `pin_on=False` 的轮次数（不进分母）。
+        self.pin_rounds = self.pin_injected_sum = self.pin_n = 0
+        self.pin_rank_top3 = self.pin_rank_top10 = self.pin_rank_missing = 0
+        self.pin_field_n = self.pin_off_n = self.pin_dedup_n = 0
+        # 首轮候选池构成（1B-H-1）：只有触发提炼的那一轮带字段。
+        self.pool_n = self.pool_sum = self.pool_proj_n = self.pool_proj_sum = self.pool_proj_rounds = 0
 
 
 def _acc_gate_and_admitted(r: dict, a: _Acc) -> None:
@@ -346,6 +406,73 @@ def _acc_topic(r: dict, a: _Acc) -> None:
         a.topic_words_sum += n
 
 
+def _acc_pin(r: dict, a: _Acc) -> None:
+    """pinned 注入量与 LLM 点名 vs 机械排名对账（spec §2.5）。
+
+    **三态分开（1A-M1 / 1B-M-2）**：`pin_on is False` 的轮次单独计、不进分母；携带
+    `pinned_injected`（含 0）的轮次计入分母 `pin_field_n`；旧记录两者都没有、不计。
+    修复前三态渲染逐字相同且写着「功能未启用」——而「开着却一次都没点名」正是这条功能
+    静默死掉的形态。
+
+    **`rk` 类型防御，镜像 `_acc_topic` 的风格**：`summarize` 是公开函数，本任务
+    自己的测试就直接手搭 dict 调它（绕过 `load_records` 的 `_drop_bad_list_elements`
+    清洗）；reviewer 复现 `am._acc_pin({'pinned_injected': 1,
+    'llm_pinned_rank': ['x']}, am._Acc())` 会因 `'x' <= 3` 抛 `TypeError`。
+    经 `load_records` 正常管线的记录里 `rk` 只会是 `int`/`None`，本函数仍按
+    「不信任输入」处理——非法类型跳过且不计入 `pin_n`（与 `_acc_topic` 对坏
+    `n_topic_words` 直接 `return` 而不计入分母同一惯例）。
+
+    rank 为 None 时按逐位对应的 `llm_pinned_dedup` 分两桶（终审 I-3）：有去重成因的是
+    「被跨轮去重压掉」（曾以摘要/全文注入过，不是没召回），没有的才是「不在本轮 admitted」。
+    """
+    if r.get("pin_on") is False:
+        # 显式关闭（session_pin_enabled=false / session_pin_max=0 / session_topic=false）的轮次。
+        # 旧记录没有这个键 ⇒ None ≠ False ⇒ 照旧走下面（与 `_acc_topic` 的 topic_on 同形态）。
+        a.pin_off_n += 1
+        return
+    v = r.get("pinned_injected")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        a.pin_field_n += 1              # 分母：本轮确实走到了 pinned 渲染（含 0 篇）
+        if int(v) > 0:
+            a.pin_rounds += 1
+            a.pin_injected_sum += int(v)
+    ranks = r.get("llm_pinned_rank")
+    dedup = r.get("llm_pinned_dedup")
+    dedup = dedup if isinstance(dedup, list) else []
+    if isinstance(ranks, list):
+        for i, rk in enumerate(ranks):
+            if rk is None:
+                a.pin_n += 1
+                if i < len(dedup) and isinstance(dedup[i], str) and dedup[i]:
+                    a.pin_dedup_n += 1
+                else:
+                    a.pin_rank_missing += 1
+            elif isinstance(rk, int) and not isinstance(rk, bool):
+                a.pin_n += 1
+                if rk <= 3:
+                    a.pin_rank_top3 += 1
+                    a.pin_rank_top10 += 1
+                elif rk <= 10:
+                    a.pin_rank_top10 += 1
+            # 其它类型（裸调 summarize 未经 load_records 清洗时才可能出现）跳过且不计入 pin_n
+
+
+def _acc_pool(r: dict, a: _Acc) -> None:
+    """首轮候选池构成（1B-H-1）。只有触发提炼的那一轮带 `n_pool`/`n_pool_proj`，其余记录不计。
+    坏值清洗归 `_NUMERIC_TOP_FIELDS` 单点，这里只做类型守卫、不另写判据。"""
+    v = r.get("n_pool")
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return
+    a.pool_n += 1
+    a.pool_sum += int(v)
+    pj = r.get("n_pool_proj")
+    if isinstance(pj, (int, float)) and not isinstance(pj, bool):
+        a.pool_proj_n += 1           # 分母：本轮确实算过项目片（pin 关闭的纯 admitted 池不落该键，不进分母）
+        a.pool_proj_sum += int(pj)
+        if int(pj) > 0:
+            a.pool_proj_rounds += 1
+
+
 def _acc_to_dict(a: _Acc) -> dict:
     return {
         "n_events": a.n, "n_ok": a.n_ok, "n_admitted": a.n_admitted,
@@ -369,6 +496,20 @@ def _acc_to_dict(a: _Acc) -> dict:
         "topic_field_n": a.topic_field_n,
         "topic_off_n": a.topic_off_n,
         "near_miss_dedup_dist": dict(a.near_dedup),
+        "pin_rounds": a.pin_rounds,
+        "pin_injected_sum": a.pin_injected_sum,
+        "pin_n": a.pin_n,
+        "pin_rank_top3": a.pin_rank_top3,
+        "pin_rank_top10": a.pin_rank_top10,
+        "pin_rank_missing": a.pin_rank_missing,
+        "pin_field_n": a.pin_field_n,
+        "pin_off_n": a.pin_off_n,
+        "pin_dedup_n": a.pin_dedup_n,
+        "pool_n": a.pool_n,
+        "pool_sum": a.pool_sum,
+        "pool_proj_n": a.pool_proj_n,
+        "pool_proj_sum": a.pool_proj_sum,
+        "pool_proj_rounds": a.pool_proj_rounds,
     }
 
 
@@ -399,6 +540,8 @@ def summarize(records: Iterable[dict]) -> dict:
         _acc_near_miss(r, a)
         _acc_epoch_and_threshold(r, a)
         _acc_topic(r, a)
+        _acc_pin(r, a)
+        _acc_pool(r, a)
     return _acc_to_dict(a)
 
 
@@ -460,24 +603,77 @@ def _render_topic(s: dict) -> str:
             f"生效轮平均 {s.get('topic_words_sum', 0) / hit:.1f} 词{tail}")
 
 
+def _render_pin(s: dict) -> str:
+    """pinned 三态必须分开渲染（1A-M1 / 1B-M-2）：功能关 / 旧记录 / **开着却一次都没点名**。
+    第三态是这条功能静默死掉的形态（池坏了、PINNED 行匹配不上、haiku 恒答 NONE）；修复前
+    三态输出逐字相同且写着「功能未启用」，把人劝离真正的排查方向。与 `_render_topic` 同构。"""
+    field_n, off, n = s.get("pin_field_n", 0), s.get("pin_off_n", 0), s.get("pin_n", 0)
+    if not field_n and not n:
+        if off:
+            return (f"pinned：{off} 轮该功能处于关闭状态（session_pin_enabled=false / "
+                    "session_pin_max=0 / session_topic=false），不计")
+        return "pinned：无记录携带该字段（落盘该指标之前的旧记录）"
+    tail = f"；另有 {off} 轮功能关闭，不计入" if off else ""
+    rounds = s.get("pin_rounds", 0)
+    if not rounds and not n:
+        return (f"pinned：0/{field_n} 轮注入 —— **一次都没点名**。先查 topics 文件里该会话的 pinned "
+                "是否为空：常见成因是候选池退化（见下一行「候选池」）、haiku 恒答 NONE、输出格式"
+                "漂移致 PINNED 行匹配不上、或点名篇路径超过 256 字符被读端丢弃（pinned 非空却注入 0 时"
+                "先查这条）" + tail)
+    return (f"pinned：{rounds}/{field_n} 轮注入 {s.get('pin_injected_sum', 0)} 篇；"
+            f"LLM 点名 {n} 篇：机械 top-3 内 {s.get('pin_rank_top3', 0)} / top-10 内 "
+            f"{s.get('pin_rank_top10', 0)} / 被跨轮去重压掉 {s.get('pin_dedup_n', 0)} / "
+            f"不在本轮 admitted {s.get('pin_rank_missing', 0)}" + tail)
+
+
+def _render_pool(s: dict) -> str:
+    """首轮候选池构成（1B-H-1）。项目笔记片**恒 0 必须点破**——组件 A 退化成纯 admitted 时功能
+    照常工作（LLM 仍从 admitted 里点名），输出与健康态无差别，这一行是唯一的信号。"""
+    n = s.get("pool_n", 0)
+    if not n:
+        return "候选池：无记录携带该字段（只有触发提炼的那一轮落盘；或全是落盘该指标之前的旧记录）"
+    avg = s.get("pool_sum", 0) / n
+    pj_n = s.get("pool_proj_n", 0)
+    if not pj_n:
+        # pin 关闭的轮次池回落纯 admitted、不算项目片（不落 n_pool_proj）——不是组件 A 坏了（A-M1 路径一）
+        return f"候选池：{n} 轮提炼，均 {avg:.0f} 篇（均为 pin 关闭时的纯 admitted 池，不计项目笔记片）"
+    pj = s.get("pool_proj_sum", 0)
+    if not pj:
+        return (f"候选池：{n} 轮提炼，均 {avg:.0f} 篇；其中 {pj_n} 轮算了项目笔记片、**恒为 0** —— 组件 A 未生效。"
+                "查 vault 是否有 项目笔记/<仓库名>/ 目录（worktree 内按主仓库名）、"
+                "session_topic_project_top_k 是否为 0、或本轮 admitted 实际篇数已 ≥ "
+                "session_topic_pool_max（项目片被截光）")
+    return (f"候选池：{n} 轮提炼，均 {avg:.0f} 篇，其中项目笔记均 {pj / pj_n:.1f} 篇"
+            f"（{s.get('pool_proj_rounds', 0)}/{pj_n} 轮含项目笔记）")
+
+
 def _render_span(s: dict) -> str:
     """「实际渲染几篇」的文案 —— 按记录里落盘的 `max_notes` 真值，不硬编码默认值。
 
     ⚠️ 这里此前写死「实际渲染 ≤4 篇」，**两处都错**：
-    ① 全文那篇是**计入** `max_notes` 之内的（`prompt_submit_load.py:341` 是
-       `rest = [...][: max_notes - 1]`，加上 ft 恰好 max_notes 篇），
+    ① 全文那篇是**计入** `max_notes` 之内的（`build_injection_text_ups` 全文分支里
+       `rest = [...][: max_notes - 1]` 那行，加上 ft 恰好 max_notes 篇），
        写成「max_notes 条清单 + 至多 1 篇全文」等于把全文额外加了一次；
     ② `max_notes` 可配（`_config_loader.py:28` 默认 3），硬编码 3 或 4 都会在用户
        改配置后开始说假话 —— 而这一行恰恰是「口径订正」那笔改动的招牌行。
     """
     dist = s.get("max_notes_dist") or {}
     if not dist:
-        return "实际渲染篇数见配置 user_prompt_submit.max_notes —— 旧记录未落该字段"
-    mn = max(dist, key=lambda k: dist[k])       # 最常见值
-    if len(dist) > 1:
-        return (f"实际渲染 ≤{mn} 篇（含全文那篇；样本期内该配置变动过："
-                f"{dict(sorted(dist.items()))}）")
-    return f"实际渲染 ≤{mn} 篇（含全文那篇，不是额外加一篇）"
+        text = "实际渲染篇数见配置 user_prompt_submit.max_notes —— 旧记录未落该字段"
+    else:
+        mn = max(dist, key=lambda k: dist[k])       # 最常见值
+        if len(dist) > 1:
+            text = (f"实际渲染 ≤{mn} 篇（含全文那篇；样本期内该配置变动过："
+                    f"{dict(sorted(dist.items()))}）")
+        else:
+            text = f"实际渲染 ≤{mn} 篇（含全文那篇，不是额外加一篇）"
+    # pinned 独占名额不占 max_notes 配额（spec §2.5），单独在末尾点破，避免读者把
+    # 「实际渲染 ≤N 篇」误解为已经含 pinned 那几篇。三个分支共用这一处追加，
+    # 避免同一条件在多个 return 里各写一份、日后改口径漏改。
+    if s.get("pin_rounds", 0) > 0:
+        text += (f"，另有 {s['pin_rounds']} 轮追加 pinned（共 "
+                f"{s.get('pin_injected_sum', 0)} 篇，独占名额）")
+    return text
 
 
 def render_report(s: dict, show_paths: bool = False) -> str:
@@ -503,6 +699,8 @@ def render_report(s: dict, show_paths: bool = False) -> str:
     lines.append(f"全文注入 {s.get('n_fulltext', 0)} 次 = 走到打分轮次的 "
                  f"{s['fulltext_rate']:.1%}")
     lines.append(_render_topic(s))
+    lines.append(_render_pin(s))
+    lines.append(_render_pool(s))
     if inj_n:
         # 标明「UPS」：SessionStart 通道完全不落 metrics（该文件对 _metrics 引用数为 0），
         # 不标注的话读者会把这个数当成 vault-loader 的注入开销总量。
@@ -594,11 +792,39 @@ def render_report(s: dict, show_paths: bool = False) -> str:
 
 VERDICTS = ("relevant", "irrelevant", "unsure")
 
-# 三类标注：near_miss 问「该不该被召回」；两个 admitted_* 问「召回得对不对」。
-# 分开是因为代价不对等——全文注入单篇上限 8192 字节，清单条目只有一行 summary，
-# 混成一个桶之后「全文错了 30%」与「清单错了 30%」在数据里长得一模一样。
-KINDS = ("near_miss", "admitted_fulltext", "admitted_list")
+# 四类标注：near_miss 问「该不该被召回」；两个 admitted_* 问「机械打分打得
+# 对不对」，分开是因为代价不对等——全文注入单篇上限 8192 字节，清单条目只有
+# 一行 summary，混成一个桶之后「全文错了 30%」与「清单错了 30%」在数据里长得
+# 一模一样；llm_pinned 问的是另一个问题——「LLM 精排这次点名点对了没有」
+# （点名条目强制入选、不参与机械打分，故不能并进 admitted_* 任何一桶）。
+KINDS = ("near_miss", "admitted_fulltext", "admitted_list", "llm_pinned")
 DEFAULT_KIND = "near_miss"   # 旧记录（写于加字段之前）一律归此类
+
+# kind → 「该记录里这篇是否以该 kind 出现」。**显式、全覆盖**：此前 `sample_admitted_events` 与
+# `sample_events_with_hits` 各写一条 if/elif 链、末尾 `else` 兜 near_miss——加第 5 个 kind 时漏改一处
+# 不报错、静默按 near_miss 匹配，`--review` 抽到的上下文属于另一类事件而人工标注不可再生
+# （1A-M3 / 1B-M-5，终审 I-1 就是这个缺陷类）。未登记的 kind 一律不命中：公开入口已在前面
+# `kind not in KINDS` 校验，这里的 None 只是响的失败面。守卫 test_pin_report.py::test_kind_tables_cover_every_kind。
+_KIND_HIT = {
+    "admitted_fulltext": lambda r, p: (r.get("ft") or {}).get("path") == p,
+    "admitted_list": lambda r, p: any(isinstance(a, dict) and a.get("path") == p
+                                      for a in (r.get("admitted") or [])),
+    "llm_pinned": lambda r, p: p in (r.get("llm_pinned") or []),
+    "near_miss": lambda r, p: any(isinstance(nm, dict) and nm.get("path") == p
+                                  for nm in (r.get("near_miss_scorelow") or [])),
+}
+# kind → 标注池配额桶（`_apply_kind_quota`）。同样显式、全覆盖；桶的取值见那边的 docstring。
+_KIND_BUCKET = {
+    "admitted_fulltext": "fulltext",
+    "llm_pinned": "pinned",
+    "admitted_list": "list",
+    "near_miss": "list",
+}
+
+
+def _kind_hits_path(r: dict, path: str, kind: str) -> bool:
+    fn = _KIND_HIT.get(kind)
+    return bool(fn(r, path)) if fn else False
 
 
 def _transcript_index(home: Path) -> dict[str, Path]:
@@ -692,16 +918,7 @@ def sample_admitted_events(records: Iterable[dict], path: str, kind: str,
         s = r.get("session")
         if not (isinstance(ph, str) and ph and isinstance(s, str) and s):
             continue
-        hit = False
-        if kind == "admitted_fulltext":
-            hit = (r.get("ft") or {}).get("path") == path
-        elif kind == "admitted_list":
-            hit = any(isinstance(a, dict) and a.get("path") == path
-                      for a in (r.get("admitted") or []))
-        else:                                     # near_miss
-            hit = any(isinstance(nm, dict) and nm.get("path") == path
-                      for nm in (r.get("near_miss_scorelow") or []))
-        if hit:
+        if _kind_hits_path(r, path, kind):
             out.append((s, ph))
             if len(out) >= limit:
                 break
@@ -728,15 +945,7 @@ def sample_events_with_hits(records: Iterable[dict], path: str, kind: str,
         ph, s = r.get("prompt_h"), r.get("session")
         if not (isinstance(ph, str) and ph and isinstance(s, str) and s):
             continue
-        if kind == "admitted_fulltext":
-            hit = (r.get("ft") or {}).get("path") == path
-        elif kind == "admitted_list":
-            hit = any(isinstance(a, dict) and a.get("path") == path
-                      for a in (r.get("admitted") or []))
-        else:
-            hit = any(isinstance(nm, dict) and nm.get("path") == path
-                      for nm in (r.get("near_miss_scorelow") or []))
-        if not hit:
+        if not _kind_hits_path(r, path, kind):
             continue
         hits: list[str] = []
         for a in (r.get("admitted") or []):
@@ -1279,6 +1488,11 @@ def sample_admitted(records: Iterable[dict], k: int = 20) -> list[dict]:
                 continue
             _bump("admitted_list", a.get("path") or "", a.get("topical") or 0)
             shown += 1
+        # LLM 点名强制入选的条目不参与常规打分，没有 topical 可言，记 0——
+        # 标注问的是「点名点对了没有」，不是「打分打得对不对」。
+        for p in (r.get("llm_pinned") or []):
+            if isinstance(p, str) and p:
+                _bump("llm_pinned", p, 0)
     ranked = sorted(agg.values(),
                     key=lambda x: (-x["count"], -x["topical_max"]))
     return _apply_kind_quota(ranked, k)
@@ -1299,13 +1513,32 @@ def _apply_kind_quota(ranked: list[dict], k: int) -> list[dict]:
 
     全文优先排前：标注者中途停手时，先标到的是代价最大的那一类（单篇上限 8192
     字节，占 42% 的轮次）。
+
+    `llm_pinned` 需要独立配额：pinned 条目每会话只记一次（对账一次性）、
+    `topical` 恒记 0，count 几乎恒为 1，与清单侧同桶按 `(-count, -topical_max)`
+    竞争必被压死——真实数据实测（3315 条记录、1 条含 `llm_pinned`）
+    `sample_admitted(k=10/20/40)` 一条都进不了池，spec §2.5「否则 pinned 永不进
+    标注池」的目的没有兑现。故单独切一个桶，其余两侧照旧互相回填，三侧都不足时
+    互相补齐。
     """
-    fts = [x for x in ranked if x["kind"] == "admitted_fulltext"]
-    lists = [x for x in ranked if x["kind"] != "admitted_fulltext"]
-    n_ft = min(len(fts), k // 2)
-    n_list = min(len(lists), k - n_ft)
-    n_ft = min(len(fts), k - n_list)        # 清单侧不足时，全文侧回填
-    return fts[:n_ft] + lists[:n_list]
+    # 桶按 `_KIND_BUCKET` **显式**分派（1B-M-5）：此前 lists 用 `not in (...)` 排除法取，下一个新
+    # kind 会静默掉进清单桶按 count 竞争（I-1 的形态）。未登记的 kind 在这里 KeyError——宁可响。
+    buckets: dict[str, list] = {"fulltext": [], "pinned": [], "list": []}
+    for x in ranked:
+        buckets[_KIND_BUCKET[x["kind"]]].append(x)
+    fts, pins, lists = buckets["fulltext"], buckets["pinned"], buckets["list"]
+    # llm_pinned 每会话只记一次、topical 恒 0，与清单侧同桶必被 count 压死（终审 I-1 实测
+    # 3315 条真实记录一条都进不了池）；给它独立配额 k//4（至少 1，否则 k<4 时永远进不了池——
+    # k ≤ 4 时 pinned 优先于全文是刻意的），余下全文 / 清单对半；回填顺序 清单 ← 全文缺口、
+    # 全文 ← 清单缺口、pinned ← 两侧缺口。下面四行的取值与顺序是承重的（1A-L6：读起来像两次
+    # 重赋值，其实是「先切上限、再按序回填」），别为了「一次算清」改顺序。
+    n_pin = min(len(pins), max(1, k // 4)) if pins else 0
+    rest = max(0, k - n_pin)
+    n_ft = min(len(fts), rest // 2)
+    n_list = min(len(lists), rest - n_ft)      # 清单 ← 全文缺口
+    n_ft = min(len(fts), rest - n_list)        # 全文 ← 清单缺口
+    n_pin = min(len(pins), k - n_ft - n_list)  # pinned ← 两侧缺口
+    return fts[:n_ft] + pins[:n_pin] + lists[:n_list]
 
 
 def _normalize_context_ids(raw) -> list[dict]:

@@ -168,15 +168,23 @@ DEFAULT_CONFIG: dict = {
         #    额度**。失败/超时由 has_recent_topic_attempt 的负缓存收敛为「每
         #    user_prompt_submit.state_ttl_hours 窗口最多一次」，不会每轮重试。
         # 2. 该子进程收到本轮 prompt 原文 + session_topic_top_n 篇候选笔记的路径与
-        #    摘要（经 stdin，不落 argv/进程表）。产物只写本机 state，不上传、不进 metrics。
+        #    摘要（经 stdin，不落 argv/进程表）。产物（主题词、点名篇）写本机 state；开启
+        #    `metrics` 时另落主题词的**加盐 hash**与点名篇路径到 metrics 记录，可 `--purge` 清除。
         # 3. 该键自 a26e9d1（2026-09-02）引入，晚于停止首跑全量物化的 42f3fc8
         #    （2026-08-03）⇒ 没有任何用户的 config.json 物化过它，故本次默认值变更对
         #    **全部**未显式配置的用户（含存量）即时生效，不是只影响新装。
         # 关掉：config 的 relevance 段显式写 "session_topic": false（显式值覆盖默认）。
         "session_topic": True,
-        # 首轮送进提炼子进程的候选笔记篇数。取 10 不是 30：注入给用户的是 top-3，
-        # 送出去的越多、暴露面越大；精排 PoC 用 30 篇时 prompt 已 2-4KB。
-        "session_topic_top_n": 10,
+        # 首轮送进提炼子进程的候选笔记篇数。spec 2026-09-15 起 10→30，并与 session_topic_project_top_k
+        # 并集后封顶 session_topic_pool_max（见 _candidate_pool.build_topic_pool）。
+        # 送出去的越多、暴露面越大——子进程走与主会话相同端点（_topic._call_model 继承 env），
+        # 主会话跑第三方 provider 时外传量随之扩大；用户 2026-09-15 已确认。
+        "session_topic_top_n": 30,
+        "session_topic_project_top_k": 20,   # 项目目录笔记按 mtime 降序并入候选池的篇数
+        "session_topic_pool_max": 50,        # 候选池封顶
+        # 会话级固定注入（spec 2026-09-15）：首轮 LLM 点名的笔记整个会话注入 summary，独占额外名额。
+        "session_pin_enabled": True,
+        "session_pin_max": 1,                # 首版保守：错 1 篇比错 3 篇代价小；读写两侧硬上限 8
         # 层1 闸门（2026-09-02）：纯指代/应答型 prompt（「继续执行」「ok」）不注入。
         # 这批实测占 5.6% 的轮次当前 100% 靠单个通用词命中（「继续执行」bigram 切出的
         # `执行` 命中数百篇），是召回质量最差的一批。
