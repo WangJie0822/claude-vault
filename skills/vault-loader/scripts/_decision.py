@@ -14,7 +14,7 @@ from scripts._scorer import (
     Signals, score, topical_score, has_keyword_hit, has_strong_evidence,
     build_tag_df, _keyword_hits_tags, _keyword_hits_summary, _keyword_hits_keywords,
 )
-from scripts._signal_collect import is_pure_cjk_keywords
+from scripts._signal_collect import extract_slash_command_name, is_pure_cjk_keywords
 
 
 @dataclass
@@ -145,6 +145,55 @@ def is_deictic_only(prompt, config: dict) -> bool:
         if not s:
             return False
         return s in table
+    except Exception:
+        return False
+
+
+def is_skipped_slash_command(prompt, config: dict) -> bool:
+    """prompt 是否以用户列入跳过名单的 slash 命令开头（`relevance.skip_slash_commands`）。
+
+    与紧邻的 `is_deictic_only` 同族：同层、同一套 fail-open 契约 —— 任何异常或畸形
+    输入一律返回 False（放行），**绝不因本闸门丢召回**。判据放这里而不是入口脚本，
+    是为了让决策面判据保持单点；下一个人加第四道闸门时有先例可循。
+
+    匹配语义（`tests/test_slash_skip.py` 逐条钉住）：
+    - 大小写不敏感；名单项可带或不带前导 `/`；
+    - 名单项**不含** `:` → 既匹配裸名 `/vault`，也匹配任意 plugin 前缀 `/ctx:vault`。
+      用户不该被迫知道某个 skill 是根级还是 plugin 提供的；跨 plugin 撞名时误拦的
+      代价只是「少注入一次」，方向温和。要精确到某一个就写全限定名。
+    - 名单项**含** `:` → 逐字相等。
+
+    归一化的分工要说准，别写成「都在 config 层」：名单的**类型**归一（非 list 归零、
+    剔非 str 与空串）在 `_config_loader._normalize_relevance`；**语义**归一（大小写、
+    前导斜杠）在这里逐轮重算，与 `is_deictic_only` 每轮重建 `table` 同形 —— 读端不
+    假设写端做过语义清洗，配置可被用户随时手改。
+
+    空名单直接短路：这是 100% 存量用户走的路径（默认 `[]`），不该为一个默认关闭的
+    功能付出每轮一次解析的代价。
+    """
+    try:
+        if not isinstance(prompt, str):
+            return False
+        names = ((config or {}).get("relevance") or {}).get("skip_slash_commands")
+        if not names or not isinstance(names, list):
+            return False
+        name = extract_slash_command_name(prompt)
+        if not name:
+            return False
+        token = name.lower()
+        bare = token.rsplit(":", 1)[-1]
+        for raw in names:
+            if not isinstance(raw, str):
+                continue
+            n = raw.strip().lstrip("/").lower()
+            if not n:
+                continue
+            if ":" in n:
+                if token == n:
+                    return True
+            elif token == n or bare == n:
+                return True
+        return False
     except Exception:
         return False
 

@@ -502,6 +502,24 @@ def main() -> int:
     if config.get("metrics", {}).get("enabled", False):
         try:
             from scripts import _metrics as _m
+            # 命名空间必须在 build/stage 之前配好：`_metrics._RUNTIME` 是独立于
+            # `_state` 的**另一个**进程级全局，默认值写死 "legacy"，不配就让
+            # `metrics_dir()` 返回 0.9.x 的 `~/.claude/vault-loader-metrics/`，
+            # 而 `analyze_metrics` 在 canonical 下读 `~/.context-vault/metrics/<runtime>/`
+            # ——数据在盘上、报表里一条都看不到，canonical 侧的 prune 也永远清不到它。
+            # 2026-09-16 实证：本入口自引入 metrics 起漏配，135 条 session_start
+            # 记录全部落错位置（canonical 侧该 channel 计数恒为 0）。
+            #
+            # ⚠️ 刻意放在**本分支内**，不要挪到上面与 `_state.configure_context`
+            # 并列的那个 try 块：那样会新增一处**无条件**的 `_metrics` 导入，一旦它
+            # 失败，同一 try 块里的 `_state.configure_context` 会被一起跳过，把注入
+            # 去重 state 也带进 legacy（实测：state 由 canonical 掉到
+            # `~/.claude/projects/<hash>/vault-loader-state.json`）。UPS 入口能把两者
+            # 并列，是因为它用模块级 import + `_MetricsStub` 兜底；本入口是惰性
+            # import，形态不同，不能照搬它的位置。
+            if hook_context is not None:
+                _m.configure_context(hook_context.runtime.value,
+                                     hook_context.event_id)
             _m.stage(_m.build_session_start_record(
                 session_id=hook_input.get("session_id", ""),
                 inj_chars=len(injection_text or ""),

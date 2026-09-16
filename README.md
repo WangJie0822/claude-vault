@@ -1,6 +1,6 @@
 # Context Vault
 
-同时面向 Claude Code 与 Codex 的本地「知识库沉淀—召回」闭环插件。仓库名可暂时保留 `claude-vault`，插件 ID 从 1.0.0 起为 `context-vault`。三个 skill 协同工作：
+同时面向 Claude Code 与 Codex 的本地「知识库沉淀—召回」闭环插件。仓库名可暂时保留 `claude-vault`，插件 ID 从 1.0.0 起为 `context-vault`。三个 skill 协同构成闭环（另有第四个 `config` 作为运维入口，用来查看与修改本插件的配置项）：
 
 | Skill | 作用 |
 |---|---|
@@ -146,6 +146,18 @@ hook 通过一个 polyglot 包装脚本运行，按以下顺序探测 Python 解
 | `VAULT_LOADER_DISABLE=1`（环境变量） | 仅当前进程 |
 | 创建 `~/.context-vault/.disabled`（文件；旧 `~/.claude/.vault-loader-disabled` 也兼容） | 持续生效直到删除该文件 |
 | 在 `~/.context-vault/config.json` 中设 `enabled: false` | 永久生效直到改回 |
+
+### 按 slash 命令跳过（`skip_slash_commands`）
+
+`/bug-batch` 这类 skill 自带完整任务上下文，注入历史笔记只是噪声。在 `~/.context-vault/config.json` 的 `relevance` 段列出要跳过的命令名，该轮即完全不注入：
+
+```json
+{ "relevance": { "skip_slash_commands": ["bug-batch", "bug-analyze"] } }
+```
+
+大小写不敏感、前导 `/` 可省；名单项不含 `:` 时同时匹配裸名与任意 plugin 前缀，含 `:` 则精确匹配。默认空 ⇒ 不配就零行为变化。
+
+⚠️ 两条边界：**只拦命令名所在那一轮**（skill 后续的对话轮次照常注入）；且**只对 UPS 收到 `/cmd` 原文的命令生效**——部分命令（如 `/context-vault:summarize-session`）UPS 收到的不是命令原文，加进名单拦不住且无提示。命令在名单里却仍注入时，改用上表的停用方式或 `opt_out_paths`。详见 vault-loader 的 SKILL.md。
 
 ### 定向回退（调节而非停用）
 

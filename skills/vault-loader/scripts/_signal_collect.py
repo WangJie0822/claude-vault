@@ -9,6 +9,9 @@
 - I：项目 CLAUDE.md vault-loader 注释
 - J：UserPromptSubmit prompt 关键词
 - collect_recent_commits：最近 commit 原始 oneline（SessionStart 展示用）
+
+其它公共入口（不是信号源，但住在本模块，因为与 J 的 slash 剥离共用切分口径）：
+- extract_slash_command_name：取 prompt 的 slash 命令名，供 `_decision.is_skipped_slash_command` 用
 """
 from __future__ import annotations
 
@@ -298,6 +301,49 @@ def _strip_slash_command(prompt: str) -> str:
     if m is None:
         return ""
     return stripped[m.start():]
+
+
+# 形态 B 的锚点。**不是**为想象中的场景写的代码，理由见 extract_slash_command_name。
+# 用 `match`（锚定开头）而非 `search`：契约是「prompt **以**命令开头」，四处文档都这么
+# 写。用 search 时 prompt 中间任何位置出现该标签都会命中 —— 讨论中粘一段含
+# `<command-name>` 的文本就会被误拦，是一条未文档化的误拦通路。锚定开头后也不再
+# 需要「只扫前 N 字节」的窗口：match 失败即刻返回，不扫全文。
+# `/?` 让前导斜杠可选 —— 保留形态 B 的理由是「harness 改形态时不静默失效」，
+# 而改形态时它未必带斜杠；只认带斜杠的写法会让那条理由自己落空。
+_COMMAND_NAME_RE = re.compile(r"<command-name>\s*(/?[^<\s]{1,200})\s*</command-name>")
+# 命令名长度上限，两种形态共用（形态 B 的正则已自带 {1,200}，形态 A 此前无上限，
+# 两边不对称）。真实命令名远短于此，超长只可能是粘贴的文本。
+_MAX_COMMAND_NAME_CHARS = 200
+
+
+def extract_slash_command_name(prompt: str) -> str:
+    """取 prompt 的 slash 命令名（去前导 `/`，保留大小写与 plugin 前缀）；非命令返回空串。
+
+    与 `_strip_slash_command` 共用同一套「到第一个空白为止」的切分口径 —— 两者必须
+    同步改，否则会漂移成「命令名被剥掉分词了、却没被跳过名单认出来」。
+    `tests/test_slash_skip.py::test_parse_parity_with_strip_slash_command` 钉住这条。
+
+    **两种形态都认**，取舍有实测依据（2026-09-16，本机 metrics 加盐 hash 与 transcript
+    对拍 335 个 slash 命令轮）：形态 A（`/cmd args` 原文）命中 47，形态 B
+    （`<command-name>` 包裹）命中 **0** —— 即当前 harness 走的是形态 A。保留形态 B
+    是因为失败方向不对称：harness 哪天改成包裹形态，只认 A 的判据会恒返回空串、
+    整个跳过名单静默失效（且与「用户没配这条」在现象上完全一致）；而多认一种形态
+    的代价只是一条正则。
+
+    ⚠️ 两种形态都覆盖不了「UPS 收到的根本不是命令文本」那一类 —— 同批实测中
+    `/context-vault:summarize-session` 等命令所在的 83 个 session 在 metrics 里**都有**
+    UPS 记录、gate 为空、确实注入了，但其 prompt_h 对不上任何命令形态。那类命令
+    加进名单也拦不住，属已知边界，见 SKILL.md。
+    """
+    stripped = prompt.lstrip()
+    if stripped.startswith("/"):
+        m = re.search(r"\s", stripped)
+        token = stripped if m is None else stripped[:m.start()]
+        # `lstrip("/")` 而非 `token[1:]`：名单项那侧也用 lstrip，只剥一个会让
+        # `//foo` 解析成 `/foo`、与名单项 `foo` 对不上，两侧口径必须一致。
+        return token.lstrip("/")[:_MAX_COMMAND_NAME_CHARS]
+    m = _COMMAND_NAME_RE.match(stripped)
+    return m.group(1).lstrip("/")[:_MAX_COMMAND_NAME_CHARS] if m else ""
 
 
 _EN_SUBTOKEN_SPLIT_RE = re.compile(r"[_-]")

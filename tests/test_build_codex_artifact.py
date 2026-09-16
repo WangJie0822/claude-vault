@@ -15,6 +15,27 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(builder)
 
 
+def test_required_covers_every_skill_on_disk():
+    """`REQUIRED` 里的 skill 清单必须等于文件系统上的 skill 集合。
+
+    `REQUIRED` 是硬编码清单，`inventory()` 用它做「必需文件是否被跟踪」的前置断言：
+    三个老 skill 未跟踪时构建**硬失败**，而不在清单里的新 skill 一旦未跟踪，
+    构建会**成功并输出缺 skill 的产物**，门禁照报 PASS。Codex 是主打发布通路，
+    这种产物缺件不会有任何征兆。
+
+    只把新 skill 加进 `REQUIRED` 治不了本：第五个 skill 还会漏。这条守卫才是判据。
+    """
+    on_disk = {f"skills/{p.parent.name}/SKILL.md"
+               for p in (ROOT / "skills").glob("*/SKILL.md")}
+    in_required = {r for r in builder.REQUIRED
+                   if r.startswith("skills/") and r.endswith("/SKILL.md")}
+    assert on_disk, "没扫到任何 SKILL.md —— 判据本身坏了，不是清单对了"
+    assert in_required == on_disk, (
+        f"REQUIRED 与磁盘上的 skill 不一致：\n"
+        f"  磁盘有而清单缺：{sorted(on_disk - in_required)}\n"
+        f"  清单有而磁盘缺：{sorted(in_required - on_disk)}")
+
+
 def test_dirty_development_build_has_standard_layout(tmp_path):
     plugin = builder.build(tmp_path / "market", allow_dirty=True)
     assert (plugin / ".codex-plugin/plugin.json").is_file()

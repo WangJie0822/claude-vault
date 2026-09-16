@@ -2,6 +2,90 @@
 
 本文件记录 Context Vault（原 claude-vault）的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.4.0] - 2026-09-16
+
+### 新增
+
+- **新增第四个 skill `config`：查看与修改插件自身的配置项。** 调用 `/context-vault:config`。
+  列出全部可配项及其「当前值 / 默认值 / 是否被显式设置 / 这一项干什么」，并在确认后
+  安全改写 `~/.context-vault/config.json`。
+  - **读端只读**：`load_config()` 在配置缺失时会写 `_MINIMAL_STUB` 占位，读端因此只
+    `json.loads` 原始文件——「看一眼有哪些配置项」不该在你机器上建文件。
+  - **写端的安全边界继承自 `migrate_config.py`**（已过一轮安全评审）：重定向守卫
+    （目标路径任意一段经 symlink/junction 即拒）、独立目录备份、原子写、`--restore`。
+    另加三条本工具特有的：写入源必须是**原始 JSON** 而非合并后的配置（否则一次写入会
+    物化 66 个默认值，此后默认值演进对该用户永久失效，且 `_config_version` / `_comment`
+    会被剥除）；写入白名单；写后回读核验。
+  - **三个隐私旋钮需显式确认**：`relevance.session_topic_top_n` / `session_topic_project_top_k`
+    / `session_topic_pool_max` 控制每会话有多少篇笔记被发往外部模型端点，而它们的类型是
+    普通 int、类型校验全放行。改它们要加 `--i-understand-privacy`。
+  - **首版只读三处**：`work_log_dir` / `obsidian_cli.*`（不在 `DEFAULT_CONFIG`、无类型与默认值
+    判据，且后者只认 canonical 会与路径解析分叉）；以及环境变量 / `.disabled` 文件 / 项目
+    CLAUDE.md 注释这三处**逃生阀**——用户开它们时往往正因插件出了问题，此时让插件自己去
+    改这些开关，失败方向不对称。
+  - **不提供「一键恢复默认」**：它要么删键（显式配置静默消失）、要么写入当前默认值
+    （此后默认值演进对该用户永久失效）。
+
+- **`relevance.skip_slash_commands`：按 slash 命令名跳过注入。** prompt 以名单内的命令开头时
+  该轮完全不注入（gate 记 `skipped_slash_command`）。默认 `[]` ⇒ 不配就零行为变化。
+  面向 `/bug-batch` 这类自带完整任务上下文、注入历史笔记只是噪声的 skill。
+  写法 `["bug-batch"]`，大小写不敏感、前导 `/` 可省；名单项不含 `:` 时同时匹配裸名与任意
+  plugin 前缀，含 `:` 则逐字精确匹配。
+  - 该功能有实测依据：本机 metrics 加盐 hash × transcript 对拍 335 个 slash 命令轮，
+    命令轮**并非不注入**——69 条匹配记录中 66 条 `n_admitted > 0`（多数在 100~300 区间），
+    `/bug-batch` 12/12、`/merge-skill-bundle` 25/25、`/superpowers:brainstorming` 18/18 全部注入。
+  - **两条边界（都会静默，务必先读）**：① 只拦命令名所在的那一轮，skill 后续的对话轮次
+    照常注入；② 只对「UPS 收到 `/cmd` 原文」的命令生效——同批实测另有一类命令
+    （`/context-vault:summarize-session` 等，涉 83 个 session）UPS 有记录、gate 为空、确实
+    注入了，但 prompt 对不上任何命令形态，加进名单**拦不住且无提示**。命令在名单里却仍
+    注入时属于这一类，改用 `opt_out_paths` 或项目 CLAUDE.md 的 disable 注释。
+  - **开 `metrics` 时能看出「配了但从未生效」**：记录新增自描述字段 `skip_on`（与既有
+    `topic_on` / `pin_on` 同族），`analyze_metrics --report` 会在「配了名单却一轮都没命中」
+    时直接点破并给出排查方向。没有这个字段时，该状态与「压根没配过」在报表上完全同形 ——
+    而上面那条边界②决定了它**一定会**发生在某些用户身上。
+
+### 变更
+
+- **SKILL.md 的配置表升级为机器契约，文档守卫从 2 段扩到全部可配键。** 表区间用
+  `<!-- config-table:begin/end -->` 锚点界定，守卫与将来读配置的工具共用同一个边界；
+  判据由「反引号键名出现在**全文任意位置**」收紧为「**锚点内表格首列**有这一行」。
+  - 起因：旧守卫论域是 `_SECTIONS = ("relevance", "metrics")`，实测只覆盖 **31/66** 键——
+    `scoring` / `session_start` / `user_prompt_submit` / `display` / `runtimes` / 顶层共 35 个键
+    （53%）新增时**没有任何测试**会红。变异实证：删掉 `scoring.prompt_keyword_hit` 那一行，
+    旧守卫全绿。另外旧实现只遍历段内一级键、不下钻，`relevance.confidence_bands.high`
+    这类嵌套键从来没被守过。
+  - 两个判据不一致还留了一道缝：删掉表格行、只在正文留一句散文提及，旧守卫放行而
+    机器解析拿不到说明。统一判据后该缝消失，并由 `test_judgement_rejects_prose_mention`
+    单独钉住（把判据改回旧形态时它转红）。
+  - 连带补齐三处文档：`runtimes.claude.enabled` / `runtimes.codex.enabled` 由「两个键挤在
+    一格」拆成各自一行；`relevance.confidence_bands` 由段级行改为叶子键
+    `relevance.confidence_bands.high`（说明里保留嵌套对象的写法示例）。
+  - 两个已废弃键（`user_prompt_submit.min_score` / `.fulltext_threshold`，运行时不读）登记进
+    显式豁免清单，并配两道防腐：豁免项必须真在 `DEFAULT_CONFIG` 里、且必须确实没有表格行——
+    否则它会变成一条没人发现的死条目，或让某个键对覆盖率守卫永久隐身。
+
+### 修复
+
+- **SessionStart 通道的 metrics 记录不再落进 0.9.x 的 legacy 根。** `session_start_load.py`
+  只配置了 `_state` 的 runtime 命名空间、漏配 `_metrics` 的，而两者是各自独立的进程级全局；
+  `_metrics._RUNTIME` 因此停在模块默认值 `"legacy"`，`metrics_dir()` 返回
+  `~/.claude/vault-loader-metrics/`，而 `analyze_metrics` 在 canonical 下读
+  `~/.context-vault/metrics/<runtime>/` —— 数据在盘上、报表里一条都看不到，canonical 侧的
+  `retention_days` 清理也永远够不到它。作者本机实测：135 条 `session_start` 记录全部落错位置，
+  canonical 侧该 channel 计数恒为 0。UPS 通道一直是正确的，不受影响。
+  - 升级后**旧记录不会自动搬家**。`~/.claude/vault-loader-metrics/` 里若有本次缺陷期产生的
+    `channel: "session_start"` 记录，需要自行合并到 `~/.context-vault/metrics/<runtime>/<月份>/`
+    的同名 `<session>.jsonl`（逐行追加即可，读端 `SUPPORTED_SCHEMAS` 同时接受 `_schema` 1 与 2）。
+
+### 已知问题
+
+- **在没有 committed 迁移标记的机器上，上面这个修复可能不生效。** 缺陷期写 metrics 会把
+  `~/.claude/vault-loader-metrics/` 目录创建出来，而该目录正是 `has_legacy_data()` 的探针之一
+  （`context_vault/paths.py`），于是 `use_canonical_namespace()` 被缺陷自己的副作用永久翻成
+  `False`，state / metrics / topics 一并留在 legacy 布局。判断方法：`~/.context-vault/migration.json`
+  的 `status` 若不是 `"committed"`，且 `~/.claude/vault-loader-metrics/` 存在，即处于该状态。
+  修它要改核心落点判据、影响面涉及四处存储，留待单独评估。
+
 ## [1.3.0] - 2026-09-16
 
 **首轮提炼不再只产主题词——同一次 haiku 调用还会从候选里点名 1 篇「本会话固定上下文」，整个会话每轮注入其摘要。**

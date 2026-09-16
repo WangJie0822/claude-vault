@@ -129,6 +129,11 @@ DEFAULT_CONFIG: dict = {
 
     "relevance": {
         "strip_slash_command": True,        # 剥 prompt 首个 slash 命令名 token
+        # 跳过名单（黑名单）：prompt 以名单内的 slash 命令开头时整轮不注入。默认空
+        # ⇒ 存量用户零行为变化。名单项不含 ':' 时同时匹配裸名与任意 plugin 前缀
+        # （`bug-batch` 命中 `/bug-batch` 与 `/x:bug-batch`）；含 ':' 则要求逐字相等。
+        # ⚠️ 只对「UPS 收到 `/cmd` 原文」的命令生效，实测边界见 SKILL.md 该键说明。
+        "skip_slash_commands": [],
         "use_keywords": True,               # 止血开关：false 时 scorer 忽略 keywords，不杀整个 loader
         "min_topical_score": 4,             # 精度闸门：仅 topical_score ≥ 此值才注入
         # fulltext_topical_threshold 与 confidence_bands.high 同值=6 时：topical=6 的条目，若命中词
@@ -259,6 +264,15 @@ def _normalize_relevance(rel: dict) -> None:
         rel["exclude_note_tags"] = [t for t in ex if isinstance(t, str)]
     else:
         rel["exclude_note_tags"] = ["archived"]
+    # 非 list 一律归零，**不是**风格问题：调用点写 `for name in names` 时，配成字符串
+    # （`"skip_slash_commands": "bug-batch"`）会逐字符迭代，每个字符都是非空 str，
+    # 于是凭空生成 `/b` `/u` `/g` … 一批单字符跳过规则，把无关命令静默拦掉。
+    # 归一化放在这里而非调用点，是为了让「名单是 list[str]」成为下游的单点保证。
+    sk = rel.get("skip_slash_commands")
+    if isinstance(sk, list):
+        rel["skip_slash_commands"] = [s for s in sk if isinstance(s, str) and s.strip()]
+    else:
+        rel["skip_slash_commands"] = []
     rel["split_cjk_bigram"] = bool(rel.get("split_cjk_bigram", True))
     rel["relax_pure_cjk_single"] = bool(rel.get("relax_pure_cjk_single", True))
     try:

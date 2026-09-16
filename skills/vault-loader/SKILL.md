@@ -75,6 +75,11 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 
 > 本节是**完整可配键清单**：占位文件的 `_comment` 指向这里，代码里的 `DEFAULT_CONFIG` 不再被物化到盘上，所以这份文档是分发物中唯一能查全键的地方。
 
+<!-- config-table:begin -->
+<!-- 这对锚点是机器契约，不是排版：`tests/test_skill_doc_config_coverage.py` 与将来读配置的
+     工具都只在锚点之间解析「一行一个叶子键」的配置表。移动或删除锚点会让守卫响亮失败。
+     新增配置键请在本区间内对应的段表里补一行，首列写全路径键名。 -->
+
 ### 顶层
 
 | 键 | 默认 | 作用 |
@@ -82,7 +87,8 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 | `enabled` | `true` | 总开关；false 永久关停 |
 | `dry_run` | `false` | true 时**不真实注入**（`hookSpecificOutput` 字段缺失，不喂模型），仅输出标 `[DRY-RUN]` 的 `systemMessage`，用于灰度验证会注入什么 |
 | `vault_path` | `~/.context-vault/knowledge-vault` | Vault 路径 |
-| `runtimes.claude.enabled` / `runtimes.codex.enabled` | `true` | 分宿主启停；不影响另一端 |
+| `runtimes.claude.enabled` | `true` | 在 Claude Code 端启停；不影响 Codex 端 |
+| `runtimes.codex.enabled` | `true` | 在 Codex 端启停；不影响 Claude Code 端 |
 | `keyword_to_tags` | `{}` | cwd 关键词 → tag 映射 |
 | `opt_out_paths` | `["/tmp", "/private/tmp", <本机临时目录>]` | 路径前缀黑名单，命中即跳过 |
 | `verbose_on_skip` | `false` | 跳过时输出短提示 |
@@ -143,10 +149,11 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 | 键 | 默认 | 作用 |
 |---|---|---|
 | `relevance.strip_slash_command` | `true` | 剥掉 prompt 开头的 slash 命令名 token，避免命令名本身参与匹配 |
+| `relevance.skip_slash_commands` | `[]` | **跳过名单**：prompt 以名单内的 slash 命令开头时，该轮完全不注入（gate 记 `skipped_slash_command`）。用于 `/bug-batch` 这类自带完整任务上下文、不需要知识库的 skill。默认空 ⇒ 不配就零行为变化。写法 `["bug-batch", "commit"]`，大小写不敏感、前导 `/` 可省。**名单项不含 `:`** 时同时匹配裸名与任意 plugin 前缀（`vault` 命中 `/vault` 与 `/context-vault:vault`）；**含 `:`** 则逐字精确匹配（`context-vault:vault` 不会命中裸 `/vault`）。⚠️ 两条边界见下方说明 |
 | `relevance.use_keywords` | `true` | keywords 字段参与打分；false 为止血开关，scorer 完全忽略 keywords（不杀整个 loader） |
 | `relevance.min_topical_score` | `4` | **注入精度闸门**：话题分低于此值的笔记不进候选 |
 | `relevance.fulltext_topical_threshold` | `6` | **全文升级阈值**：话题分达此值**且**满足强证据档才升级为全文（见「全文升级判据」） |
-| `relevance.confidence_bands` | `{"high": 6}` | 话题分 ≥ `high` 且强证据档 → 标「高置信」，否则「中置信」 |
+| `relevance.confidence_bands.high` | `6` | 话题分 ≥ 此值且强证据档 → 标「高置信」，否则「中置信」。写进 config 时是嵌套对象：`"confidence_bands": {"high": 6}` |
 | `relevance.short_summary_chars` | `20` | summary 短于此字符数时，清单改用文件名作标题 |
 | `relevance.split_english_token` | `true` | 英文 token 再按 `[_-]` 切分，治路径碎片黏连 |
 | `relevance.en_subtoken_min` | `4` | 英文子片最小长度。设 3 经实证是召回灾难（`bug` 会命中 146 个 tag） |
@@ -164,8 +171,17 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 | `relevance.session_topic_top_n` | `30` | 首轮送进提炼子进程的 admitted 候选篇数；与 `session_topic_project_top_k` 并集后封顶 `session_topic_pool_max`。显式写过的值不会被 `migrate_config` 动 |
 | `relevance.session_topic_project_top_k` | `20` | 当前项目 `项目笔记/<仓库名>/`（含项目 CLAUDE.md 的 `extra_paths`）下按 mtime 最新的 N 篇并入首轮提炼候选池；worktree 内按主仓库名取。显式写过的值不会被 `migrate_config` 动 |
 | `relevance.session_topic_pool_max` | `50` | 首轮提炼候选池封顶：admitted 前 `session_topic_top_n` 全保留，**被截掉的是项目笔记那一片**——本轮 admitted 实际篇数达到本值时项目笔记一篇都进不了池（要保住项目片就把本值随 `session_topic_top_n` 一起调大；开 `metrics` 后报表「候选池」行会点破「项目笔记恒为 0」）。显式写过的值不会被 `migrate_config` 动 |
-| `relevance.session_pin_enabled` | `true` | 会话级固定注入总开关（**需 `relevance.session_topic` 同时为 `true`**——点名来自同一个提炼子进程，`session_topic: false` 时本开关无效）：首轮 LLM 点名的笔记在整个会话（`state_ttl_hours` 内）每轮注入其 summary，**独占额外名额**（不占 `user_prompt_submit.max_notes`），机械召回为空时也注入；闸门早退（指代型/关键词不足/subagent 事件通知）轮次不注入。关掉则提炼 prompt 与候选池回到 1.2.1 形态 |
+| `relevance.session_pin_enabled` | `true` | 会话级固定注入总开关（**需 `relevance.session_topic` 同时为 `true`**——点名来自同一个提炼子进程，`session_topic: false` 时本开关无效）：首轮 LLM 点名的笔记在整个会话（`state_ttl_hours` 内）每轮注入其 summary，**独占额外名额**（不占 `user_prompt_submit.max_notes`），机械召回为空时也注入；闸门早退（指代型/关键词不足/subagent 事件通知/**命中 `skip_slash_commands`**）轮次不注入。关掉则提炼 prompt 与候选池回到 1.2.1 形态 |
 | `relevance.session_pin_max` | `1` | 首轮最多点名几篇；读端每轮也按此值收口（TTL 内调低立即少注入；`0` 等价于关掉点名），读写两侧硬上限 8。首版取 1：点错时只污染一篇 |
+
+> ⚠️ **`skip_slash_commands` 的两条边界**（2026-09-16 实测，本机 metrics 加盐 hash × transcript 对拍 335 个 slash 命令轮）：
+>
+> 1. **只拦命令名所在的那一轮。** skill 跑起来后的后续对话轮次，prompt 不以 `/` 开头，照常注入。这是刻意的粒度选择——想让整段工作都不注入，用 `opt_out_paths`（按目录）或项目 CLAUDE.md 的 `<!-- vault-loader: disable -->`。
+> 2. **只对「UPS 收到 `/cmd` 原文」的命令生效。** 实测 `/bug-batch` 12/12 是原文形态、本机制对它成立；但另有一类命令（`/context-vault:summarize-session` 等，涉 83 个 session）UPS 有记录、gate 为空、**确实注入了**，其 prompt 却对不上任何命令形态——把它们加进名单**拦不住，且失败静默**（与「没配这条」现象完全一致）。**若某个命令在名单里却仍触发注入，多半就是这一类，改用上面那两个替代手段。**
+>
+> 另两条预期（都是既有设计，非缺陷）：**以 `/` 开头且首个 token 命中名单的任何 prompt 都算该命令**，包括你粘贴的代码或路径 —— 注意首个 token 是按**空白**切分的，`/usr/bin/foo 有 bug` 的 token 是 `usr/bin/foo`（不是 `usr`），所以只有名单里写了 `usr/bin/foo` 才会被跳过。失败方向是「这一轮没注入」，复述一遍即可。**命中的一轮不吞诊断**，配置错误、near-miss 提示等 `systemMessage` 仍会显示，跳过的只是 vault 注入。
+>
+> 顺带影响：命中的轮次也不会触发 `session_topic` 首轮提炼（那是好事——省一次 haiku 调用），但若该会话首轮恰好是被跳过的命令，本会话的主题词与点名会延后到下一轮才建立。
 
 > ⚠️ **阈值与权重耦合**：`relevance` 的三个阈值（`min_topical_score` / `fulltext_topical_threshold` / `confidence_bands.high`）是按当前 `scoring` 权重标定的——默认权重（tag 4 / summary 2 / keywords 5、floor 0.5）下话题分上界为 11。**改 `scoring` 权重后必须同步复核这三个阈值**，否则闸门会整体偏松或偏紧（例如把 `prompt_tag_hit` 提到 8，单个泛 tag 命中就能越过全文阈值）。
 
@@ -179,6 +195,8 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 | `metrics.retention_days` | `90` | 超过此天数的**月份事件目录**（`<YYYY-MM>/*.jsonl`）自动清理，按「每天至多一次」的频率闸门在正常使用时自动触发，无需手动操作；**只清理这部分**——`.salt`/`near_miss_counts.json`/`nudge_ts.json`/`prune_ts.json`/`annotations.jsonl` 都不受它约束，会一直留到你手动 `--purge` |
 | `metrics.nudge_threshold` | `10` | 某篇笔记累计 near-miss 次数达到此阈值才提示（77 轮真实 prompt 实测标定，判据偏向沉默，勿放宽） |
 | `metrics.nudge_ttl_hours` | `168` | near-miss 提示的**全局**冷却窗口（小时），窗口内所有笔记合计最多提示一次 |
+
+<!-- config-table:end -->
 
 1.0 数据分别落 `~/.context-vault/metrics/claude/` 与 `~/.context-vault/metrics/codex/`；0.9.x legacy 才使用 `~/.claude/vault-loader-metrics/`。`--runtime all --purge` 会不可逆清空两端 canonical 数据（含人工标注）。
 

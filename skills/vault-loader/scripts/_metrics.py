@@ -344,6 +344,7 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
                  n_topic_words: int = 0,
                  topic_on: bool = True,
                  pin_on: bool = True,
+                 skip_on: bool = False,
                  n_pool: "int | None" = None,
                  n_pool_proj: "int | None" = None,
                  llm_pinned: "list[str] | None" = None,
@@ -524,6 +525,16 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
     # 与 `topic_on` 同族的自描述字段：没有它，报表分不开「功能关着」与「功能开着却一次都没点名」——
     # 后者正是这条功能静默死掉的形态（1A-M1 / 1B-M-2）。无条件落盘。
     record["pin_on"] = bool(pin_on)
+    # `skip_on`：本轮 `relevance.skip_slash_commands` 是否非空（用户配过跳过名单）。
+    # 与 `topic_on` / `pin_on` 同族的自描述字段，理由比那两个更硬：本功能有一类
+    # **必然静默失效**的场景 —— 部分 slash 命令 UPS 收到的不是 `/cmd` 原文
+    # （2026-09-16 实测，涉 83 个 session），名单对它们永远不触发。没有这个字段，
+    # 「配了但从未生效」与「压根没配过」在报表上完全同形，而前者正是用户会反复
+    # 改名单也改不通的那一种。
+    # 命中的轮次走 `_stage_gate_record` 的极简记录（刻意只有 5 个键、有守卫钉死），
+    # 不经过本函数 ⇒ 带 `skip_on=True` 的记录恒为「配了但本轮没命中」，与 gate 分布里
+    # 的 `skipped_slash_command` 计数组合即可判别那个失效形态。无条件落盘。
+    record["skip_on"] = bool(skip_on)
     # 候选池构成（1B-H-1）：只在触发提炼的那一轮由调用方传入。`n_pool_proj` 是池中来自项目笔记片的
     # 篇数——组件 A 退化成纯 admitted 时功能照常工作，这是唯一能把退化照出来的数。None 不落键。
     if n_pool is not None:

@@ -4,7 +4,7 @@ This file is the single project guidance source for Claude Code and Codex when w
 
 ## 项目概述
 
-`context-vault`（仓库目录历史名 `claude-vault`）是一个跨平台（macOS / Linux / Windows）、同时支持 Claude Code 与 Codex 的插件，把三个 skill 与一组 hook 打包成「知识库沉淀—召回」闭环。面向中文笔记工作流调优。
+`context-vault`（仓库目录历史名 `claude-vault`）是一个跨平台（macOS / Linux / Windows）、同时支持 Claude Code 与 Codex 的插件，把四个 skill 与一组 hook 打包成「知识库沉淀—召回」闭环（其中三个构成闭环本体，第四个 `config` 是运维入口）。面向中文笔记工作流调优。
 
 ## 架构大图
 
@@ -13,6 +13,8 @@ This file is the single project guidance source for Claude Code and Codex when w
 - **summarize-session**（写端，唯一写入方）——会话结束时把对话沉淀为 Obsidian 笔记 / 工作日志 / CLAUDE.md 更新，并维护 `<vault>/.meta/frontmatter-cache.json`。
 - **vault-loader**（读端，只读）——通过 hook 把相关笔记自动注入会话上下文。
 - **vault**（手动检索）——会话中按关键词 / 分类 / 标签调取笔记。
+
+第四个 skill **config** 不在这个闭环里，是**运维入口**：把全部可配项连同「当前值 / 默认值 / 是否被显式设置 / 这一项干什么」列出来，并在确认后安全改写 `config.json`。读端**只读**（`load_config()` 在文件缺失时会写占位，读端因此只 `json.loads` 原始文件）；写端的安全边界**继承自 `migrate_config.py`**（重定向守卫、独立目录备份、原子写、restore），不重新发明。首版三处只读：`work_log_dir` / `obsidian_cli.*`（不在 `DEFAULT_CONFIG`、无类型判据，且后者只认 canonical 会与路径解析分叉）、三处逃生阀（用户开它们时往往正因插件出了问题，让插件自己去改失败方向不对称）。三个 `session_topic_*` 是**隐私旋钮**（控制每会话外发多少篇给外部模型），类型校验对它们全放行，故改动需显式确认。
 
 **核心数据契约**：`<vault>/.meta/frontmatter-cache.json` 是写端（summarize-session 的 `rebuild_index.py`）与读端（vault-loader 的 `load_cache`）之间的唯一接口。读端 `load_cache` 校验 `_version`，不匹配返回空索引——改一端的 cache schema 必须同步另一端。笔记 frontmatter 的 `keywords`（检索扩展词）经此 cache 流到读端 scorer，是**可选增量字段**——新增它**不**触发 `_version` 变更（读端缺失默认空、双向兼容）。
 
@@ -33,6 +35,9 @@ This file is the single project guidance source for Claude Code and Codex when w
   - 那条端到端并发用例的判据因此不是「零丢失」而是「**每一条丢失都有已知异常可解释**」：写成零丢失会被 `TimeoutError` 拖成 flaky，很快没人当真；写成现在这样，任何**无法解释**的丢失（= 静默丢写）都会红。⚠️ 它的判别力来自**规模**：6 进程 × 25 次时变异 3 次只红 1 次，8 × 60 才稳定，调小等于让守卫掷骰子。真实竞态守卫天生概率性，故另配一条注入 `PermissionError` 的**确定性**用例，变异下 3/3 稳定转红。
 - **测试必须无条件隔离 HOME，`conftest` 的 autouse fixture 负责这件事**：`state_path_for_cwd` 的两个分支（canonical `~/.context-vault/state/<runtime>/`、legacy `~/.claude/projects/<hash>/`）**都以 `Path.home()` 为根**，所以只复位 `_state._RUNTIME` 不解决问题——那只是换个子树写。实测一次全套跑的增量：只复位 `_RUNTIME` 是 canonical +0 / legacy **+36**，无条件隔离 HOME 才是两处都 +0。2026-09-10 曾因此在真实 `~/.context-vault/state/claude/` 留下 **252 个**测试文件（该目录真实数据只有 16 个），legacy 侧历史积累更达 2658 个、其中 topic 条目只有 18 条属真实会话。守卫是 `test_topic_namespace.py` 末尾**成对**的两条用例：前一条故意污染、后一条断言已复位——少了前一条，后一条在「从未有人污染过」时也恒真。
 - **runtime 命名空间是进程级全局，凡新起的子进程都必须显式再配一次**：`_state._RUNTIME` 默认 `legacy`，detached 子进程**不继承**父进程的 `configure_context`。`spawn_topic_extraction` 因此把 `current_runtime()`——父进程**实际生效**的那个归一化值，不是按 payload/config 重新推导的——写进子进程 argv，`run_extraction_child` 用 **`adopt_runtime()`**（而非 `configure_context()`）据此配一次。**这两个函数的区别就是「单点」成不成立**：`current_runtime()` 交出的是**输出域**的值（已生效的命名空间），`configure_context()` 接受的是**输入域**的值（原始 runtime id），两个域取值字符串重叠、类型相同、语义不同，把前者喂回后者是一次**有损往返**——`claude` 是其中唯一的非不动点，而它恰好是绝大多数用户所在的那一档。父子之间 `use_canonical_namespace()` 一旦翻转（`has_legacy_data` 的三个探针里有两个是**其它组件**可能创建的路径）落点即分裂，且分裂后完全静默。`adopt_runtime()` 去掉的**只有**那次二次推导；`{claude, codex}` 白名单与 `_safe_component` 清洗必须原样保留——`_RUNTIME` 会被 `state_path_for_cwd` 拼进目录路径，放行任意字符串等于把它变成任意路径 JSON 写原语（安全评审已 PoC 复现 `..\..\..\PWNED` 写到预期范围之外）。**走 argv 不走 stdin**：后者是 best-effort 通道（写入异常被吞、且刻意不影响 spawn 的成功判定），把决定落点的参数放在那里，一次管道回收就让子进程静默回落 legacy。2026-09-09 实证漏配这一步的后果：`session_topic` 提炼 18/18 成功却全部写进 legacy，而 hook 从 canonical 读，功能默认开一周、每会话付一次 haiku，召回侧零收益且全程无声。守卫（`test_topic_namespace.py`）**必须真起子进程**——同进程用例继承父进程的 `_RUNTIME`、写读天然一致，这类分裂对它们**结构性不可见**，既有 7 条 wiring 用例全是同进程形态，缺陷因此带着全绿跑了一周。
+  - ⚠️ **不止子进程——同一进程里的「另一个 hook 入口」同样要各配一次，而且 `_state` 与 `_metrics` 是两个彼此独立的全局**，配了一个不等于配了另一个。2026-09-16 实证：`session_start_load.py` 只调 `_state.configure_context`、漏调 `_metrics` 那个，`_metrics._RUNTIME` 停在默认 `legacy`，该入口 135 条 `session_start` 记录全部写进 `~/.claude/vault-loader-metrics/`，而 `analyze_metrics` 在 canonical 下读 `~/.context-vault/metrics/<runtime>/`（该 channel 计数恒为 0），canonical 侧的 `retention_days` 也永远清不到它 —— 全程零报错。识别信号有三个且互相独立：记录缺 `runtime` 字段（它只在 `_RUNTIME != "legacy"` 时写入）、两个入口的错误文案不一致（补 metrics 那次没同步过去）、canonical 侧某 channel 恒为 0。**守卫必须端到端跑真实入口**：既有 7 条 `test_session_start_metrics.py` 用例全部直接调 `build_session_start_record`/`summarize`/`render_report` 这类纯函数，对「`metrics_dir()` 用了哪个根」结构性不可见。
+  - ⚠️ **补这行调用时不要把 `_metrics` 的 import 提到与 `_state.configure_context()` 并列的位置**：那是一处无条件导入，它一旦失败，同一 try 块里的 `_state` 配置会被一起跳过、把 state 也带进 legacy（已实测）。UPS 入口能把两者并列，是因为它在模块顶部有 `try: from scripts import _metrics` + `_MetricsStub` 替身兜底；SessionStart 是惰性 import、没有那层替身，位置不能照搬 —— 它的 `_m.configure_context` 应留在 metrics 自己的分支内，紧邻那处惰性 import。
+  - ⚠️ **`has_legacy_data()` 会被本类缺陷的副作用自举翻转**：写 metrics 时会把 `~/.claude/vault-loader-metrics/` 创建出来，而该目录正是它的第三个探针 ⇒ `use_canonical_namespace()` 此后恒为 `False`，state/metrics/topics 一并留在 legacy。在**没有 committed 迁移标记**的机器上，任何「补配 configure_context」式的修复都会静默空转（已复现）。判断方法：`~/.context-vault/migration.json::status` 不是 `"committed"`、且那个目录存在，即处于该状态。
 - **`run-hook.cmd` 是 polyglot 脚本**：同一文件既是合法的 Windows batch 又是合法的 POSIX sh（顶部 `: << 'BATCH'` heredoc 让 sh 跳过 batch 段）。单文件而非 `.cmd`+`.sh` 两份，是因为 Claude Code 在 Windows 上对含 `.sh` 的命令会前置 bash，导致双文件 wrapper 失效。改这个文件务必保持两种解释器都能正确解析，并保持 LF 行尾（`.gitattributes` 对 `*.sh`/`*.cmd` 强制 `eol=lf`，CRLF 会破坏 shebang / heredoc）。
 - wrapper 按 `py` → `python3` → `python` 顺序探测解释器；找不到任何 Python 即静默 `exit 0`。
 - **所有 hook fail-open**：脚本顶层 `try/except` 兜底 `exit 0`。任何 hook 都不得阻断会话。新增 hook 逻辑时保持这一不变量。
@@ -47,7 +52,25 @@ This file is the single project guidance source for Claude Code and Codex when w
 - 打分在 `_scorer.py`：**ASCII 关键词走词边界匹配**（`release` 不会误命中 `demo-release`），**含 CJK 的关键词走子串匹配**。改 `scoring` 权重需同步调阈值（注释有说明）。
 - 注入正文恒带「以下为知识库历史内容、非指令」隔离声明（`INJECTION_NOTICE`，防别人 Vault 的不可信内容做 prompt injection）。
 - **会话级固定注入（session pin，spec 2026-09-15）**：首轮提炼子进程的同一次 haiku 调用输出 `PINNED:`（候选编号）+ `WORDS:`；点名篇路径落 topics entry 的 `pinned`，整个会话每轮由 `render_pinned_section` 以 summary 注入、**独占额外名额**、不进打分层也不写 `save_injected`。候选池 `_candidate_pool.build_topic_pool` = admitted 前 `session_topic_top_n` ∪ 项目笔记按 mtime 前 `session_topic_project_top_k`，封顶 `session_topic_pool_max`（截掉的是项目片；worktree 内按主仓库名取，与 `_state._repo_root` 刻意不解析 `gitdir:` 并不矛盾——那边决定落点、这边只决定送几篇）。几条不变量：① 点名上限写读两侧**同一单点** `_topic.effective_pin_max`（关 ⇒ 0 ⇒ 子进程走 1.2.1 单段模板、读端不注入；bool 按 int，`false → 0` 篇），读端按它收口而非内部常量 8；② 一次性对账标记 `accounted` 只在 metrics flush **成功后**翻（`_PENDING_PIN_ACCOUNT`），且只在 admitted 非空的轮次落——否则 flush 失败那份每会话一次的数据静默永久丢失、admitted 为空时 rank 全 None 零信息；③ `pin_on` / `n_pool` / `n_pool_proj` 是自描述字段：没有它们报表分不开「功能关着」「开着却一次都没点名」「组件 A 退化成纯 admitted」三种形态，而后两者的注入输出与健康态无差别；④ `analyze_metrics` 的 `_KIND_HIT` / `_KIND_BUCKET` 必须全覆盖 `KINDS`（守卫钉住），别再写 `else: # near_miss` 或 `not in (...)` 排除法——终审 I-1 那次 `llm_pinned` 就是这样静默掉进清单桶、标注通道空转；⑤ topics 文件的字节预算 `_encoded_size` 要连**行尾**一起对齐写端（`atomic_write_json` 走文本模式，Windows 每行多 1 字节；满载实测 81930B > 80KB 预算），守卫拿真实写端逐字节对账；⑥ 索引排除判据 `_signal_collect.is_system_index_name` 是信号 A 与候选池共用的单点，两边载体不同（rglob vs cache 键）故另有 parity 用例对同一批样本对跑。
+- **slash 命令跳过名单（`relevance.skip_slash_commands`，默认 `[]`）**：prompt 以名单内命令开头时整轮早退（gate `skipped_slash_command`）。闸门必须在信号 J **之前** —— 分词会剥掉命令名 token，之后判据就没有输入了。命令名解析 `_signal_collect.extract_slash_command_name` 与 `_strip_slash_command` **共用「到第一个空白为止」的切分口径**，由 parity 用例钉住；两者漂移会表现为「命令名被剥掉分词了、却没被名单认出来」。匹配判据是 `_decision.is_skipped_slash_command`，与同族闸门 `is_deictic_only` **并列且逐字对齐**（同签名 `(prompt, config)`、同一套 fail-open 契约：任何异常或畸形输入一律放行）—— 决策面判据集中在一处，下一个人加第七道闸门时有先例可循。**归一化的分工要说准**：名单的**类型**归一（非 list 归零、剔非 str 与空串）在 `_config_loader._normalize_relevance`，**语义**归一（大小写、前导斜杠）在判据里逐轮重算、与 `is_deictic_only` 每轮重建 `table` 同形；写成「都在 config 层单点保证」是不实的（评审 A-M-3 订正）。类型归一那处不能省：配成字符串时 `for n in "bug-batch"` 会逐字符迭代、凭空造出 `/b` `/u` `/g` 一批单字符规则，把无关命令静默拦掉。
+  - 形态 B 用 `match` **锚定开头**而非 `search`：契约是「prompt 以命令开头」，用 search 时讨论中粘一段含 `<command-name>` 的文本就会被误拦（评审 A-M-1，一条未文档化的误拦通路）；前导斜杠可选，否则「harness 改形态时不静默失效」这条保留理由自己就落空了。
+  - **失效可观测**：记录落自描述字段 `skip_on`（与 `topic_on` / `pin_on` 同族），报表在「配了名单却一轮都没命中」时直接点破。没有它，边界②那类必然失效与「压根没配过」完全同形。命中的轮次走极简 gate 记录（刻意只 5 个键、有守卫钉死），故带 `skip_on=True` 的记录恒为「配了但本轮没命中」，与 `gate_dist` 里的计数组合即可判别。
+  - **两条边界都会静默，改这里前必读**（2026-09-16 实测：本机 metrics 加盐 hash × transcript 对拍 335 个 slash 命令轮）：① 只拦命令名所在那一轮——skill 后续对话轮次 prompt 不以 `/` 开头，照常注入，这是用户拍板的粒度；② **只对「UPS 收到 `/cmd` 原文」的命令生效**。同批实测：`/bug-batch` 12/12 为原文形态（形态 A 命中 47、`<command-name>` 包裹形态命中 **0**），而 `/context-vault:summarize-session` 等命令所在的 **83 个 session 在 metrics 里都有 UPS 记录、gate 为空、确实注入了**，其 prompt 却对不上任何命令形态 ⇒ 加进名单拦不住。该类命令具体收到什么**未直证**（模板做过 `$ARGUMENTS` 替换，无法逐字复原比对），故文档只写到「不是命令原文」这个精度，不写「是模板展开正文」。
+  - 保留 `<command-name>` 包裹形态解析（当前实测零命中）是**失败方向不对称**的取舍：只认原文形态时，harness 哪天改成包裹形态，判据会恒返回空串、整个名单静默失效，与「用户没配」现象完全一致；多认一种形态只花一条正则，且有用例覆盖、不是死代码。
+  - 同批实测顺带推翻一个常见直觉：**命令轮并非「反正也不注入」**——69 条匹配记录里 66 条 `n_admitted > 0`（多数 100~300），`/merge-skill-bundle` 25/25、`/superpowers:brainstorming` 18/18 全部注入。
 - **停用逃生阀**：环境变量 `VAULT_LOADER_DISABLE=1`（单进程）/ 文件 `~/.claude/.vault-loader-disabled`（持续）/ config `enabled:false`（永久）/ 项目 CLAUDE.md 注释 `<!-- vault-loader: dis​able -->`（亦支持 `tags=[...]`、`extra_paths=[...]`，注：disable 中插入零宽空格 U+200B 防止被自身的 `_DISABLE_RE` 正则误命中）。
+
+### 配置表是机器契约，不是排版（2026-09-16）
+
+`skills/vault-loader/SKILL.md` 的配置表由 `<!-- config-table:begin/end -->` 一对锚点界定，**守卫与将来读配置的工具共用这个边界**。`tests/test_skill_doc_config_coverage.py` 的判据是「**锚点内、表格首列**有 `` `<全路径键>` `` 这一行」，论域是 `_flatten(DEFAULT_CONFIG)` 的**全部叶子键**。
+
+改这块前要知道它为什么长这样：
+
+- **旧论域是 `_SECTIONS = ("relevance", "metrics")`，实测只覆盖 31/66 键**。另外 35 个（`scoring`/`session_start`/`user_prompt_submit`/`display`/`runtimes`/顶层，53%）新增时没有任何测试会红——变异实证：删掉 `scoring.prompt_keyword_hit` 那一行，旧守卫全绿。且旧实现 `for key in DEFAULT_CONFIG[section]` **只遍历一级键、不下钻**，`relevance.confidence_bands.high` 这类嵌套键从来没被守过。
+- **旧判据「反引号键名出现在全文任意位置」与「能解析出这一行」是两回事**：删掉表格行、只在正文留一句散文提及，旧守卫照样放行而机器拿不到说明。两个判据不统一就等于留了一道缝，而缝的两侧各自都「有守卫」。统一后由 `test_judgement_rejects_prose_mention` 单独钉住——**那条守的是判据本身**，把 `_has_table_row` 改回 `in text` 形态时它转红；没有它，这次收紧的唯一目的就没有守卫。
+- **锚点不是可有可无的排版**：没有锚点时判据只能是「全文任一表格行」，会把「停用逃生阀」等别的表算进来（实测抓到过 `VAULT_LOADER_DISABLE=1` 这种根本不是配置键的行）。`_config_table` 在锚点缺失时**抛错而不是回落全文**——回落会让守卫在锚点被误删时继续全绿，正是它要防的失效。
+- **一行一个叶子键**：`runtimes.claude.enabled` / `runtimes.codex.enabled` 曾把两个键挤在一格（首列不是单个键，解析不出）；`relevance.confidence_bands` 曾是段级行。两处都已改成叶子键，嵌套写法在说明列里给示例。
+- **废弃键走显式豁免清单 `_EXEMPT`**（当前两个：`user_prompt_submit.min_score` / `.fulltext_threshold`，运行时不读），配两道防腐：豁免项必须真在 `DEFAULT_CONFIG` 里（否则废弃键真被删后它变成死条目，下一个同名新键会被无声豁免）、且必须确实没有表格行（否则补了文档还挂在豁免里，该键对覆盖率守卫永久隐身）。这套防腐照搬仓库既有 `SCAN_EXEMPT` 的模式。
 
 ### vault-loader 效果评估机制（metrics，opt-in）
 
@@ -134,7 +157,7 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 
 ## 开发与测试
 
-**三个 pytest 根，导入约定各不相同——从错误的 cwd 跑会因 import 失败（这是最容易踩的坑，三者不能用单一 rootdir 一起收集）**：
+**四个 pytest 根，导入约定各不相同——从错误的 cwd 跑会因 import 失败（这是最容易踩的坑，它们不能用单一 rootdir 一起收集）**：
 
 ```bash
 # 1. 插件打包 / hook / scripts 测试（仓库根，测试用绝对 ROOT 路径定位）
@@ -147,12 +170,58 @@ cd skills/vault-loader && python -m pytest
 # 3. summarize-session（无 pytest.ini；conftest.py 把 scripts/ 加进 sys.path；测试 import 裸 `from _x`）
 cd skills/summarize-session && python -m pytest tests/
 
-# 4. 发布工具测试：脱敏闸门 + 推送守卫安装脚本（仅作者主 checkout 可用——
+# 4. config skill（与 summarize-session 同款：conftest 把 scripts/ 加进 sys.path，
+#    刻意不建 scripts/__init__.py —— 见该文件 docstring 里的顶层包名争用说明）
+cd skills/config && python -m pytest tests/
+
+# 5. 发布工具测试：脱敏闸门 + 推送守卫安装脚本（仅作者主 checkout 可用——
 #    packaging/ 被 gitignore，不在 clone / worktree 中）
 python -m pytest packaging/
 ```
 
+> ⚠️ **`packaging/run_gates.py` 尚未加入 config skill 这一项门禁**（该文件被 gitignore、
+> 不随 worktree 带出，只能在作者主检出改）。在补上之前，config skill 的守卫**不会**在发布前
+> 的唯一检查表里跑 —— 正是 `run_gates.py` 自陈要消灭的那种「『忘了跑』与『跑了通过』事后
+> 无法区分」的形态。更根治的做法是给它加自检：枚举 `skills/*/tests` 实存目录与 `GATES` 的
+> pytest 根取差集，非空即红，这样第六个 skill 也不会漏。
+
 **发布前一次跑完全部门禁**（DO-M1）：`python packaging/run_gates.py` 串起上面四个 pytest 根 + 脱敏闸门 + 推送守卫安装态 + commit message 脱敏，共 7 项，逐项报、有一项红则整体红（`--list` 只列不跑）。各 gate 的 cwd 必须不同——三个 skill 根的导入约定不兼容，共用 rootdir 会 import 失败，这正是它们容易被漏跑的原因。
+
+> **2026-09-16 增量四（config skill）**：新增第四个 pytest 根 `skills/config/tests/`，
+> **27 条**（读端 11 / 写端 16）；仓库根 `tests/` 由 123 增至 **124**（新增
+> `test_required_covers_every_skill_on_disk`，钉住 `build_codex_artifact.REQUIRED` 必须等于
+> 磁盘上的 skill 集合——只把新 skill 加进清单治不了本，第五个还会漏）。当日实测
+> config **27 passed**、`tests/` **124 passed / 2 skipped**。vault-loader 未改动、未重跑。
+> 变异 **8/8 KILLED**（读端改用会写盘的 `load_config`、写入源换成合并后配置、去掉隐私旋钮
+> 确认、删 bool 分支、去掉回读核验、去掉废弃键白名单、去掉备份、`REQUIRED` 漏掉新 skill）。
+> 另有 1 个**等价变异**按预期存活：去掉 int 分支里对 `"true"` 的特判后，`int("true")` 本来
+> 就抛 `ValueError` 并返回同样的「类型不符」，两条路径等价——真正承重的是 bool 分支本身
+> （删它则 `metrics.enabled` 传 `"1"` 会被写成整数 1），那条变异 KILLED。
+>
+> **2026-09-16 增量三（配置表机器契约）**：`test_skill_doc_config_coverage.py` 由 5 条增至 **9 条**
+> （全键覆盖 / 锚点成对 / 判据拒绝散文提及 / 豁免清单两道防腐），可收集数 1086 → **1090**。
+> 当日实测 **1086 passed / 1 failed / 3 skipped**（150.7s），唯一失败仍是 perf 那条、本次只改文档与测试、
+> 不碰 UPS 热路径。变异 **7/7 KILLED**：删表格行（旧守卫管不到的 `scoring.*` 与管得到的 `relevance.*` 各一）、
+> 删起始锚点、锚点区间缩空、`_EXEMPT` 混入不存在的键、**判据改回「全文提及」**、`_flatten` 不再下钻。
+> 其中「判据改回全文提及」正是本次收紧的唯一目的，由 `test_judgement_rejects_prose_mention` 单独钉住。
+>
+> **2026-09-16 增量二（slash 跳过名单）**：vault-loader 新增 `tests/test_slash_skip.py` **68 条**
+> （解析 / 匹配语义 / 配置归一化 / **接线**四层），可收集数 1018 → **1086**。当日实测
+> **1082 passed / 1 failed / 3 skipped**（97.9s）；仓库根 `tests/` **123 passed / 2 skipped**（97.8s）。
+> 唯一失败仍是 `test_perf.py::test_prompt_submit_under_300ms`（0.343~0.506s，随负载波动），已定责**与本次改动无关**，
+> 证据两条：① **ABBA 交替 A/B**（各 6 次）—— baseline `fe4ca49` median 0.446s / min 0.401s、
+> **6/6 全红**，本次改动 median 0.453s / min 0.406s，Δmedian +8ms、Δmin +5ms，远小于组内波动
+> （~94ms）；② 微基准 —— 新判据空名单 **0.062 µs**、命中 1.324 µs、名单非空但非命令 0.281 µs，
+> 最坏占 300ms 预算的 0.00044%，与 8ms 差约 6000 倍，量级上不可能是它造成的。
+> 本次未跑 summarize-session（零改动）与 packaging（零改动且 gitignore 不在 worktree）。
+>
+> **2026-09-16 增量**：vault-loader 因 metrics 落点修复新增 3 条端到端用例
+> （`tests/integration/test_metrics_namespace.py`），可收集数 1015 → 1018。当日实测
+> **1014 passed / 1 failed / 3 skipped**（105.4s）——唯一失败是 `test_perf.py::test_prompt_submit_under_300ms`
+> （0.469s），已用 baseline 对照定责：**同一条用例在修复前的树上同样红**（0.372/0.373s），且本次
+> diff 不含 `prompt_submit_load.py`、该用例只 spawn UPS 脚本，与改动无关；当时机器并发 16 个
+> claude/node 进程 + Android Studio。即 perf 通过时应为 1015 passed / 3 skipped。下方 1012 那组
+> 是 09-15 的读数，保留作对照。
 
 已实测（2026-09-15，Windows 本机 worktree，`python -B -m pytest -q --color=no -p no:cacheprovider`）：
 `tests/` **123 passed / 2 skipped**、vault-loader **1012 passed / 3 skipped**（59.4s，含 perf 两条；同日

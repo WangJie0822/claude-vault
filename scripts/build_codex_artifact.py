@@ -18,6 +18,7 @@ REQUIRED = (
     "skills/vault/SKILL.md",
     "skills/vault-loader/SKILL.md",
     "skills/summarize-session/SKILL.md",
+    "skills/config/SKILL.md",
     "VERSION",
     "AGENTS.md",
 )

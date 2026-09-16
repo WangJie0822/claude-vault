@@ -211,7 +211,8 @@ class _Acc:
                  "topic_off_n", "pin_rounds", "pin_injected_sum", "pin_n",
                  "pin_rank_top3", "pin_rank_top10", "pin_rank_missing",
                  "pin_field_n", "pin_off_n", "pin_dedup_n",
-                 "pool_n", "pool_sum", "pool_proj_n", "pool_proj_sum", "pool_proj_rounds")
+                 "pool_n", "pool_sum", "pool_proj_n", "pool_proj_sum", "pool_proj_rounds",
+                 "skip_on_n")
 
     def __init__(self) -> None:
         self.arm: Counter = Counter()
@@ -228,6 +229,10 @@ class _Acc:
         # 历史数据永久稀释、这栏刚上线就失去判别力。
         self.topic_rounds = self.topic_words_sum = self.topic_field_n = 0
         self.topic_off_n = 0        # 显式关闭该功能的轮次，单独计、不进生效率分母
+        # 配了 skip_slash_commands 却**没命中**的轮次（命中的走 gate 记录、不经 build_record）。
+        # 与 gate 分布里的 skipped_slash_command 组合，才能把「配了但从未生效」
+        # 与「压根没配过」分开 —— 前者是本功能唯一会静默死掉的形态。
+        self.skip_on_n = 0
         # 全量成因计数（新记录）与被截断窗口口径（旧记录）严格分开：混算既不是
         # 全量也不是窗口，而两者的 dedup 占比实测差一个数量级以上。
         self.dedup_full: Counter = Counter()
@@ -249,6 +254,8 @@ def _acc_gate_and_admitted(r: dict, a: _Acc) -> None:
     """闸门分布、入选臂、候选池计数，以及两个自描述配置字段。"""
     g = r.get("gate") or "ok"
     a.gate[g] += 1
+    if r.get("skip_on"):
+        a.skip_on_n += 1
     if g == "ok":
         a.n_ok += 1
 
@@ -495,6 +502,7 @@ def _acc_to_dict(a: _Acc) -> dict:
         "topic_words_sum": a.topic_words_sum,
         "topic_field_n": a.topic_field_n,
         "topic_off_n": a.topic_off_n,
+        "skip_on_n": a.skip_on_n,
         "near_miss_dedup_dist": dict(a.near_dedup),
         "pin_rounds": a.pin_rounds,
         "pin_injected_sum": a.pin_injected_sum,
@@ -571,6 +579,30 @@ def _shown_path(p: str, show_paths: bool) -> str:
     """
     return sanitize_injected_text(p, keep_newlines=False)[:80] if show_paths \
         else _stable_path_id(p)
+
+
+def _render_slash_skip(s: dict) -> str | None:
+    """`skip_slash_commands` 一行。返回 None 表示「没配过，不渲染」。
+
+    存在的意义是把**「配了但从未生效」**照出来：本功能有一类必然静默失效的场景
+    —— 部分 slash 命令 UPS 收到的不是 `/cmd` 原文（2026-09-16 实测，涉 83 个
+    session），名单对它们永远不触发，而用户看到的现象与「名单写错了」完全一致，
+    会反复改名单也改不通。与 `_render_topic` / `_render_pin` 同构：**只渲染百分比
+    等于把「0 意味着坏了」这一步留给读者**，所以这里把话说出来。
+    """
+    n = s.get("skip_on_n", 0)            # 配了名单、但本轮没命中的轮次
+    hit = (s.get("gate_dist") or {}).get("skipped_slash_command", 0)
+    if not n and not hit:
+        return None                      # 没配过该功能（或全是旧记录），不占版面
+    if not hit:
+        return (f"skip_slash_commands：配了名单的 {n} 轮**一次都没命中** —— "
+                "先确认名单里的命令属于「UPS 能收到 `/cmd` 原文」那一类："
+                "`/bug-batch` 这类 skill 型可以拦，而部分命令（如 "
+                "`/context-vault:summarize-session`）UPS 收到的不是命令原文，"
+                "本机制对它们无效（见 SKILL.md 该键说明），"
+                "改用 opt_out_paths 或项目 CLAUDE.md 的 disable 注释")
+    return (f"skip_slash_commands：命中并跳过 {hit} 轮"
+            f"；另有 {n} 轮配了名单但未命中（正常，说明那些轮不是名单内的命令）")
 
 
 def _render_topic(s: dict) -> str:
@@ -698,6 +730,9 @@ def render_report(s: dict, show_paths: bool = False) -> str:
                 if n_ok else ""), ""]
     lines.append(f"全文注入 {s.get('n_fulltext', 0)} 次 = 走到打分轮次的 "
                  f"{s['fulltext_rate']:.1%}")
+    _skip_line = _render_slash_skip(s)
+    if _skip_line:
+        lines.append(_skip_line)
     lines.append(_render_topic(s))
     lines.append(_render_pin(s))
     lines.append(_render_pool(s))

@@ -81,7 +81,7 @@ try:
     )
     from scripts._decision import (
         decide_injection, StateView, _hit_keywords, gate_keywords, select_fulltext,
-        is_deictic_only,
+        is_deictic_only, is_skipped_slash_command,
     )
     from scripts._topic import (
         load_session_topic, spawn_topic_extraction, has_recent_topic_attempt,
@@ -616,6 +616,10 @@ def _stage_gate_record(config: dict, hook_input: dict, gate: str) -> None:
     恒等于 `{'ok': N}` 的空统计——被拦的从来没被记录过，于是「这周有多少次
     召回被闸门挡掉了」无从回答（实测 259/259 条记录 gate 全为空）。
 
+    ⚠️ 上面的「四类」是写下这段时的数目，**截至本笔已是六类**：`vault_unreachable` /
+    `skipped_source` / `skipped_slash_command` / `deictic_only` / `too_few_keywords` /
+    `cache_empty`。数目还会涨，别照这个数写断言——要算就数调用点。
+
     **只记五个键，不含 kw_h/cwd_h/admitted/near_miss** —— 零隐私增量。
     也因为不含 `near_miss_scorelow` 键，`flush()` 走的 `_metrics.scorelow_entries()`
     对它返回 `[]`，而 `bump_near_miss_counts` 的 `if not paths: return` 在 mkdir /
@@ -848,6 +852,14 @@ def main() -> int:
         _stage_gate_record(config, hook_input, "skipped_source")
         return _finish_with_metrics(config, cwd)
 
+    # 跳过名单：用户点名的 slash 命令整轮不注入（`relevance.skip_slash_commands`，默认空）。
+    # **必须在信号 J 之前** —— 分词会把命令名 token 剥掉（`strip_slash_command`），
+    # 之后就再也拿不到判据输入了。与上面那道同属「看 prompt 原文的来源型闸门」，
+    # 故紧邻放置，让闸门集中、不在别处再造第四个。
+    if is_skipped_slash_command(prompt, config):
+        _stage_gate_record(config, hook_input, "skipped_slash_command")
+        return _finish_with_metrics(config, cwd)
+
     # 信号 J（剥 slash + 英文切分 + CJK bigram + 头尾截断均由 relevance 控制）
     prompt_keywords = collect_signal_j_prompt_keywords(
         prompt,
@@ -1064,6 +1076,10 @@ def main() -> int:
                 n_topic_words=len(signals.session_topic_words),
                 topic_on=bool(rel_cfg.get("session_topic", False)),
                 pin_on=pin_on,
+                # 本轮是否配了跳过名单。走到这里说明**没命中**（命中的轮次早退走
+                # gate 记录），故它是「配了名单的未命中轮次」的分母 —— 报表据此把
+                # 「配了但从未生效」与「压根没配」分开。
+                skip_on=bool(rel_cfg.get("skip_slash_commands")),
                 n_pool=pool_stats[0] if pool_stats else None,
                 n_pool_proj=pool_stats[1] if pool_stats else None,
                 **pin_kwargs,
