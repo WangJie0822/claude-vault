@@ -25,6 +25,18 @@ test-output*.txt
 # 通过」不可区分。2026-09-07 实测：`git status -uall` 的 670 项里 663 项来自这里，
 # 该门禁因此从未真正执行过，且本仓库无任何 CI，没有第二个机制会发现。
 .tmp/
-# git worktree 的物理目录（EnterWorktree 默认落在这里）：纯运行时产物，且里面是另一份
-# 完整工作树，误 add 会把整个仓库副本连同其 .full-review/.superpowers 一起提交进来。
-.claude/
+# `.claude/`：git worktree 的物理目录（EnterWorktree 默认落在这里），纯运行时产物，且里面是
+# 另一份完整工作树，误 add 会把整个仓库副本连同其 .full-review/.superpowers 一起提交进来。
+# 唯一例外是根级扁平的规则正文 `.claude/rules/*.md`（CLAUDE.md「写入约定」，2026-09-29）。
+# 首行 `**/.claude/` 保住「任意深度的 .claude 都忽略」——只写 `/.claude/*` 会锚到仓库根、
+# 放出子目录里的 `.claude/`（实测）；其后几行只放行根级 rules 目录下一层的 `.md`，
+# 子目录与 `.bak` 等一律仍被忽略；末行再把「名字恰好以 .md 结尾的目录」忽略回去
+# （`!/.claude/rules/*.md` 同时匹配文件和目录，否则 `.claude/rules/x.md/y.md` 会被放出）。
+# 守卫：tests/test_no_corpus_in_repo.py、tests/test_claude_md_layout.py。
+**/.claude/
+!/.claude/
+/.claude/*
+!/.claude/rules/
+/.claude/rules/*
+!/.claude/rules/*.md
+/.claude/rules/*.md/

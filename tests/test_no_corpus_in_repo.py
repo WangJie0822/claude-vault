@@ -63,6 +63,10 @@ ALLOWED_FILES = frozenset({
     "VERSION",
 })
 
+# `.claude/` 是 git worktree 的物理目录，唯一例外是根级扁平的规则正文 `.claude/rules/*.md`
+# （CLAUDE.md「写入约定」，2026-09-29）。用精确正则而非目录前缀：前缀会连子目录与 `.bak` 一起放行。
+ALLOWED_RULES_RE = re.compile(r"^\.claude/rules/[^/]+\.md$")
+
 
 def _tracked_files(root: Path = ROOT) -> list[str]:
     """返回 git 跟踪清单（仓库内相对 posix 路径）。
@@ -96,7 +100,22 @@ def _tracked_files(root: Path = ROOT) -> list[str]:
 
 def _outside_allowlist(paths: list[str]) -> list[str]:
     return [p for p in paths
-            if p not in ALLOWED_FILES and not p.startswith(ALLOWED_DIR_PREFIXES)]
+            if p not in ALLOWED_FILES and not p.startswith(ALLOWED_DIR_PREFIXES)
+            and not ALLOWED_RULES_RE.fullmatch(p)]
+
+
+def _dot_claude_violations(paths: list[str]) -> list[str]:
+    """任何路径段为 `.claude` 的跟踪文件，只允许是根级扁平的 `.claude/rules/*.md`。
+
+    `skills/`、`tests/`、`hooks/` 等前缀会放行其下任意内容，所以子目录里的 `.claude/`
+    （本地 settings、未经评审的 rules）只能靠这一条拦——`.gitignore` 早先写 `.claude/`
+    时任意深度都被忽略，改成放行 rules 之后这层保护必须由守卫补上。
+    路径段按 casefold 比较：Linux（`core.ignorecase=false`）上 `.Claude/` 既不被 gitignore
+    忽略，检出到大小写不敏感的文件系统后又会被当成 `.claude/` 解析。
+    """
+    return [p for p in paths
+            if any(seg.casefold() == ".claude" for seg in p.split("/"))
+            and not ALLOWED_RULES_RE.fullmatch(p)]
 
 
 # ---- 分发目录内部的流程产物 denylist（F1，整分支终审 2026-09-02）----
@@ -165,6 +184,20 @@ def test_tracked_files_within_distribution_allowlist():
         f"ALLOWED_DIR_PREFIXES / ALLOWED_FILES；否则从索引移除。")
 
 
+def test_tracked_dot_claude_is_only_flat_rules():
+    assert _dot_claude_violations(_tracked_files()) == []
+
+
+def test_dot_claude_guard_discriminates():
+    bad = [".claude/settings.json", ".claude/rules/sub/x.md", ".claude/rules/x.md.bak",
+           ".claude/worktrees/w/README.md", "skills/x/.claude/settings.local.json",
+           "hooks/.claude/rules/x.md",
+           # 大小写变体：Linux（core.ignorecase=false）上 gitignore 的 `**/.claude/` 拦不住它们
+           "skills/x/.Claude/settings.json", ".CLAUDE/rules/x.md"]
+    assert _dot_claude_violations(bad) == bad
+    assert _dot_claude_violations([".claude/rules/hooks-runtime.md", "skills/vault-loader/SKILL.md"]) == []
+
+
 def test_no_corpus_files_tracked():
     """语料类文件一律不得被 git 跟踪（allowlist 之外的定向补充）。
 
@@ -192,6 +225,9 @@ def test_allowlist_rejects_known_non_distributed_paths():
         "summarized-sessions.json",
         "debug.log",
         ".claude/worktrees/w/README.md",
+        ".claude/settings.json",
+        ".claude/rules/sub/x.md",
+        ".claude/rules/x.md.bak",
     ]
     assert _outside_allowlist(should_be_rejected) == should_be_rejected
     # 反向：真实分发内容必须放行，否则守卫会把正常提交拦成红
@@ -202,6 +238,7 @@ def test_allowlist_rejects_known_non_distributed_paths():
         "scripts/x.py", "tests/test_no_corpus_in_repo.py",
         "images/cc_preview.png", "docs/MIGRATION.md",
         "README.md", "AGENTS.md", "CLAUDE.md", ".gitattributes", ".gitignore", "VERSION",
+        ".claude/rules/hooks-runtime.md",
     ]
     assert _outside_allowlist(should_pass) == []
 
