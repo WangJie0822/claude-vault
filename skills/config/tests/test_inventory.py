@@ -111,6 +111,18 @@ def test_deprecated_keys_are_flagged_not_hidden(_isolate_home):
     assert dep["desc"], "废弃键也要说明为什么废弃、改用哪个键"
 
 
+def test_retired_codex_switch_is_flagged_deprecated(_isolate_home):
+    """2.0.0 移除 Codex 后 `runtimes.codex.enabled` 失效；迁移脚本给每台迁移过的机器都写过它，
+    必须在清单里以「已废弃」出现，而不是消失或混在生效项里。"""
+    by_key = {it["key"]: it for it in inv.build_inventory(home=_isolate_home)}
+    dep = by_key["runtimes.codex.enabled"]
+    assert dep["status"] == "deprecated"
+    # 1.x 里该键只关掉被误判成 Codex 的 SessionStart；等价替代只有 session_start.enabled。
+    # runtimes.claude.enabled 会把 SessionStart 与 UPS 两个入口一起关掉，不得列为替代。
+    assert "session_start.enabled" in dep["desc"]
+    assert "runtimes.claude.enabled" not in dep["desc"]
+
+
 def test_keys_without_documentation_are_marked_not_blank(_isolate_home):
     """无说明的键标注为「无说明」而非空白——空白读起来像「没说明是正常的」。"""
     items = inv.build_inventory(home=_isolate_home)

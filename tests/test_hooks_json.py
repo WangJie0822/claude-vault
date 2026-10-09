@@ -49,11 +49,11 @@ def test_hooks_json_commands_have_type_command():
                 )
 
 
-def test_context_hooks_have_bounded_codex_output():
-    """Codex spills oversized context; keep the shared hook limit explicit and positive."""
+def test_hooks_json_has_no_codex_only_fields():
+    """`commandWindows` 与 `additionalContextLimit` 只被 Codex 读取，2.0.0 起不得再出现。"""
     data = json.loads((ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))
     for entries in data["hooks"].values():
         for entry in entries:
             for hook in entry["hooks"]:
-                assert isinstance(hook.get("additionalContextLimit"), int)
-                assert hook["additionalContextLimit"] > 0
+                assert "commandWindows" not in hook
+                assert "additionalContextLimit" not in hook

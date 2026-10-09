@@ -11,7 +11,7 @@
    深度的同名目录。`hooks/**/*` 与 `/VERSION` 是锚定的。
 3. 加载以磁盘为准、只收 `.md`：未跟踪的 rules 文件照样会被加载，所以只比对 git 跟踪
    清单不够。
-另外，CLAUDE.md 与 AGENTS.md 是 vault-loader 信号 I 的输入，不得出现能生效的注释；
+另外，CLAUDE.md 是 vault-loader 信号 I 的输入，不得出现能生效的注释；
 rules 随公开发布分发，不得含私人标识。
 
 判据都写成接收 `(root, tracked)` 的纯函数：对仓库真实状态断言一次，再在 `tmp_path`
@@ -57,7 +57,7 @@ CLAUDE_REFS = [
     pytest.param("tests/test_cache_contract.py", "核心数据契约", id="cache-contract"),
     pytest.param("tests/test_cache_contract.py", "改一端的 cache schema 必须同步另一端", id="cache-sync"),
     pytest.param("skills/vault-loader/tests/test_fail_open.py", "所有 hook fail-open", id="failopen-vl"),
-    pytest.param("tests/test_windows_hook_command.py", "所有 hook fail-open", id="failopen-win"),
+    pytest.param("tests/test_hook_command_claude.py", "所有 hook fail-open", id="failopen-claude-cmd"),
     pytest.param("tests/test_no_corpus_in_repo.py", "分发边界（重要）", id="corpus-dist"),
     pytest.param("tests/test_push_guard_installed.py", "分发边界", id="pushguard-dist"),
     pytest.param("tests/test_plugin_version_sync.py", "发布流程", id="version-release"),
@@ -110,6 +110,14 @@ LEAK_SAMPLES = {
 }
 LEAK_NEGATIVES = ["版本 1.4.1 发布", "见 https://docs.example.com/a", "`@` 导入", "127.0.0.1:8080",
                   "`\\\\?\\UNC\\`", "`~/.claude/projects/<hash>/`", "dis" + chr(0x200B) + "able"]
+# 泄漏扫描的放行项：(文件, 命中原文, 所在行必须包含的锚串)。三者同时成立才放行——
+# 只按命中原文放行太粗（例如 `D:/` 会放过 CHANGELOG 将来出现的任何盘符路径），
+# 按整个文件豁免更粗。当前三项都在 CHANGELOG：opt_out 示例路径与两个格式规范 URL。
+LEAK_ALLOW = frozenset({
+    ("CHANGELOG.md", "D:/", '"D:/work/secret"'),
+    ("CHANGELOG.md", "https://keepachangelog.com/zh-CN/1.1.0/", "[Keep a Changelog]"),
+    ("CHANGELOG.md", "https://semver.org/lang/zh-CN/", "[语义化版本]"),
+})
 
 # 测试读数（写入约定 ①）：会随下一次提交过期的套件计数
 COUNT_RE = re.compile(r"(?<![0-9A-Za-z])\d+\s*(?:passed|failed|skipped|errors?)(?![A-Za-z])"
@@ -136,7 +144,7 @@ def _git(root: Path, *args: str, stdin: bytes | None = None) -> subprocess.Compl
 def _tracked(root: Path = ROOT) -> list[str]:
     """本仓库自己的 git 跟踪清单。
 
-    - git 不可用 / 不是 git 检出（插件缓存、Codex staging）→ skip；
+    - git 不可用 / 不是 git 检出（插件缓存）→ skip；
     - 是 git 检出（有 `.git`）却调用失败 → fail：门禁不能把「git 坏了」静默算成通过；
     - 嵌在别的 git 仓库里（例如插件缓存位于 `~/.claude` 仓库内）→ skip，不拿外层清单比对。
     """
@@ -147,7 +155,7 @@ def _tracked(root: Path = ROOT) -> list[str]:
         err = top.stderr.decode("utf-8", "replace").strip()
         if (root / ".git").exists():
             pytest.fail(f"这是 git 检出但 git rev-parse 失败，门禁不能静默跳过：{err}")
-        pytest.skip(f"非 git 仓库（例如插件缓存或 Codex staging 里的副本）：{err}")
+        pytest.skip(f"非 git 仓库（例如插件缓存里的副本）：{err}")
     if Path(top.stdout.decode("utf-8", "replace").strip()).resolve() != root.resolve():
         pytest.skip("不是本仓库自己的 checkout（嵌在别的 git 仓库里），不拿外层清单比对")
     proc = _git(root, "ls-files", "-z")
@@ -369,25 +377,40 @@ def index_pointer_problems(root: Path) -> list[str]:
             for rel in rule_md_files(root) if rel not in body]
 
 
-def leak_problems(root: Path) -> list[str]:
+def leak_universe(tracked: list[str]) -> list[str]:
+    """泄漏扫描论域：全部受跟踪的 Markdown（它们随公开发布分发）。"""
+    return sorted(p for p in tracked if p.endswith(".md"))
+
+
+def _leak_allowed(rel: str, text: str, line: str) -> bool:
+    return any(rel == a_rel and text == a_text and anchor in line
+               for a_rel, a_text, anchor in LEAK_ALLOW)
+
+
+def leak_problems(root: Path, rels: list[str]) -> list[str]:
     probs = []
-    for rel in ["CLAUDE.md", "AGENTS.md"] + rule_md_files(root):
-        text = _read(root, rel)
-        probs += [f"{rel}: {name} {m.group(0)!r}" for name, pat in LEAK_PATTERNS.items()
-                  for m in pat.finditer(text)]
+    for rel in rels:
+        content = _read(root, rel)
+        for name, pat in LEAK_PATTERNS.items():
+            for m in pat.finditer(content):
+                start = content.rfind("\n", 0, m.start()) + 1
+                end = content.find("\n", m.end())
+                line = content[start:] if end == -1 else content[start:end]
+                if not _leak_allowed(rel, m.group(0), line):
+                    probs.append(f"{rel}: {name} {m.group(0)!r}")
     return probs
 
 
 def count_problems(root: Path) -> list[str]:
     probs = []
-    for rel in ["CLAUDE.md", "AGENTS.md"] + rule_md_files(root):
+    for rel in ["CLAUDE.md"] + rule_md_files(root):
         probs += [f"{rel}: {m.group(0)!r}" for m in COUNT_RE.finditer(outside_migrated(_read(root, rel)))]
     return probs
 
 
 def _mini(tmp_path: Path) -> Path:
     """复制指令文件与 rules 到 tmp_path，供判别用例在其上制造违规。"""
-    for rel in ["CLAUDE.md", "AGENTS.md", *sorted(disk_rule_files(ROOT))]:
+    for rel in ["CLAUDE.md", *sorted(disk_rule_files(ROOT))]:
         dst = tmp_path / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / rel, dst)
@@ -424,7 +447,7 @@ def test_glob_problem_reason_names_real_mechanism(g, needle):
 
 def test_glob_regex_semantics():
     r = glob_regex("scripts/**/*")
-    assert r.fullmatch("scripts/build_codex_artifact.py") and r.fullmatch("scripts/a/b.py")
+    assert r.fullmatch("scripts/migrate_context_vault.py") and r.fullmatch("scripts/a/b.py")
     assert not r.fullmatch("skills/vault-loader/scripts/_state.py")
     v = glob_regex("/VERSION")
     assert v.fullmatch("VERSION") and not v.fullmatch("skills/x/VERSION")
@@ -478,6 +501,33 @@ def test_each_leak_pattern_fires(name):
 @pytest.mark.parametrize("text", LEAK_NEGATIVES)
 def test_leak_patterns_spare_known_benign_text(text):
     assert not [n for n, p in LEAK_PATTERNS.items() if p.search(text)], text
+
+
+def test_leak_universe_covers_every_tracked_markdown(tracked):
+    """泄漏扫描论域 = 全部受跟踪 `*.md`。
+
+    2.0.0 之前只扫两份根级指令文件 + rules，README / MIGRATION / CHANGELOG /
+    SKILL.md / references 这批随公开发布分发的用户文档不在其内——而它们正是
+    移除 Codex 时要大改的文件。
+    """
+    universe = set(leak_universe(tracked))
+    assert universe == {p for p in tracked if p.endswith(".md")}
+    assert {"README.md", "CHANGELOG.md", "docs/MIGRATION.md"} <= universe
+
+
+def test_leak_problems_scans_non_instruction_docs(tmp_path):
+    root = _mini(tmp_path)
+    (root / "README.md").write_text("说明\n" + LEAK_SAMPLES["邮箱"] + "\n", encoding="utf-8")
+    rels = ["CLAUDE.md", "README.md", *rule_md_files(root)]
+    assert any(p.startswith("README.md: 邮箱") for p in leak_problems(root, rels))
+
+
+def test_leak_allow_entries_are_live():
+    """放行项防腐：每一项都必须仍恰好命中一次，否则就是死条目或已失效的豁免。"""
+    for rel, text, anchor in LEAK_ALLOW:
+        content = _read(ROOT, rel)
+        lines = [ln for ln in content.splitlines() if anchor in ln and text in ln]
+        assert len(lines) == 1, f"放行项不再唯一命中，应更新或删除：{(rel, text, anchor)}"
 
 
 def test_count_re_discriminates():
@@ -558,11 +608,12 @@ def test_pointer_and_index_problems_discriminate(tmp_path):
 
 def test_leak_and_count_problems_discriminate(tmp_path):
     root = _mini(tmp_path)
-    assert leak_problems(root) == [] and count_problems(root) == []
+    rels = ["CLAUDE.md", *rule_md_files(root)]
+    assert leak_problems(root, rels) == [] and count_problems(root) == []
     with (root / RULES_REL / "summarize-session.md").open("a", encoding="utf-8") as f:
         # 另起一节：写在「迁移原文」小节里的读数按约定豁免，新写入内容不豁免
         f.write("\n## 后续新增\n\n" + LEAK_SAMPLES["邮箱"] + "\n全套 165 passed\n")
-    assert any("邮箱" in p for p in leak_problems(root))
+    assert any("邮箱" in p for p in leak_problems(root, rels))
     assert any("165 passed" in p for p in count_problems(root))
 
 
@@ -570,7 +621,7 @@ def test_signal_i_guard_discriminates(tmp_path):
     root = _mini(tmp_path)
     mod = _load_signal_collect()
     assert mod.collect_signal_i_project_claude_md(root).disabled is False
-    with (root / "AGENTS.md").open("a", encoding="utf-8") as f:
+    with (root / "CLAUDE.md").open("a", encoding="utf-8") as f:
         f.write("\n<!-- vault-loader: disable -->\n")
     assert mod.collect_signal_i_project_claude_md(root).disabled is True
 
@@ -660,13 +711,6 @@ def test_claude_md_within_budget():
         f"按「写入约定」合并同组索引行或把正文挪进 .claude/rules/；调整上限需用户确认。")
 
 
-def test_agents_md_stays_a_pointer():
-    t = _read(ROOT, "AGENTS.md")
-    assert "CLAUDE.md" in t
-    assert _u16(t) <= 600, "AGENTS.md 只应指向 CLAUDE.md，不要复制或转述规则"
-    assert not re.search(r"^\s*- \*\*", t, re.M), "AGENTS.md 出现了规则条目"
-
-
 @pytest.mark.parametrize("referrer,phrase", CLAUDE_REFS)
 def test_phrases_referenced_by_comments_stay_in_claude_md(referrer, phrase):
     assert phrase in _read(ROOT, referrer), f"{referrer} 已不再引用「{phrase}」，请从 CLAUDE_REFS 删除该项"
@@ -712,13 +756,13 @@ def test_rule_name_regex_matches_gitignore_admission(tracked):
 
 def test_instruction_files_do_not_trigger_vault_loader_signal_i():
     res = _load_signal_collect().collect_signal_i_project_claude_md(ROOT)
-    assert res.disabled is False, "CLAUDE.md / AGENTS.md 出现了能生效的停用注释，vault-loader 会在本仓库静默停用"
+    assert res.disabled is False, "CLAUDE.md 出现了能生效的停用注释，vault-loader 会在本仓库静默停用"
     assert not res.tags and not res.extra_paths, f"出现了能生效的 tags / extra_paths 注释：{res.tags} {res.extra_paths}"
 
 
-def test_distributed_instruction_files_have_no_private_markers():
-    probs = leak_problems(ROOT)
-    assert not probs, "随公开发布分发的指令文件里出现私人标识：\n" + "\n".join(probs)
+def test_distributed_instruction_files_have_no_private_markers(tracked):
+    probs = leak_problems(ROOT, leak_universe(tracked))
+    assert not probs, "随公开发布分发的 Markdown 里出现私人标识：\n" + "\n".join(probs)
 
 
 def test_instruction_files_carry_no_test_counts():

@@ -1700,8 +1700,10 @@ def main() -> int:
     # --show-paths 是 --report 的修饰项，不参与互斥
     ap.add_argument("--show-paths", action="store_true")
     ap.add_argument(
-        "--runtime", choices=("auto", "legacy", "claude", "codex", "all"), default="auto",
-        help="metrics 命名空间；canonical 存在时 auto/all 同时处理 Claude 与 Codex",
+        "--runtime", choices=("auto", "legacy", "claude", "all"), default="auto",
+        help="metrics 命名空间。auto：canonical 配置存在时等同 all，否则等同 legacy。"
+             "all：legacy 与 claude；并处理 2.0.0 退役的 metrics/codex/——--purge 整目录删除"
+             "（含 .salt），--reset-counts 只删其中 near_miss_counts.json 与 nudge_ts.json",
     )
     args = ap.parse_args()
     home = Path.home()
@@ -1713,7 +1715,7 @@ def main() -> int:
     # 原样留在盘上（含加盐 hash、明文笔记路径、明文 session id、不可再生的人工标注）。
     # 漏掉它时 `--purge` 只清一半却报告「已清空 N 个数据文件」，`--report` 也看不到
     # 那半边——「没有数据」与「数据在另一个命名空间」不可区分。
-    runtimes = ("legacy", "claude", "codex") if selected == "all" else (selected,)
+    runtimes = ("legacy", "claude") if selected == "all" else (selected,)
 
     def all_records():
         for runtime in runtimes:
@@ -1725,6 +1727,9 @@ def main() -> int:
         for runtime in runtimes:
             _metrics.configure_context(runtime)
             n += _metrics.reset_counts(home)
+        if selected == "all":
+            # 退役的 codex 命名空间（2.0.0）按路径处理，见 _metrics.RETIRED_NAMESPACES
+            n += _metrics.reset_retired_counts(home)
         print(f"已清空 near-miss 累计计数（{n} 条）与 nudge 冷却戳。"
               f"事件记录与人工标注未受影响。")
         return 0
@@ -1739,6 +1744,12 @@ def main() -> int:
                 scanned.append(str(_metrics.metrics_dir(home)))
                 n_ann += _metrics.count_annotations(home)
                 n += _metrics.purge(home)
+            if selected == "all":
+                # 退役的 codex 命名空间（2.0.0）按路径整目录删除，见 _metrics.RETIRED_NAMESPACES
+                r_n, r_ann, r_dirs = _metrics.purge_retired(home)
+                n += r_n
+                n_ann += r_ann
+                scanned.extend(r_dirs)
         except OSError as exc:
             print(f"metrics 清理失败，仍有数据保留：{exc}", file=sys.stderr)
             return 2
@@ -1756,7 +1767,7 @@ def main() -> int:
         return 0
     if args.review_web:
         if len(runtimes) != 1:
-            print("--review-web 必须显式指定 --runtime legacy|claude|codex",
+            print("--review-web 必须显式指定 --runtime legacy|claude",
                   file=sys.stderr)
             return 2
         _metrics.configure_context(runtimes[0])
@@ -1774,7 +1785,7 @@ def main() -> int:
 
     if args.review:
         if len(runtimes) != 1:
-            print("--review 必须显式指定 --runtime legacy|claude|codex", file=sys.stderr)
+            print("--review 必须显式指定 --runtime legacy|claude", file=sys.stderr)
             return 2
         _metrics.configure_context(runtimes[0])
         # 下面两条是**假设没有这层护栏**、裸 input() 会撞上的失败形态——正是这层

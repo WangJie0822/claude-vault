@@ -1,17 +1,14 @@
 ---
 paths:
   - ".claude-plugin/**/*"
-  - ".codex-plugin/**/*"
   - "scripts/**/*"
   - "/.gitignore"
   - "/.gitattributes"
   - "/VERSION"
   - "/CHANGELOG.md"
-  - "/AGENTS.md"
   - "tests/test_no_corpus_in_repo.py"
   - "tests/test_push_guard_installed.py"
   - "tests/test_plugin_version_sync.py"
-  - "tests/test_build_codex_artifact.py"
 ---
 
 # 规则正文：分发边界（重要）
@@ -41,3 +38,7 @@ paths:
 > ⚠️ 由此牵出一条闸门盲区：脱敏闸门只扫工作树文件，**不扫 commit message**。写 message 时若引用了私人标识（比如解释「守卫为什么不能跟踪」时把那个域名原样抄进去），闸门不会有任何反应，而发布提交会把 message 一并带上公开远端。实测本仓库开发谱系里确有多笔 message 命中 `SECRET_PATTERNS`。
 >
 > 补丁是 `packaging/scan_commit_messages.py`（不分发，已接进 `run_gates.py`）。默认范围 `origin/master..HEAD`：在发布分支上这正是本次要发布的全部提交；在开发谱系上与 `origin/master` 无共同祖先、没有发布语义，**自动跳过并说明**——若在日常分支恒红，这条检查很快会被无视，等于没有。**开发谱系的历史 message 不改写**：那些提交本就不推公开远端（pre-push 守卫保证），为此重写历史的风险大于收益。
+
+## 历史订正（2.0.0 移除 Codex 支持）
+
+- `.codex-plugin/`、`scripts/build_codex_artifact.py` 与仓库根 `AGENTS.md` 随 2.0.0 删除，版本号同步改为三处（`VERSION`、`.claude-plugin/plugin.json`、marketplace 自身条目）。构建器自带的私钥 / 令牌 / Windows 用户目录三条通用扫描迁入 `tests/test_no_secrets_in_tree.py`，先于删除落地；`leak_problems` 的论域同步扩到全部受跟踪 `*.md`。上文「现行补充」里 1.2.1 漏改 `.codex-plugin/plugin.json` 的实证保留作历史记录。

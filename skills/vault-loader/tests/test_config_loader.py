@@ -560,5 +560,5 @@ def test_malformed_runtimes_never_escapes_load_config(tmp_home: Path, bad) -> No
     runtimes = cfg["runtimes"]
     assert isinstance(runtimes, dict)
     # 复刻真实消费点的调用链：任何一层类型不对都会在这里抛
-    for rt in ("claude", "codex", "unknown"):
+    for rt in ("claude", "unknown"):
         assert runtimes.get(rt, {}).get("enabled", True) in (True, False)

@@ -3,23 +3,34 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
 from context_vault.events import claim_event
 
 
 def test_event_claim_is_atomic_and_contains_no_content(tmp_path):
-    assert claim_event("codex", "UserPromptSubmit", "s1", "e1", home=tmp_path)
-    assert not claim_event("codex", "UserPromptSubmit", "s1", "e1", home=tmp_path)
-    marker = next((tmp_path / ".context-vault/state/events/codex").glob("*.json"))
+    assert claim_event("claude", "UserPromptSubmit", "s1", "e1", home=tmp_path)
+    assert not claim_event("claude", "UserPromptSubmit", "s1", "e1", home=tmp_path)
+    marker = next((tmp_path / ".context-vault/state/events/claude").glob("*.json"))
     data = json.loads(marker.read_text(encoding="utf-8"))
     assert data["claims"][0]["event_id"] == "e1"
     assert data["session_hash"] != "s1"
     assert "prompt" not in data and "cwd" not in data
 
 
-def test_event_names_and_runtimes_do_not_collide(tmp_path):
+def test_event_names_do_not_collide(tmp_path):
     assert claim_event("claude", "SessionStart", "s1", "e1", home=tmp_path)
-    assert claim_event("codex", "SessionStart", "s1", "e1", home=tmp_path)
     assert claim_event("claude", "UserPromptSubmit", "s1", "e1", home=tmp_path)
+
+
+@pytest.mark.parametrize("runtime", ["codex", "../x", "", "CLAUDE", "legacy"])
+def test_claim_event_rejects_unknown_runtime(tmp_path, runtime):
+    """runtime 会被拼进 marker 目录：白名单之外一律拒绝，且不得在盘上留下任何东西。"""
+    with pytest.raises(ValueError, match="unsupported runtime"):
+        claim_event(runtime, "UserPromptSubmit", "s1", "e1", home=tmp_path)
+    events = tmp_path / ".context-vault" / "state" / "events"
+    markers = list(events.rglob("*.json")) if events.exists() else []
+    assert not markers, f"被拒绝的 runtime 不得留下 marker：{markers}"
 
 
 def test_same_host_event_id_in_different_projects_does_not_collide(tmp_path):

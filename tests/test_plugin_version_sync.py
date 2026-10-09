@@ -38,7 +38,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN_JSON = ROOT / ".claude-plugin" / "plugin.json"
 MARKETPLACE_JSON = ROOT / ".claude-plugin" / "marketplace.json"
-CODEX_PLUGIN_JSON = ROOT / ".codex-plugin" / "plugin.json"
 VERSION_FILE = ROOT / "VERSION"
 
 
@@ -89,11 +88,10 @@ def test_plugin_and_marketplace_versions_match():
 def test_all_manifests_follow_root_version():
     expected = VERSION_FILE.read_text(encoding="utf-8").strip()
     claude = _load(PLUGIN_JSON)
-    codex = _load(CODEX_PLUGIN_JSON)
     market = _load(MARKETPLACE_JSON)
-    assert expected == claude["version"] == codex["version"]
+    assert expected == claude["version"]
     assert _self_entry(market, claude["name"])["version"] == expected
-    assert claude["name"] == codex["name"] == "context-vault"
+    assert claude["name"] == "context-vault"
 
 
 def test_marketplace_entry_points_to_self():

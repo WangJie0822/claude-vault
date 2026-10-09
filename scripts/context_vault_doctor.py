@@ -13,7 +13,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from context_vault.paths import canonical_config, context_home, legacy_loader_config
-from context_vault.runtime import detect_runtime
 from context_vault.coexist import legacy_plugin_enabled
 from scripts.migrate_context_vault import inspect
 
@@ -40,14 +39,9 @@ def diagnose(home: Path, runtime: str = "auto") -> dict:
     except Exception as exc:            # noqa: BLE001 — 排障工具不得因被诊断对象而崩
         legacy = dict(_EMPTY_LEGACY)
         errors.append(f"legacy 配置无法解析：{exc}")
-    selected_runtime = detect_runtime({}).value if runtime == "auto" else runtime
+    selected_runtime = "claude" if runtime == "auto" else runtime
     try:
-        coexistence_risk = (
-            legacy_plugin_enabled("claude", home=home)
-            or legacy_plugin_enabled("codex", home=home)
-            if selected_runtime == "unknown"
-            else legacy_plugin_enabled(selected_runtime, home=home)
-        )
+        coexistence_risk = legacy_plugin_enabled(home=home)
     except Exception as exc:            # noqa: BLE001
         coexistence_risk = False
         errors.append(f"共存检测失败：{exc}")
@@ -71,7 +65,6 @@ def diagnose(home: Path, runtime: str = "auto") -> dict:
         "plugin_root": str(ROOT),
         "manifests": {
             "claude": (ROOT / ".claude-plugin/plugin.json").is_file(),
-            "codex": (ROOT / ".codex-plugin/plugin.json").is_file(),
         },
         "canonical_config": str(canonical) if canonical.exists() else "",
         "legacy_config": str(legacy_loader_config(home))
@@ -85,7 +78,6 @@ def diagnose(home: Path, runtime: str = "auto") -> dict:
         "coexistence_risk": coexistence_risk,
         "disabled_by": disabled,
         "environment": {
-            "PLUGIN_ROOT": bool(os.environ.get("PLUGIN_ROOT")),
             "CLAUDE_PLUGIN_ROOT": bool(os.environ.get("CLAUDE_PLUGIN_ROOT")),
         },
     }
@@ -93,7 +85,7 @@ def diagnose(home: Path, runtime: str = "auto") -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Context Vault read-only doctor")
-    parser.add_argument("--runtime", choices=("auto", "claude", "codex"), default="auto")
+    parser.add_argument("--runtime", choices=("auto", "claude"), default="auto")
     parser.add_argument("--home", type=Path, default=Path.home(), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:

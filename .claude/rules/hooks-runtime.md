@@ -8,7 +8,7 @@ paths:
   - "skills/vault-loader/scripts/_diagnostics.py"
   - "skills/vault-loader/scripts/session_start_load.py"
   - "skills/vault-loader/scripts/prompt_submit_load.py"
-  - "tests/test_windows_hook_command.py"
+  - "tests/test_hook_command_claude.py"
 ---
 
 # 规则正文：Hook 管线与 runtime
@@ -35,3 +35,10 @@ paths:
 - **所有 hook fail-open**：脚本顶层 `try/except` 兜底 `exit 0`。任何 hook 都不得阻断会话。新增 hook 逻辑时保持这一不变量。
 - **「宿主拒绝写入」不等于「无害」，不得永久静默**。判据单点在 `context_vault/degrade.py::is_host_write_denied`（认 `PermissionError`，以及 `OSError` 的 EACCES/EPERM/**EROFS** —— 只读*文件系统*在 POSIX 上不被映射成 `PermissionError`）。命中后登记一条 `degraded` 诊断（`CODE_HOST_WRITE_DENIED`），由 `take_user_visible` 按 code+cwd 做 TTL 冷却「说一次」，**而不是** `return` 掉：Windows 上「文件被占用」（WinError 5/32，本机 Obsidian 与安全代理属常态，`summarize-session/scripts/_fs.py` 正为此做指数退避重试）抛的同样是 `PermissionError`，与「用户目录权限真的配坏了」在异常类型上不可区分，无条件静默会把后者一并吞掉。既然无法只报真问题，就让 hint 把「哪种情况无需处理」写死 —— 这是 `_diagnostics` 模块「判据偏向沉默」那条约束下的取舍，不是对它的违反。
   该判据 2026-09-07 之前在**三处**各写一份（两个入口脚本的 `_report_nonfatal` + `_metrics.flush()` 内联），改一处漏两处、且任何一处漏改都不会让测试转红。`_metrics` 的 prune 失败**刻意不**升级为诊断（清理失败无后续影响，且该模块每次 UPS 无条件 import，不引入诊断层依赖）。守卫是 `test_readonly_sandbox.py`，它用 `ast` 钉住**接线**而非函数本体 —— 首版只调本体，把 7 个真实调用点全部还原成裸 `print` 后整套仍然全绿。
+
+## 历史订正（2.0.0 移除 Codex 支持）
+
+- 上文「迁移原文」里关于 Codex 的条目（`hooks.json` 两端共用、`commandWindows`、`PLUGIN_ROOT` 优先、按 payload 识别宿主）随 2.0.0 退役：`hooks.json` 只剩 Claude Code 的 `command`，wrapper 候选根为 `CLAUDE_PLUGIN_ROOT` → 自身位置，宿主恒为 claude，白名单收为 `{claude}`（`_safe_component` 与「必须保留」不变）。
+- 退役的直接动因之一：1.x 的宿主识别在 Claude Code 2.1.293 上把部分 SessionStart 判成 Codex，作者本机 `metrics/codex/` 185 条记录中 183 条是 session_start，涉及 156 个会话，其中 117 个能在本机找到 Claude Code transcript；`claude -p` 下两次探针未复现，交互与后台模式的 payload 未取到，成因未坐实。
+- Windows 守卫随之改写（`tests/test_hook_command_claude.py`）：按 Claude Code 的方式把插值后的完整 `command` 交给 Git Bash 执行，核对 stdin 到达脚本，覆盖「有 / 没有 `CLAUDE_PLUGIN_ROOT`」两种形态。上文「只有 `PLUGIN_ROOT` / 两者都无 / 两者不一致」三种形态里有两种依赖 `PLUGIN_ROOT`，随它一起退役。依据的实测（2026-10-08，Git for Windows 2.55.0，GNU bash 5.3.15）：Git Bash 把 `.cmd` 交给 cmd.exe 执行，polyglot 探针只输出 batch 段的标记，所以 Windows 上覆盖的是 batch 段、macOS / Linux 上覆盖的是 sh 段。守卫取 bash 必须从 git 的安装位置推出 Git Bash，不能取 PATH 上第一个 bash：Windows 常规终端里那是 System32 的 WSL 启动器（同日实测：用它执行插值后的命令串 rc=127、`No such file or directory`），整组用例会误报红。没装 Git Bash 的 Windows 上 Claude Code 改用 PowerShell 执行同一条命令串，当前命令串在那里解析失败、脚本没被执行（1.x 起既有，不是 2.0.0 引入），守卫不覆盖这一形态。
+- 订正一处实测：上文「`CLAUDE_PLUGIN_ROOT` 不在 hook 子进程环境里」未标注测量版本；Claude Code 2.1.293 的 `claude -p` 探针实测 hook 子进程环境里有该变量。wrapper 仍保留「取不到就回落自身位置」。

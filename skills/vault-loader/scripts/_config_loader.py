@@ -56,6 +56,10 @@ DEFAULT_CONFIG: dict = {
     "vault_path": str(default_vault()),
     "runtimes": {
         "claude": {"enabled": True},
+        # 已废弃（2.0.0 移除 Codex 支持）：运行时不读。键保留在这里只为让 /config 清单
+        # 能把用户配置里残留的它标成「已废弃」（迁移脚本给每台迁移过的机器都写过它）；
+        # 同 user_prompt_submit.min_score 的先例：登记在 config_inventory.DEPRECATED 与
+        # test_skill_doc_config_coverage._EXEMPT。
         "codex": {"enabled": True},
     },
 

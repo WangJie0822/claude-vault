@@ -41,7 +41,6 @@ ROOT = Path(__file__).resolve().parent.parent
 # 目录前缀：这些目录下的内容随插件分发。
 ALLOWED_DIR_PREFIXES = (
     ".claude-plugin/",
-    ".codex-plugin/",
     "context_vault/",
     "hooks/",
     "skills/",
@@ -55,7 +54,6 @@ ALLOWED_DIR_PREFIXES = (
 ALLOWED_FILES = frozenset({
     "docs/MIGRATION.md",
     "README.md",
-    "AGENTS.md",
     "CLAUDE.md",
     "CHANGELOG.md",
     ".gitattributes",
@@ -228,16 +226,18 @@ def test_allowlist_rejects_known_non_distributed_paths():
         ".claude/settings.json",
         ".claude/rules/sub/x.md",
         ".claude/rules/x.md.bak",
+        ".codex-plugin/plugin.json",
+        "AGENTS.md",
     ]
     assert _outside_allowlist(should_be_rejected) == should_be_rejected
     # 反向：真实分发内容必须放行，否则守卫会把正常提交拦成红
     should_pass = [
-        ".claude-plugin/plugin.json", ".codex-plugin/plugin.json",
+        ".claude-plugin/plugin.json",
         "context_vault/runtime.py", "hooks/run-hook.cmd",
         "skills/vault-loader/scripts/_scorer.py", "commands/vault.md",
         "scripts/x.py", "tests/test_no_corpus_in_repo.py",
         "images/cc_preview.png", "docs/MIGRATION.md",
-        "README.md", "AGENTS.md", "CLAUDE.md", ".gitattributes", ".gitignore", "VERSION",
+        "README.md", "CLAUDE.md", ".gitattributes", ".gitignore", "VERSION",
         ".claude/rules/hooks-runtime.md",
     ]
     assert _outside_allowlist(should_pass) == []

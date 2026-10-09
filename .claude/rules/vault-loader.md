@@ -59,3 +59,8 @@ paths:
 - **锚点不是可有可无的排版**：没有锚点时判据只能是「全文任一表格行」，会把「停用逃生阀」等别的表算进来（实测抓到过 `VAULT_LOADER_DISABLE=1` 这种根本不是配置键的行）。`_config_table` 在锚点缺失时**抛错而不是回落全文**——回落会让守卫在锚点被误删时继续全绿，正是它要防的失效。
 - **一行一个叶子键**：`runtimes.claude.enabled` / `runtimes.codex.enabled` 曾把两个键挤在一格（首列不是单个键，解析不出）；`relevance.confidence_bands` 曾是段级行。两处都已改成叶子键，嵌套写法在说明列里给示例。
 - **废弃键走显式豁免清单 `_EXEMPT`**（当前两个：`user_prompt_submit.min_score` / `.fulltext_threshold`，运行时不读），配两道防腐：豁免项必须真在 `DEFAULT_CONFIG` 里（否则废弃键真被删后它变成死条目，下一个同名新键会被无声豁免）、且必须确实没有表格行（否则补了文档还挂在豁免里，该键对覆盖率守卫永久隐身）。这套防腐照搬仓库既有 `SCAN_EXEMPT` 的模式。
+
+## 历史订正（2.0.0 移除 Codex 支持）
+
+- `runtimes.codex.enabled` 已失效：按 `user_prompt_submit.min_score` 的先例留在 `DEFAULT_CONFIG`，登记 `config_inventory.DEPRECATED` 与本节所述 `_EXEMPT`，配置表删行。上文「一行一个叶子键」里提到它的那句保留作历史记录。
+- 上文「`_EXEMPT`（当前两个：…）」现为三个，第三个即 `runtimes.codex.enabled`。

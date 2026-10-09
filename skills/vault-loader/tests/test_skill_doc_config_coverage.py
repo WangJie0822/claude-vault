@@ -38,6 +38,7 @@ _EXEMPT: dict[str, str] = {
     "user_prompt_submit.min_score": "已废弃，运行时不读（改用 relevance.min_topical_score）",
     "user_prompt_submit.fulltext_threshold":
         "已废弃，运行时不读（改用 relevance.fulltext_topical_threshold）",
+    "runtimes.codex.enabled": "已废弃，运行时不读（2.0.0 移除 Codex 支持）",
 }
 
 

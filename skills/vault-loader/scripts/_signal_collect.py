@@ -95,11 +95,10 @@ def _split_comma_list(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-# 项目指令文件名，按优先级排列。**两个都要读**：Codex 用户的项目指令写在
-# AGENTS.md 里（本仓库这次新增的 AGENTS.md 就是这个事实的证明）。只读 CLAUDE.md 时，
-# README 承诺的四个逃生阀里 `<!-- vault-loader: dis‌able -->` 那一个在 Codex 上
-# **永远不生效**，信号 I 的 tags/extra_paths 同样恒空——而且没有任何提示，
-# 用户只会以为自己写错了注释语法。
+# 项目指令文件名，按优先级排列。**两个都要读**：用户项目可能把指令写在 AGENTS.md
+# 里（多种编码智能体共用的约定）。2.0.0 移除 Codex 支持后仍保留它——去掉的话，写在
+# AGENTS.md 里的 `<!-- vault-loader: dis‌able -->` 会静默失效，vault-loader 会在用户
+# 已停用的项目里恢复注入，而用户只会以为自己写错了注释语法。
 _PROJECT_INSTRUCTION_FILES = ("CLAUDE.md", "AGENTS.md")
 
 

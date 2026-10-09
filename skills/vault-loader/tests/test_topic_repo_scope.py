@@ -180,7 +180,7 @@ def test_git_as_file_is_treated_as_repo_root(tmp_path: Path) -> None:
 
 # --------------- 路径形态：不得漏接 runtime 命名空间 ---------------
 
-@pytest.mark.parametrize("runtime", ["claude", "codex"])
+@pytest.mark.parametrize("runtime", ["claude"])
 def test_path_carries_runtime_segment(tmp_path: Path, runtime: str) -> None:
     """`session_topics_path` 必须含 `_RUNTIME` 段。
 
@@ -385,10 +385,10 @@ def test_topics_and_injection_state_are_different_files(tmp_path: Path) -> None:
         "注入去重不得被顺手改成按项目根隔离"
 
 
-@pytest.mark.parametrize("runtime", ["legacy", "claude", "codex"])
+@pytest.mark.parametrize("runtime", ["legacy", "claude"])
 def test_topics_and_state_differ_when_cwd_is_repo_root(tmp_path: Path,
                                                        runtime: str) -> None:
-    """cwd **恰好是项目根**时两者也必须分属不同文件 —— 三个 runtime 都要验。
+    """cwd **恰好是项目根**时两者也必须分属不同文件 —— legacy 与 claude 两个命名空间都要验。
 
     变异验证补的两个缺口（2026-09-10）：
     ① 上一条用例拿子目录做断言，而 `_cwd_hash(sub) != _cwd_hash(repo)` 让路径

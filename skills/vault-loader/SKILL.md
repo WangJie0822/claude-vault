@@ -1,13 +1,13 @@
 ---
 name: vault-loader
-description: 自动从知识库按相关性注入 summary 清单到 Claude Code 或 Codex 会话上下文（零配置，安装即生效）。SessionStart 注入项目相关笔记 + 近期工作日志；UserPromptSubmit 按用户问题动态深入。禁用逃生阀：VAULT_LOADER_DISABLE=1、~/.context-vault/.disabled 或 config enabled:false。
+description: 自动从知识库按相关性注入 summary 清单到 Claude Code 会话上下文（零配置，安装即生效）。SessionStart 注入项目相关笔记 + 近期工作日志；UserPromptSubmit 按用户问题动态深入。禁用逃生阀：VAULT_LOADER_DISABLE=1、~/.context-vault/.disabled 或 config enabled:false。
 argument-hint: "[--doctor]"
 allowed-tools: Read, Bash(python3 *)
 ---
 
 # vault-loader：自动加载知识库
 
-vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Claude Code 或 Codex 会话上下文，让当前编码智能体启动时即可看到项目历史决策、近期工作进展。
+vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Claude Code 会话上下文，让 Claude Code 启动时即可看到项目历史决策、近期工作进展。
 
 ## 触发机制
 
@@ -56,7 +56,7 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 
 ## 安装（零配置）
 
-作为 `context-vault` 插件安装即生效：Claude Code 与 Codex 都从插件自带的 `hooks/hooks.json` 注册 SessionStart / UserPromptSubmit。hook 经同一个 polyglot wrapper 运行，root 优先取 `PLUGIN_ROOT`，其次兼容 `CLAUDE_PLUGIN_ROOT`，最后按 wrapper 自身位置解析。
+作为 `context-vault` 插件安装即生效：Claude Code 从插件自带的 `hooks/hooks.json` 注册 SessionStart / UserPromptSubmit。hook 经 polyglot wrapper 运行，root 取 `CLAUDE_PLUGIN_ROOT`，取不到时按 wrapper 自身位置解析。
 
 新装从 `~/.context-vault/config.json` 读取共享 `vault_path`，默认 `~/.context-vault/knowledge-vault`；公共配置不存在时继续兼容旧 `~/.claude/skills/vault-loader/config.json`，不会自动删除或覆盖旧数据。
 
@@ -87,8 +87,7 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 | `enabled` | `true` | 总开关；false 永久关停 |
 | `dry_run` | `false` | true 时**不真实注入**（`hookSpecificOutput` 字段缺失，不喂模型），仅输出标 `[DRY-RUN]` 的 `systemMessage`，用于灰度验证会注入什么 |
 | `vault_path` | `~/.context-vault/knowledge-vault` | Vault 路径 |
-| `runtimes.claude.enabled` | `true` | 在 Claude Code 端启停；不影响 Codex 端 |
-| `runtimes.codex.enabled` | `true` | 在 Codex 端启停；不影响 Claude Code 端 |
+| `runtimes.claude.enabled` | `true` | 启停 SessionStart 与 UserPromptSubmit 两个注入入口 |
 | `keyword_to_tags` | `{}` | cwd 关键词 → tag 映射 |
 | `opt_out_paths` | `["/tmp", "/private/tmp", <本机临时目录>]` | 路径前缀黑名单，命中即跳过 |
 | `verbose_on_skip` | `false` | 跳过时输出短提示 |
@@ -198,7 +197,7 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 
 <!-- config-table:end -->
 
-1.0 数据分别落 `~/.context-vault/metrics/claude/` 与 `~/.context-vault/metrics/codex/`；0.9.x legacy 才使用 `~/.claude/vault-loader-metrics/`。`--runtime all --purge` 会不可逆清空两端 canonical 数据（含人工标注）。
+1.0 起数据落 `~/.context-vault/metrics/claude/`；0.9.x legacy 使用 `~/.claude/vault-loader-metrics/`；2.0.0 之前还可能有 `~/.context-vault/metrics/codex/`（主要是被错判的 SessionStart 记录）。`--runtime all --purge` 会不可逆清空这三处（含人工标注）。
 
 想只清 near-miss 计数（比如从 0.9.0 升上来、存量计数按旧判据累加过）用 `--reset-counts`：它只删两份可再生的派生数据（`near_miss_counts.json` / `nudge_ts.json`），事件记录与人工标注一律不碰。**别为这个目的去跑 `--purge`**——那会把不可再生的标注一起删掉。
 

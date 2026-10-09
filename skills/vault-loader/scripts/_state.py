@@ -63,7 +63,8 @@ def configure_context(runtime: str, session_id: str = "") -> None:
 
     ⚠️ **注入去重的 state 按 cwd 隔离，不按 session。** 这是有意的：
 
-    - 隔离要解决的问题是「两个 runtime 互相踩踏」，runtime 一层就够了；
+    - 命名空间这一层（legacy / claude）区分的是迁移前后的两套布局（2.0.0 起宿主只剩
+      Claude Code，已没有两个 runtime 互相踩踏的问题），这一层就够了；
     - 再切一层 session 会让跨会话去重失效——同一批笔记每开一次新会话就被重新
       全文注入一遍，而这正是去重机制存在的理由（0.9.x 的行为就是按 cwd）；
     - 每会话一个目录还会单调增长，且没有任何清理路径。
@@ -81,7 +82,7 @@ def configure_context(runtime: str, session_id: str = "") -> None:
         # 去重集此后无人读取——现象与「去重没生效」完全一样，却查不到原因。
         # `_safe_component` 作为二次清洗保留：白名单日后扩容时不至于漏掉路径净化。
         _RUNTIME = (_safe_component(runtime, "legacy")
-                    if runtime in {"claude", "codex"} else "legacy")
+                    if runtime in {"claude"} else "legacy")
 
 
 def current_runtime() -> str:
@@ -102,7 +103,7 @@ def adopt_runtime(ns: str) -> None:
     与 `configure_context` 的唯一差别是**不查 `use_canonical_namespace()`**。这不是
     优化，是「单点」这句话得以成立的前提：`current_runtime()` 交出的是**输出域**的值
     （已生效的命名空间），而 `configure_context` 接受的是**输入域**的值（原始 runtime
-    id）。两个域的取值字符串重叠（`legacy`/`claude`/`codex`）、类型相同、语义不同，
+    id）。两个域的取值字符串重叠（`legacy`/`claude`）、类型相同、语义不同，
     把前者喂回后者是一次**有损往返** —— `claude` 是其中唯一的非不动点，而它恰好是
     绝大多数用户所在的那一档。父子之间 `use_canonical_namespace()` 一旦翻转
     （`has_legacy_data` 的三个探针里，`~/.claude/skills/summarize-session/config.json`
@@ -117,7 +118,7 @@ def adopt_runtime(ns: str) -> None:
     """
     global _RUNTIME
     _RUNTIME = (_safe_component(ns, "legacy")
-                if ns in {"claude", "codex"} else "legacy")
+                if ns in {"claude"} else "legacy")
 
 
 def _hash_path(p: Path) -> str:

@@ -7,11 +7,11 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash(date *), Bash(basename *), Ba
 
 # 会话总结与知识沉淀
 
-将当前对话中产生的有价值信息，结构化地沉淀到 Obsidian 知识库和项目规则文件中，确保 Claude Code 与 Codex 跨会话共享知识。
+将当前对话中产生的有价值信息，结构化地沉淀到 Obsidian 知识库和项目规则文件中，确保 Claude Code 跨会话共享知识。
 
 ## 脚本路径（重要）
 
-本 skill 的脚本随插件分发，安装后位于宿主给出的 skill 目录或版本钉死的插件 cache。优先根据当前加载的 `SKILL.md` 绝对路径取同级 `scripts/`；只有 Claude Code 的 Bash 环境无法取得该路径时，才使用下面的兼容定位器。它同时识别 Codex、新名称和旧 `claude-vault` cache：
+本 skill 的脚本随插件分发，安装后位于宿主给出的 skill 目录或版本钉死的插件 cache。优先根据当前加载的 `SKILL.md` 绝对路径取同级 `scripts/`；只有 Claude Code 的 Bash 环境无法取得该路径时，才使用下面的兼容定位器。它同时识别新名称 `context-vault` 与旧 `claude-vault` 的 cache：
 
 ```bash
 SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
@@ -19,11 +19,11 @@ SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2
 
 之后统一用 `python3 "$SS/<脚本名>.py"` 调用。
 
-- **不要假设 hook root 环境变量存在**：`PLUGIN_ROOT` / `CLAUDE_PLUGIN_ROOT` 只在 hook 入口可靠，skill shell 未必注入。
+- **不要假设 hook root 环境变量存在**：`CLAUDE_PLUGIN_ROOT` 只在 hook 入口可靠，skill shell 未必注入。
 - **禁用源目录形式**：旧文档把脚本写成 `~/.claude/` 下 `skills/<本 skill>` 的 `scripts/` 子路径——插件化后那里无脚本，跑必 No such file。
 - **`--plugin-dir` 本地开发模式**（不走 cache）：把 `SS` 直接指向你本地仓库的 `skills/summarize-session/scripts`。
-- **PowerShell/Codex**：不要原样执行 Bash 定位器；直接把 `$SS` 设为当前 skill 的绝对 `scripts` 目录。
-- **宿主参数**：当前在 Codex 时记为 `RUNTIME=codex`，Claude Code 时记为 `RUNTIME=claude`。调用 `scan_sessions.py` 必须传 `--runtime "$RUNTIME"`；调用 `enrich_keywords.py` 必须显式传 `--backend "$RUNTIME"`，未知宿主不得自动跨提供商回退。
+- **PowerShell**：不要原样执行 Bash 定位器；直接把 `$SS` 设为当前 skill 的绝对 `scripts` 目录。
+- **模型后端**：调用 `enrich_keywords.py` 必须显式传 `--backend claude`（`auto` 只在带 `CLAUDE_PLUGIN_ROOT` 的 hook 子进程里成立，Claude Code 的 Bash 工具与普通终端里都会拒绝执行）。`scan_sessions.py` 不需要宿主参数，2.0.0 起只扫描 Claude Code 会话。
 - **运行时数据**：1.0 新装统一放在 `~/.context-vault/`；旧 `~/.claude/skills/...` 配置继续兼容读取，迁移前不删除。
 
 ## 知识库路径解析
@@ -52,13 +52,13 @@ skill 需要知道 Obsidian Vault 的路径才能正确写入笔记。按以下�
 
 ### keywords backfill（可选，手动 opt-in）
 
-`scripts/enrich_keywords.py` 给存量笔记一次性补 `keywords`（供 vault-loader 召回）。每篇一次模型调用，须手动运行、不接自动管线，并必须显式传 `--backend claude|codex`；无法可靠识别宿主时会拒绝执行，不跨提供商回退。
+`scripts/enrich_keywords.py` 给存量笔记一次性补 `keywords`（供 vault-loader 召回）。每篇一次模型调用，须手动运行、不接自动管线，并必须显式传 `--backend claude`；不传时（`auto`）在 Claude Code 的 Bash 工具与普通终端里都会拒绝执行。
 
 - 先 `--dry-run` 看会处理哪些篇；`--limit N` 限制本次最多发起 N 次付费调用。
 - ⚠️ **成本告警**：大 vault 全量 backfill = 笔记数 × 一次 haiku 调用，先用 `--limit` 小批试。
 - 跑完会改笔记 frontmatter，**需再跑 `rebuild_index.py` 刷新 cache** 召回才生效（脚本结束会提示）。
 - 定位器（每个 Bash 块内联）：
-  Claude fallback 可用 `SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)`；随后执行 `python3 "$SS/enrich_keywords.py" --backend "$RUNTIME" --vault "$VAULT" --dry-run`。
+  Claude fallback 可用 `SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)`；随后执行 `python3 "$SS/enrich_keywords.py" --backend claude --vault "$VAULT" --dry-run`。
 
 ### 配置管理
 
@@ -194,7 +194,7 @@ python3 "$SS/obsidian_cli.py" --vault "$VAULT" <op> [...]
 ⚡ **并行执行**（同一消息中发出多个 tool calls）：
 - Read `~/.claude/skills/summarize-session/config.json`
 - `Bash: date "+%Y-%m-%d %H:%M"`
-- Claude Code：从当前 skill scripts 执行 `scan_sessions.py --runtime claude --timerange "$PWD"` 与 `--touched-repos "$PWD"`。Codex 当前会话 transcript 操作仍为 experimental，跳过这两项并明确提示用户，不得回退扫描 Claude 会话。
+- 从当前 skill scripts 执行 `scan_sessions.py --timerange "$PWD"` 与 `--touched-repos "$PWD"`。
 - `ToolSearch query="select:AskUserQuestion" max_results=1`（第三步确认环节需要；AskUserQuestion 是 deferred tool，若未预加载会导致直接调用失败。已经在直接工具列表时这步相当于 no-op）
 
 用 config 结果确定 `$VAULT` 和 `$LOG_DIR`。
@@ -530,10 +530,10 @@ summary: "2026-03-19 工作记录"
    - 每次 `--set` 返回 `cache_synced`：为 `false` 时该篇召回要等下次 rebuild 才生效，在第五步输出中如实提示，不要当作成功
    - 归集进来的 spec/plan 正常情况下不该出现在这里——它们的 keywords 由 `archive_doc` 从 pending-docs 条目透传（见「文档归集」）。若持续出现，说明写 pending-docs 时漏填了该字段
 6. 如果新建了笔记，检查是否需在 CLAUDE.md 或其他笔记中添加 `[[wikilink]]` 引用（无需文件夹路径）
-7. Claude Code 标记当前会话为已总结（避免 `--catch-up` 重复处理）；Codex 当前会话标记仍为 experimental，必须跳过并在结果中说明：
+7. 标记当前会话为已总结（避免 `--catch-up` 重复处理）：
    ```bash
    SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
-   python3 "$SS/scan_sessions.py" --runtime claude --mark-current "$PWD"
+   python3 "$SS/scan_sessions.py" --mark-current "$PWD"
    ```
 8. **提交知识库改动（git commit）**——默认开启，`--no-commit` 跳过：
    ```bash

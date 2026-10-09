@@ -250,7 +250,7 @@ def host_write_denied(detail: object) -> Diagnosis:
         code=CODE_HOST_WRITE_DENIED,
         level=LEVEL_DEGRADED,
         message=f"宿主拒绝写入，本轮已降级为只读：{safe_field(detail)}",
-        hint="若你在 Codex 的 workspace-write 沙箱、只读挂载，或该文件正被 Obsidian "
+        hint="若你在只读挂载或沙箱中运行，或该文件正被 Obsidian "
              "等程序占用，这是预期降级、召回不受影响，无需处理；"
              "若都不是，请检查 ~/.claude 与 ~/.context-vault 的目录权限。",
     )

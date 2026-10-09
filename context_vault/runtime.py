@@ -1,4 +1,11 @@
-"""Normalize Claude Code and Codex hook payloads without host-specific imports."""
+"""Normalize Claude Code hook payloads without host-specific imports.
+
+⚠️ 本文件同时是 7 处「插件根」判据的哨兵：vault-loader 的 `_state` / `_metrics` /
+`_config_loader`、两个 hook 入口、summarize-session 的 `enrich_keywords`、config
+skill 的 `config_inventory` 都用「`<插件根>/context_vault/runtime.py` 是否存在」判断
+自己是否跑在插件布局里。**不得删除或改名**：判据不成立时 `use_canonical_namespace()`
+恒为 False，全体用户被静默切回 0.9.x 的 legacy 布局。
+"""
 from __future__ import annotations
 
 import hashlib
@@ -10,38 +17,14 @@ from typing import Any, Mapping
 
 
 class RuntimeKind(str, Enum):
+    """宿主。2.0.0 起只支持 Claude Code。
+
+    保留枚举而不是改成裸字符串：`.value` 是 state / metrics / events 三处命名空间的
+    路径段，调用方一律取 `.value`。1.x 按 payload 的 `turn_id`/`model` 与环境变量
+    `PLUGIN_ROOT` 判出 CODEX，Claude Code 的 SessionStart 因此在部分模式下被错判、
+    记录落进 codex 命名空间——宿主固定后这条错判不复存在。
+    """
     CLAUDE = "claude"
-    CODEX = "codex"
-    UNKNOWN = "unknown"
-
-
-def detect_runtime(payload: Mapping[str, Any] | None = None,
-                   environ: Mapping[str, str] | None = None) -> RuntimeKind:
-    """Detect the host from stable payload fields first, environment second."""
-    data = {} if payload is None else payload
-    env = os.environ if environ is None else environ
-    if data.get("turn_id") or data.get("model"):
-        return RuntimeKind.CODEX
-    if data.get("prompt_id") or data.get("agent_type"):
-        return RuntimeKind.CLAUDE
-    if env.get("PLUGIN_ROOT"):
-        return RuntimeKind.CODEX
-    if env.get("CLAUDE_PLUGIN_ROOT"):
-        return RuntimeKind.CLAUDE
-    # 兜底：payload 形态可辨认（带 hook_event_name）却没有任何 Codex 特征。
-    #
-    # 依据是两端实测的 hook input schema：Codex 的 SessionStart 与 UserPromptSubmit
-    # 的 required 都含 `model`（UPS 另含 `turn_id`），所以 `model` 缺失 ⇒ 不是 Codex。
-    #
-    # 没有这一条会怎样（实测，Claude Code 2.1.220）：SessionStart 的 payload 只有
-    # cwd / hook_event_name / session_id / source / transcript_path —— 既无 `model`
-    # 也无 `prompt_id`；而 `CLAUDE_PLUGIN_ROOT` **不在 hook 子进程的环境里**（它只在
-    # hooks.json 的命令串里被插值展开）。于是 SessionStart 落 UNKNOWN、同一会话的
-    # UserPromptSubmit 靠 `prompt_id` 判 CLAUDE，两者命名空间分裂：SessionStart 写的
-    # 注入去重集 UPS 读不到，启动时注入过的笔记会在第一次提问时被再注入一遍。
-    if data.get("hook_event_name"):
-        return RuntimeKind.CLAUDE
-    return RuntimeKind.UNKNOWN
 
 
 def _text(value: Any) -> str:
@@ -59,32 +42,37 @@ class HookContext:
     prompt: str = ""
     transcript_path: Path | None = None
     prompt_id: str | None = None
-    turn_id: str | None = None
     source: str = ""
     actor: str = ""
 
+    @property
+    def metrics_event_id(self) -> str:
+        """写进 metrics 记录的事件 id：只有宿主给的稳定 id 才落盘。
+
+        不稳定 id 是 `sha256(runtime, event, session_id, source, prompt)` 的截断值，
+        材料含 prompt 原文且未加盐（见 `events.claim_event` 的 docstring），而 metrics
+        承诺 prompt 只存加盐 hash。两个入口都传本属性，调用点不含分支。
+        """
+        return self.event_id if self.stable_event_id else ""
+
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any], *,
-                     environ: Mapping[str, str] | None = None) -> "HookContext":
-        runtime = detect_runtime(payload, environ)
+    def from_payload(cls, payload: Mapping[str, Any]) -> "HookContext":
         event = _text(payload.get("hook_event_name"))
         cwd_raw = _text(payload.get("cwd")) or os.getcwd()
         session_id = _text(payload.get("session_id")) or "unknown"
         prompt_id = _text(payload.get("prompt_id")) or None
-        turn_id = _text(payload.get("turn_id")) or None
-        event_id = prompt_id or turn_id
+        event_id = prompt_id or ""
         stable_event_id = bool(event_id)
         if not event_id:
-            # Some host hook payloads do not expose an invocation ID. The
-            # fallback only groups near-simultaneous duplicate deliveries; it
-            # must never permanently suppress later prompts/compactions.
-            raw = "\0".join((runtime.value, event, session_id,
-                              _text(payload.get("source")),
-                              _text(payload.get("prompt"))))
+            # 宿主不下发 prompt_id（SessionStart 恒如此）时回落内容派生 id。它只用于
+            # 合并近乎同时的重复投递，绝不能永久压制后续的提问或压缩。
+            raw = "\0".join((RuntimeKind.CLAUDE.value, event, session_id,
+                             _text(payload.get("source")),
+                             _text(payload.get("prompt"))))
             event_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
         transcript = _text(payload.get("transcript_path"))
         return cls(
-            runtime=runtime,
+            runtime=RuntimeKind.CLAUDE,
             event=event,
             cwd=Path(cwd_raw),
             session_id=session_id,
@@ -93,7 +81,6 @@ class HookContext:
             prompt=_text(payload.get("prompt")),
             transcript_path=Path(transcript) if transcript else None,
             prompt_id=prompt_id,
-            turn_id=turn_id,
             source=_text(payload.get("source")),
             actor=_text(payload.get("agent_type")),
         )

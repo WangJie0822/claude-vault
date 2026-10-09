@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -16,6 +17,14 @@ import pytest
 _SCRIPTS = Path(__file__).resolve().parent / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
+
+
+def pytest_configure(config):
+    # 剥离继承来的全部 GIT_*（大小写不敏感），与其余三个 pytest 根一致。本根目前没有
+    # git 调用，这里是防御：git 派生的子进程带着 GIT_DIR 进来时，测试里的 git 会改写
+    # 真实仓库（2026-10-08 实证）。行为守卫见仓库根 tests/test_git_env_isolation.py。
+    for key in [k for k in os.environ if k.upper().startswith("GIT_")]:
+        del os.environ[key]
 
 
 @pytest.fixture(autouse=True)

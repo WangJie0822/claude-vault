@@ -1,10 +1,10 @@
 # CLAUDE.md
 
-This file is the resident project guidance for Claude Code and Codex; detailed rule bodies live in `.claude/rules/` (see 写入约定). `AGENTS.md` only points here and must not duplicate these rules.
+This file is the resident project guidance for Claude Code; detailed rule bodies live in `.claude/rules/` (see 写入约定).
 
 ## 写入约定（改本文件前先读）
 
-本文件是 Claude Code 与 Codex 共用的常驻指令源，只写：架构与数据契约、每条硬约束的一行祈使句（带正文指针）、测试命令、本约定。
+本文件是 Claude Code 的常驻指令源，只写：架构与数据契约、每条硬约束的一行祈使句（带正文指针）、测试命令、本约定。
 
 - **规则正文写入仓库根下 `.claude/rules/` 的对应文件**（见下表）。本文件只在「硬约束索引」对应分组（分发与发布类在「分发边界（重要）」节）加一行：`- <祈使句>。改 <源文件> 前先 Read .claude/rules/<rules 文件>.md`，同组末行已有统一指针时可省略本行指针。正文写理由、反例、实证经过（写明测量条件与版本）、历史订正；否定性决策（「刻意不做」「勿…」「不要…」）的结论句留在本文件。
 - 子系统 → 正文文件（与 `.claude/rules/` 目录一一对应，由 `tests/test_claude_md_layout.py` 守卫）：
@@ -36,7 +36,7 @@ This file is the resident project guidance for Claude Code and Codex; detailed r
 
 ## 项目概述
 
-`context-vault`（仓库目录历史名 `claude-vault`）是一个跨平台（macOS / Linux / Windows）、同时支持 Claude Code 与 Codex 的插件，把四个 skill 与一组 hook 打包成「知识库沉淀—召回」闭环（其中三个构成闭环本体，第四个 `config` 是运维入口）。面向中文笔记工作流调优。
+`context-vault`（仓库目录历史名 `claude-vault`）是一个跨平台（macOS / Linux / Windows）、面向 Claude Code 的插件（2.0.0 起不再支持 Codex），把四个 skill 与一组 hook 打包成「知识库沉淀—召回」闭环（其中三个构成闭环本体，第四个 `config` 是运维入口）。面向中文笔记工作流调优。
 
 ## 架构大图
 
@@ -58,12 +58,12 @@ Read 到匹配文件时 rules 会自动注入；上下文里已出现该 rules �
 
 ### Hook 管线与 runtime
 
-- `hooks/hooks.json` 是 Claude Code/Codex 共用的薄声明，两端都由 `hooks/run-hook.cmd` 路由；plugin root 优先级固定为 `PLUGIN_ROOT` → `CLAUDE_PLUGIN_ROOT` → wrapper 相对路径。
-- Codex 的 `commandWindows` 只做前缀归一化，不做择根；任何一步取不到就打印一行诊断并 `exit 0`。Windows 守卫必须执行声明中的完整命令，并覆盖三种 root 形态；不要把整条声明再塞进 `powershell -Command`。
+- `hooks/hooks.json` 是 Claude Code 的薄声明，由 `hooks/run-hook.cmd` 路由；候选根固定为 `CLAUDE_PLUGIN_ROOT` → wrapper 相对路径，`PLUGIN_ROOT` 不是候选（2.0.0 起）。
+- 守卫必须按 Claude Code 的方式执行声明中的完整 `command`（插值 `${CLAUDE_PLUGIN_ROOT}` 后交给 bash；Windows 上必须是 Git Bash，不能用 PATH 上的 WSL 启动器），核对 stdin 到达脚本，并覆盖「有该变量」「没有该变量」两种形态。没装 Git Bash 的 Windows 改由 PowerShell 执行，当前命令串在那里解析失败，守卫不覆盖。
 - **所有 hook fail-open**：顶层 `try/except` 兜底 `exit 0`，任何 hook 都不得阻断会话。
 - `run-hook.cmd` 是 polyglot（同一文件既是 batch 又是 POSIX sh），两种解释器都要能解析，保持 LF 行尾；wrapper 按 `py` → `python3` → `python` 探测，找不到即静默 `exit 0`。
-- 宿主识别以 payload 为先，只带 `hook_event_name` 时判 Claude；事件 marker 用 `O_EXCL`。state 与 metrics 按 runtime 隔离，注入去重按 cwd，不按 session 切。
-- runtime 命名空间是进程级全局：新起的子进程、同一进程里的另一个 hook 入口，都必须各自配置；`_state` 与 `_metrics` 是两个独立全局。子进程用 `current_runtime()` 交出、`adopt_runtime()` 接收，走 argv 不走 stdin；`{claude, codex}` 白名单与 `_safe_component` 清洗必须原样保留。SessionStart 入口里不要把 `_metrics` 的 import 提到与 `_state.configure_context()` 并列（UPS 入口有 `_MetricsStub` 兜底，可以并列）。
+- 宿主恒为 Claude（2.0.0 起没有宿主识别）；入口只对带 `hook_event_name` 的 payload 做事件去重，事件 marker 用 `O_EXCL`。state 与 metrics 按命名空间（legacy / claude）隔离，注入去重按 cwd，不按 session 切。
+- runtime 命名空间是进程级全局：新起的子进程、同一进程里的另一个 hook 入口，都必须各自配置；`_state` 与 `_metrics` 是两个独立全局。子进程用 `current_runtime()` 交出、`adopt_runtime()` 接收，走 argv 不走 stdin；`{claude}` 白名单与 `_safe_component` 清洗必须原样保留（只剩一个取值也不得当死代码删掉）。SessionStart 入口里不要把 `_metrics` 的 import 提到与 `_state.configure_context()` 并列（UPS 入口有 `_MetricsStub` 兜底，可以并列）。
 - `has_legacy_data()` 会被本类缺陷的副作用自举翻转：没有 committed 迁移标记的机器上，补配 `configure_context` 式的修复会静默空转。
 - 「宿主拒绝写入」不得永久静默：判据单点 `context_vault/degrade.py::is_host_write_denied`，命中即登记 `degraded` 诊断、由 `take_user_visible` 冷却后说一次；`_metrics` 的 prune 失败刻意不升级为诊断。
 - 改 `hooks/`、`context_vault/`、`_state.py`、`_metrics.py`、`_topic.py`、`_diagnostics.py` 或两个入口脚本前先 Read `.claude/rules/hooks-runtime.md`。
@@ -98,6 +98,7 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 
 ### 测试
 
+- 测试不得继承 `GIT_*`：四个 pytest 根的 conftest 在 `pytest_configure` 剥离（大小写不敏感），由 git 派生的子进程（如 `rebase -x`）里跑测试也要先剥离。
 - 测试不得写真实 HOME：vault-loader 与 config 两个根由 conftest 的 autouse fixture 无条件隔离；`tests/` 与 summarize-session 根没有该 fixture，需在用例内 monkeypatch HOME 与 `USERPROFILE`（Windows 上 `Path.home()` 取后者）。
 - 判定性能回归或「有无回归」须 median-of-N 加 A/B 交替，不靠单次 pass/fail；把失败归为「环境性」必须逐条拿到该条自己的报错原文；修法不是让用例跳过，而是显式声明测哪个平台分支。
 - 变异不转红先查方法（结果解析、用例是否绕过被测层、对照组形态），再做阳性对照；变异转红也要核对原因（不合法的变异会以 `NameError` 假转红）；手工构造被测对象的用例，要补一条从真实产出喂入的端到端用例；容量类守卫要锁绝对下界。
@@ -105,10 +106,10 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 
 ## 分发边界（重要）
 
-并非所有目录都随插件分发。**git 跟踪 = 分发源**：`.claude-plugin/`、`.codex-plugin/`、`context_vault/`、`hooks/`、`skills/`、`commands/`、`scripts/`、`tests/`、`images/`、`docs/MIGRATION.md`、README、AGENTS.md（仅指向 CLAUDE.md）、CLAUDE.md、`.claude/rules/*.md`（规则正文，仅一层）、CHANGELOG.md、VERSION。Codex 对外发布物还必须经受跟踪的 `scripts/build_codex_artifact.py` 生成标准 marketplace staging，不能直接把仓库根当 marketplace 安装（那会把 `.git` 和忽略的本机文件复制进 cache）。
+并非所有目录都随插件分发。**git 跟踪 = 分发源**：`.claude-plugin/`、`context_vault/`、`hooks/`、`skills/`、`commands/`、`scripts/`、`tests/`、`images/`、`docs/MIGRATION.md`、README、CLAUDE.md、`.claude/rules/*.md`（规则正文，仅一层）、CHANGELOG.md、VERSION。
 
 **本地开发工具 / 设计文档，被 `.gitignore` 排除、不分发**：
-- `packaging/` —— 作者私有发布工具：`build_plugin.py`（脱敏闸门，见 `.claude/rules/distribution.md`）、`import_assets.py`（从 `~/.claude` 源 allowlist 同步资产到插件目录）。公开 Codex staging 构建器是受跟踪的 `scripts/build_codex_artifact.py`，不能放在本目录。
+- `packaging/` —— 作者私有发布工具：`build_plugin.py`（脱敏闸门，见 `.claude/rules/distribution.md`）、`import_assets.py`（从 `~/.claude` 源 allowlist 同步资产到插件目录）。
 - `docs/superpowers/` —— spec / plan 设计文档（含私人引用，不能随 clone 泄露）。
 - `.superpowers/` —— subagent-driven 开发的 task 简报。
 - `.claude/`（`.claude/rules/*.md` 除外）—— git worktree 的物理目录（`EnterWorktree` 默认落这里）。里面是**另一份完整工作树**，误 `git add .claude/` 会把整个仓库副本连同其 `.full-review/`、`.superpowers/` 一起提交进来。
@@ -122,7 +123,7 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 
 **推送策略（强制）**：私有开发远端承载完整开发历史、接受全部 ref；**公开仓库与内网镜像只接受发布分支 `master` 与 tag**。由 `.git/hooks/pre-push` 守卫，两道判据——ref 名 + 谱系（`git merge-base origin/master <sha>` 失败即属 `dev` 谱系）。后者是实质防线：把 `dev` 改名成 `master` 推送同样拦得住。守卫 **fail-closed**（与 hook 的 fail-open 相反）：`origin/master` 缺失即拒绝，绕过需 `--no-verify`。源副本在 `packaging/hooks/pre-push`（不分发，换机需重装）。
 
-**发布流程（重要）**：对外发布为每版一笔 squash 提交——master 是独立谱系，该提交的树等于待发布那一版 dev 提交的树（重做已打 tag 的版本时钉死该版原有的树，不取当前 dev），父提交是原 master tip，另打注解标签 `v<版本>`。禁止把 `dev` 或其任何衍生分支推向公开或内网远端：脱敏闸门只扫工作树、不扫 git 历史。发布时同步 bump 四处版本号：`VERSION`、`.claude-plugin/plugin.json`、`.codex-plugin/plugin.json`、`.claude-plugin/marketplace.json` 的自身条目（守卫 `tests/test_plugin_version_sync.py`）；别靠记忆数这几个文件，跑门禁（`packaging/run_gates.py`，仅作者主检出）。
+**发布流程（重要）**：对外发布为每版一笔 squash 提交——master 是独立谱系，该提交的树等于待发布那一版 dev 提交的树（重做已打 tag 的版本时钉死该版原有的树，不取当前 dev），父提交是原 master tip，另打注解标签 `v<版本>`。禁止把 `dev` 或其任何衍生分支推向公开或内网远端：脱敏闸门只扫工作树、不扫 git 历史。发布时同步 bump 三处版本号：`VERSION`、`.claude-plugin/plugin.json`、`.claude-plugin/marketplace.json` 的自身条目（守卫 `tests/test_plugin_version_sync.py`）；别靠记忆数这几个文件，跑门禁（`packaging/run_gates.py`，仅作者主检出）。
 
 ## 开发与测试
 
@@ -157,4 +158,4 @@ python -m pytest packaging/
 - vault-loader 对 Vault 只读；summarize-session 是唯一写入方（且只追加/新建，不删除已有笔记）。
 - git 跟踪文件中不写 Obsidian `[[...]]` wikilink（vault 是个人知识库层、不随仓库分发）。
 - 文档以中文为主；但分发内容必须通过 `build_plugin.py` 脱敏扫描（零私人标识）。
-- 分发的 SKILL.md / references 必须优先按当前加载的 `SKILL.md` 绝对路径定位同级 scripts；仅 Claude Bash 无法取得该路径时允许搜索 `~/.claude/plugins/cache/`，同时识别 `context-vault` 与旧 `claude-vault`。不得跨到 `~/.codex` 取脚本，也不得使用 `~/.claude/skills/.../scripts/` 源目录形式。skill shell 不得假设注入 `PLUGIN_ROOT`/`CLAUDE_PLUGIN_ROOT`；PowerShell/Codex 必须使用当前 skill 的绝对 scripts 路径。
+- 分发的 SKILL.md / references 必须优先按当前加载的 `SKILL.md` 绝对路径定位同级 scripts；仅 Claude Bash 无法取得该路径时允许搜索 `~/.claude/plugins/cache/`，同时识别 `context-vault` 与旧 `claude-vault`。不得跨到 `~/.codex` 取脚本（那里只可能是停止更新的 1.x 副本），也不得使用 `~/.claude/skills/.../scripts/` 源目录形式。skill shell 不得假设注入 `CLAUDE_PLUGIN_ROOT`；PowerShell 必须使用当前 skill 的绝对 scripts 路径。

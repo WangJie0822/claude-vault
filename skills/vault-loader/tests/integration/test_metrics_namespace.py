@@ -14,9 +14,8 @@
 而 `analyze_metrics` 在 canonical 下读 `~/.context-vault/metrics/<runtime>/`
 （该 channel 计数恒为 0），全程零报错。2026-09-16 实证并修复。
 
-⚠️ payload **必须带 `hook_event_name`**：没有它 `detect_runtime` 落 UNKNOWN、
-`configure_context("unknown")` 按设计回落 legacy，于是修复前后都写 legacy，
-本文件全部用例失去判别力（会绿着放过原缺陷）。
+⚠️ 2.0.0 起宿主恒为 Claude，payload 不再影响命名空间。payload 仍带 `hook_event_name`
+是为了与真实入参同形——缺它时入口不做事件去重，走的是另一条分支。
 """
 from __future__ import annotations
 
@@ -43,11 +42,8 @@ def _run(script: Path, payload: dict) -> subprocess.CompletedProcess:
     # 不设则继承跑测试的那个会话 —— 在 `claude -p` 下跑测试时入口会静默早退，
     # 用例变成「什么都没发生也绿」。
     env["CLAUDE_CODE_ENTRYPOINT"] = "cli"
-    # 同理必须剥掉这两个：SessionStart 的 payload 不含 turn_id/model/prompt_id/
-    # agent_type，`detect_runtime` 会一路走到环境变量分支，`PLUGIN_ROOT` 一旦存在
-    # 就判成 **codex**，记录落进 `.context-vault/metrics/codex/`。那是 false-red
-    # （不会放过真缺陷），但断言消息会斩钉截铁地报「入口漏调 configure_context」
-    # 这个错误根因，排查成本很高。
+    # 剥掉两个 root 变量：2.0.0 起它们不再影响命名空间，剥离只是为了让用例不依赖
+    # 跑测试那台机器的环境。
     env.pop("PLUGIN_ROOT", None)
     env.pop("CLAUDE_PLUGIN_ROOT", None)
     return subprocess.run(

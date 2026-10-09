@@ -12,6 +12,9 @@ from .atomic import atomic_write_json, lease_lock
 from .paths import context_home
 
 _MARKER_RETENTION_SECONDS = 90 * 86400
+# 2.0.0 起只支持 Claude Code。`runtime` 会被拼进 marker 目录，这里自己校验，
+# 不依赖调用方传对：放行任意字符串等于一个任意路径写原语。
+_ALLOWED_RUNTIMES = frozenset({"claude"})
 
 
 def _event_salt(home: Path | None = None) -> bytes:
@@ -62,7 +65,7 @@ def claim_event(runtime: str, event_name: str, session_id: str,
     should silently exit.
 
     ⚠️ **`stable=False` 时 `event_id` 是内容派生的**：`HookContext` 在宿主不下发
-    `prompt_id`/`turn_id` 时回落成 `sha256(runtime, event, session_id, source,
+    `prompt_id` 时回落成 `sha256(runtime, event, session_id, source,
     prompt)` 的截断值——材料里含 **prompt 原文**，且**未加盐**。marker 保留 90 天，
     且不受 metrics 的 opt-in 约束。材料中除 prompt 外全部本地可得（session_id 就以
     明文目录名存在于 state 路径里），足以做离线确认攻击（「用户是否问过 X」）——
@@ -72,6 +75,8 @@ def claim_event(runtime: str, event_name: str, session_id: str,
     去重只认 `id`），`id` 本身用本机盐参与摘要。此前的 docstring 写着
     "Markers intentionally contain no prompt or cwd"，那句话对这条分支不成立。
     """
+    if runtime not in _ALLOWED_RUNTIMES:
+        raise ValueError(f"unsupported runtime namespace: {runtime!r}")
     if not event_id:
         return True
     material = "\0".join((runtime, event_name, session_id, event_id, scope))

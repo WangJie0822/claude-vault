@@ -2,6 +2,51 @@
 
 本文件记录 Context Vault（原 claude-vault）的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.0.0] - 2026-10-08
+
+### 破坏性变更
+
+- **不再支持 Codex。** 删除 Codex 插件清单、Codex 发布构建器、Codex 会话扫描与 Codex 模型后端；
+  v1.4.2 是最后支持 Codex 的版本。已在 Codex 中安装 1.x 的用户执行
+  `codex plugin remove context-vault@<marketplace>` 卸载（marketplace 名用 `codex plugin list` 查）。
+  Codex 继续用 1.4.2 的用户，清理任何数据前先读 `docs/MIGRATION.md` 的 2.0.0 一节。
+- `runtimes.codex.enabled` 失效（`/config` 清单标为已废弃，`config_set` 拒绝写入）。
+- `analyze_metrics.py --runtime codex`、`enrich_keywords.py --backend codex`、
+  `scan_sessions.py --codex-dir`、doctor 的 `--runtime codex` 移除。`scan_sessions.py --runtime claude`
+  仍被接受（隐藏参数），旧版 SKILL.md 与新版脚本组合时不会报错。
+
+### 行为变更（升级前请读）
+
+- 1.x 在部分 Claude Code 版本上把 SessionStart 误判为 Codex（见「修复」）。这类会话升级后：
+  - SessionStart 与 UserPromptSubmit 共用注入去重集，首轮提问不再重复注入会话开头的项目笔记；
+  - `runtimes.claude.enabled=false` 能关掉 SessionStart；
+  - 旧插件 `claude-vault` 仍启用时，SessionStart 会提示「已暂停」并停止注入；
+  - 诊断提示的冷却在两个入口之间共享。
+
+  1.x 已正确识别的会话，这几条行为不变。
+- 所有会话：SessionStart 不再把工作日志记入注入去重集（会话开头只给链接），提问时相关工作日志
+  可能再以摘要形式注入一次。
+- 此前用 `runtimes.codex.enabled=false` 关掉 SessionStart 的用户，升级后 SessionStart 注入会恢复，
+  请改用 `session_start.enabled`。
+- 2.0.0 之前落在 `metrics/codex/` 的 SessionStart 记录不再出现在报表里。报表里的去重计数会变化：
+  误判会话的项目笔记进入去重集使它增加，工作日志不再计入使它减少。
+- `analyze_metrics.py --runtime all`（或 canonical 配置存在时的 `auto`）会一并处理退役的
+  `~/.context-vault/metrics/codex/`：`--purge` 整目录删除（含 `.salt`，链接与 junction 不跟随），
+  `--reset-counts` 只删其中两份计数文件。Codex 里还在用 1.4.2 时不要这样做，见 `docs/MIGRATION.md`。
+- hook wrapper 不再采信 `PLUGIN_ROOT`，候选根只剩 `CLAUDE_PLUGIN_ROOT` 与 wrapper 自身位置：环境里把
+  `PLUGIN_ROOT` 指向另一份本插件（例如本地开发副本）的用户，升级后执行的是 Claude Code 加载的那份。
+- doctor 的 JSON 输出删除 `manifests.codex` 与 `environment.PLUGIN_ROOT`；旧插件共存检测不再读
+  `~/.codex/config.toml`。
+
+### 修复
+
+- SessionStart 在部分 Claude Code 会话中被误记到 Codex 命名空间，导致它写的注入去重集
+  UserPromptSubmit 读不到、`runtimes.claude.enabled` 关不掉它、metrics 落错目录。
+
+### 内部
+
+- 新增跟踪树敏感内容扫描守卫（接替被删除的 Codex 构建器里的扫描）；泄漏守卫论域扩到全部受跟踪 Markdown。
+
 ## [1.4.2] - 2026-09-30
 
 1.4.1 没有单独发布，下方 [1.4.1] 的变更随本版一并发布。

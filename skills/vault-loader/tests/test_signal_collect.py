@@ -638,12 +638,11 @@ def test_global_cn_token_re_untouched_guard() -> None:
     assert _CN_TOKEN_RE.pattern == r"[一-鿿]{3,}"
 
 
-def test_signal_i_reads_agents_md_for_codex(tmp_path):
-    """项目指令文件也可能是 AGENTS.md（Codex 的约定）。
+def test_signal_i_still_reads_agents_md(tmp_path):
+    """用户项目的指令文件也可能是 AGENTS.md（多种编码智能体共用的约定）。
 
-    只读 CLAUDE.md 时，README 承诺的四个逃生阀里「项目注释 disable」那一个在
-    Codex 上永远不生效，信号 I 的 tags/extra_paths 同样恒空——且毫无提示，
-    用户只会以为自己写错了注释语法。
+    2.0.0 移除 Codex 支持后仍须读它：只读 CLAUDE.md 时，写在 AGENTS.md 里的
+    「项目注释 disable」会静默失效，vault-loader 在用户已停用的项目里恢复注入。
     """
     from scripts._signal_collect import collect_signal_i_project_claude_md
 

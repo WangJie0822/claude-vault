@@ -21,6 +21,7 @@ paths:
 - **变异转红也要核对原因**：连 import 一起改掉的变异会以 `NameError` 转红，不合法；以得到预期的 `AssertionError` 为准。
 - **替身要有接口覆盖守卫**：`_MetricsStub` 必须覆盖被调用的全部接口（`test_metrics_stub_covers_all_called_interfaces`，一写出来就抓到漏掉的 `nudge_due` / `mark_nudged`）。
 - **手工构造被测对象的用例，都要补一条从真实产出喂入的端到端用例**（实例见 `metrics.md` 「`src` 字段实测恒为空」）。
+- **测试不得继承 `GIT_*`**：四个 pytest 根的 conftest 在 `pytest_configure` 里剥离全部 `GIT_*`，匹配大小写不敏感（Windows 上环境变量名不分大小写）。实证（2026-10-08，2.0.0 验证）：`git rebase -x "<跑测试>"` 的 exec 子进程环境里有 `GIT_DIR=<worktree gitdir>`、`GIT_EDITOR`、`GIT_EXEC_PATH`、`GIT_PREFIX`、`GIT_SEQUENCE_EDITOR`；`tmp_git_repo` 等在临时目录执行的 `git init` / `git config` / `git commit` 遵从 `GIT_DIR`，结果把提交、分支、`core.bare=true`、`core.hookspath`、`user.*` 写进了共享 `.git/config`。被改写的 `core.hooksPath` 会让 pre-push 推送守卫静默失效。行为守卫是 `tests/test_git_env_isolation.py`：用子进程注入 `GIT_DIR`，断言受害仓库的 config 与 ref 不变。conftest 管不到的调用方（自写的 runner、`rebase -x` 的 exec 命令）同样要先剥离。疑似发生过时，核验命令是 `git config --local --show-origin --get-regexp "core\.(bare|hookspath)|user\."` 加上 `git worktree list`。
 
 现状订正（「## 迁移原文」里以现在时写的两处已失效）：summarize-session 在 Windows 上已没有「环境性失败」，obsidian_cli 那批用例已按平台分支改写；`test_perf.py` 的判据已是 median of 7 加一次预热，不再是「3 次 spawn 取最差值」。
 

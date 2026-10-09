@@ -1,28 +1,19 @@
-"""Detect an enabled legacy plugin before the renamed plugin takes ownership."""
+"""Detect an enabled legacy plugin before the renamed plugin takes ownership.
+
+2.0.0 起只检查 Claude Code 的 settings；1.x 另读 `~/.codex/config.toml` 的那一半已随
+Codex 支持一并移除（连同为 Python < 3.11 准备的 tomllib 降级解析）。
+"""
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import NamedTuple
-
-try:
-    import tomllib
-except ModuleNotFoundError:          # Python < 3.11
-    # 不能让它成为硬依赖：wrapper 探到的解释器可能是 3.10 及以下（macOS Xcode CLT
-    # 的 python3 是 3.9、Ubuntu 20.04 是 3.8）。硬 import 会让整个模块加载失败，
-    # 连带把事件去重、共存检测、runtime 命名空间三项一起静默停用。
-    tomllib = None                   # type: ignore[assignment]
 
 LEGACY_PLUGIN_NAME = "claude-vault"
 # 祖先遍历的深度上限。不设上限时，任意一个共享上层目录（工作区根、甚至盘符根）
 # 里的 `.claude/settings.json` 会影响其下**全部**项目；配合下面「读不出不再让路」，
 # 影响面被限制在可解释的范围内。
 _MAX_PARENTS = 8
-
-# tomllib 缺席时的降级判据：只认 `[plugins."<name>@<market>"]` 段内的 `enabled = true`。
-_TOML_SECTION_RE = re.compile(r'^\s*\[plugins\."([^"\]]+)"\]\s*$', re.M)
-_TOML_ENABLED_RE = re.compile(r'^\s*enabled\s*=\s*true\s*$', re.M)
 
 
 class CoexistCheck(NamedTuple):
@@ -78,56 +69,13 @@ def _claude_legacy_enabled(home: Path, cwd: Path | None = None) -> CoexistCheck:
     return CoexistCheck(False, "")
 
 
-def _codex_enabled_from_text(text: str) -> bool:
-    """tomllib 缺席时的降级解析：段名匹配旧插件且段内出现 `enabled = true`。"""
-    for match in _TOML_SECTION_RE.finditer(text):
-        if match.group(1).split("@", 1)[0] != LEGACY_PLUGIN_NAME:
-            continue
-        nxt = _TOML_SECTION_RE.search(text, match.end())
-        body = text[match.end():nxt.start() if nxt else len(text)]
-        if _TOML_ENABLED_RE.search(body):
-            return True
-    return False
-
-
-def _codex_legacy_enabled(home: Path) -> CoexistCheck:
-    path = home / ".codex" / "config.toml"
-    if not path.is_file():
-        return CoexistCheck(False, "")
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except OSError:
-        return CoexistCheck(False, f"无法读取 {path}，已跳过")
-    if tomllib is None:
-        return CoexistCheck(_codex_enabled_from_text(text), "")
-    try:
-        data = tomllib.loads(text)
-    except (ValueError, tomllib.TOMLDecodeError):
-        # 与 Claude 侧同一口径：解析失败只跳过并说明，不冒充「检测到启用」。
-        return CoexistCheck(_codex_enabled_from_text(text),
-                            f"{path} 解析失败，已按文本形态降级判断")
-    plugins = data.get("plugins") if isinstance(data, dict) else None
-    if not isinstance(plugins, dict):
-        return CoexistCheck(False, "")
-    hit = any(
-        isinstance(key, str) and key.split("@", 1)[0] == LEGACY_PLUGIN_NAME
-        and isinstance(value, dict) and value.get("enabled") is True
-        for key, value in plugins.items()
-    )
-    return CoexistCheck(hit, "")
-
-
-def check_legacy_plugin(runtime: str, *, home: Path | None = None,
+def check_legacy_plugin(*, home: Path | None = None,
                         cwd: Path | None = None) -> CoexistCheck:
-    base = home or Path.home()
-    if runtime == "claude":
-        return _claude_legacy_enabled(base, cwd)
-    if runtime == "codex":
-        return _codex_legacy_enabled(base)
-    return CoexistCheck(False, "")
+    return _claude_legacy_enabled(home or Path.home(), cwd)
 
 
-def legacy_plugin_enabled(runtime: str, *, home: Path | None = None,
+def legacy_plugin_enabled(*, home: Path | None = None,
                           cwd: Path | None = None) -> bool:
-    """向后兼容的布尔入口（旧调用点与既有用例仍在用）。"""
-    return check_legacy_plugin(runtime, home=home, cwd=cwd).yield_ownership
+    """布尔便捷入口（doctor 与既有用例在用）。与 `check_legacy_plugin` 一样只收关键字
+    参数：1.x 按位置传 runtime 的调用会 TypeError。"""
+    return check_legacy_plugin(home=home, cwd=cwd).yield_ownership

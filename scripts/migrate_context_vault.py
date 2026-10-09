@@ -106,7 +106,7 @@ def _build_config(home: Path, report: dict) -> dict:
     config.pop("_comment", None)
     config["_config_version"] = 2
     config["vault_path"] = selected
-    config["runtimes"] = {"claude": {"enabled": True}, "codex": {"enabled": True}}
+    config["runtimes"] = {"claude": {"enabled": True}}
     return config
 
 

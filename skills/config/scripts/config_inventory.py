@@ -48,6 +48,9 @@ DEPRECATED: dict[str, str] = {
     "user_prompt_submit.min_score": "已废弃，运行时不读；改用 `relevance.min_topical_score`",
     "user_prompt_submit.fulltext_threshold":
         "已废弃，运行时不读；改用 `relevance.fulltext_topical_threshold`",
+    "runtimes.codex.enabled":
+        "已失效（2.0.0 移除 Codex 支持），运行时不读；若曾用它关掉启动注入，改用 "
+        "`session_start.enabled`",
 }
 
 # 控制「多少篇笔记被发往外部模型端点」的旋钮。类型都是普通 int，类型校验对它们

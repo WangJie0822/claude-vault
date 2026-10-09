@@ -1,6 +1,9 @@
 # tests/test_wrapper.py
 import os, shutil, subprocess, sys, tempfile
 from pathlib import Path
+
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 
 WRAPPER = ROOT / "hooks/run-hook.cmd"
@@ -78,55 +81,88 @@ def test_real_script_runs_stdout_passes(tmp_path):
         assert b"HELLO_FROM_HOOK" in r_sh.stdout, f"sh stdout: {r_sh.stdout!r}"
 
 
-def test_plugin_root_takes_precedence(tmp_path):
-    """两个候选根都含该脚本时，PLUGIN_ROOT 优先。"""
-    codex_root = tmp_path / "codex"
+def test_plugin_root_is_never_a_candidate(tmp_path):
+    """2.0.0 起 PLUGIN_ROOT 不是候选根：它是任何工具都可能导出的通用变量名，而 2.0.0 起
+    没有受支持的宿主会为本插件设置它。即使那里有同名脚本也不得执行。"""
+    stale_root = tmp_path / "stale"
     claude_root = tmp_path / "claude"
-    codex_root.mkdir()
+    stale_root.mkdir()
     claude_root.mkdir()
-    (codex_root / "probe.py").write_text("print('CODEX_ROOT')\n", encoding="utf-8")
+    (stale_root / "probe.py").write_text("print('STALE_ROOT')\n", encoding="utf-8")
     (claude_root / "probe.py").write_text("print('CLAUDE_ROOT')\n", encoding="utf-8")
-    env = {**os.environ, "PLUGIN_ROOT": str(codex_root),
+    env = {**os.environ, "PLUGIN_ROOT": str(stale_root),
            "CLAUDE_PLUGIN_ROOT": str(claude_root)}
     if os.name == "nt":
         result = _run_cmd(["probe.py"], env)
         assert result.returncode == 0
-        assert b"CODEX_ROOT" in result.stdout
-        assert b"CLAUDE_ROOT" not in result.stdout
+        assert b"CLAUDE_ROOT" in result.stdout
+        assert b"STALE_ROOT" not in result.stdout
     result_sh = _run_sh(["probe.py"], env)
     if result_sh is not None:
         assert result_sh.returncode == 0
-        assert b"CODEX_ROOT" in result_sh.stdout
-        assert b"CLAUDE_ROOT" not in result_sh.stdout
+        assert b"CLAUDE_ROOT" in result_sh.stdout
+        assert b"STALE_ROOT" not in result_sh.stdout
 
 
-def test_unrelated_plugin_root_falls_back_instead_of_dying_silently(tmp_path):
-    """`PLUGIN_ROOT` 指向不含该脚本的目录时必须回落，而不是静默失效。
-
-    `PLUGIN_ROOT` 是个极通用的变量名：任何第三方工具或 shell profile 导出它，都会
-    顶掉宿主自己给的 `CLAUDE_PLUGIN_ROOT`。旧写法「取第一个非空变量」选中它之后
-    **不再回落**，脚本找不到即 exit 0 —— 零输出、零告警，整个插件对该用户彻底不
-    工作，且与「这轮本来就没有相关笔记」完全不可区分。
-
-    上一条用例只覆盖「两个根里都有脚本」，恰好绕过这个危险分支。
-    """
-    unrelated = tmp_path / "unrelated"      # 别的工具导出的 PLUGIN_ROOT
-    claude_root = tmp_path / "claude"
-    unrelated.mkdir()
-    claude_root.mkdir()
-    (claude_root / "probe.py").write_text("print('CLAUDE_ROOT')\n", encoding="utf-8")
-    env = {**os.environ, "PLUGIN_ROOT": str(unrelated),
-           "CLAUDE_PLUGIN_ROOT": str(claude_root)}
+def test_plugin_root_alone_is_ignored(tmp_path):
+    """只有 PLUGIN_ROOT 指向含该脚本的目录时同样不执行；回落后找不到就在 stderr 出声。"""
+    stale_root = tmp_path / "stale"
+    stale_root.mkdir()
+    (stale_root / "probe_only_here.py").write_text("print('STALE_ROOT')\n", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    env["PLUGIN_ROOT"] = str(stale_root)
     if os.name == "nt":
-        result = _run_cmd(["probe.py"], env)
+        result = _run_cmd(["probe_only_here.py"], env)
         assert result.returncode == 0
-        assert b"CLAUDE_ROOT" in result.stdout, \
-            f"未回落到 CLAUDE_PLUGIN_ROOT，插件静默失效：stdout={result.stdout!r}"
-    result_sh = _run_sh(["probe.py"], env)
+        assert b"STALE_ROOT" not in result.stdout
+        assert b"hook script not found" in result.stderr
+    result_sh = _run_sh(["probe_only_here.py"], env)
     if result_sh is not None:
         assert result_sh.returncode == 0
-        assert b"CLAUDE_ROOT" in result_sh.stdout, \
-            f"未回落到 CLAUDE_PLUGIN_ROOT，插件静默失效：stdout={result_sh.stdout!r}"
+        assert b"STALE_ROOT" not in result_sh.stdout
+        assert b"hook script not found" in result_sh.stderr
+
+
+def _copied_plugin(base: Path) -> Path:
+    """拷一份 wrapper 到临时插件根，探针脚本只放在这个插件根里。"""
+    (base / "hooks").mkdir(parents=True)
+    shutil.copy2(WRAPPER, base / "hooks" / "run-hook.cmd")
+    (base / "probe.py").write_text("print('SELF_ROOT_RAN')\n", encoding="utf-8")
+    return base / "hooks" / "run-hook.cmd"
+
+
+def _stale_claude_root_env(tmp_path: Path) -> dict:
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    env = {k: v for k, v in os.environ.items()
+           if k.upper() not in ("PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT")}
+    env["CLAUDE_PLUGIN_ROOT"] = str(stale)
+    return env
+
+
+# full-review P3A-M2：`CLAUDE_PLUGIN_ROOT` 非空却不含该脚本时，必须回落到 wrapper 自身所在的
+# 插件根。择根规则是「取第一个含有该脚本的候选根」，不是「取第一个非空变量」；按后者写，
+# 脚本找不到即 exit 0——零输出、零告警，整个插件对该用户不工作，且与「这轮本来就没有
+# 相关笔记」不可区分。上面几条用例的 CLAUDE_PLUGIN_ROOT 要么含脚本、要么不存在，都走不到
+# 这个回落分支。
+@pytest.mark.skipif(os.name != "nt", reason="batch 段只在 Windows 上经 cmd.exe 执行")
+def test_stale_claude_plugin_root_falls_back_to_wrapper_dir_batch(tmp_path):
+    wrapper = _copied_plugin(tmp_path / "plugin")
+    r = subprocess.run([str(wrapper), "probe.py"], capture_output=True,
+                       env=_stale_claude_root_env(tmp_path), timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert b"SELF_ROOT_RAN" in r.stdout, f"未回落到 wrapper 所在插件根：stderr={r.stderr!r}"
+
+
+def test_stale_claude_plugin_root_falls_back_to_wrapper_dir_sh(tmp_path):
+    sh = shutil.which("sh")
+    if sh is None:
+        pytest.skip("没有 sh")
+    wrapper = _copied_plugin(tmp_path / "plugin")
+    r = subprocess.run([sh, str(wrapper), "probe.py"], capture_output=True,
+                       env=_stale_claude_root_env(tmp_path), timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert b"SELF_ROOT_RAN" in r.stdout, f"未回落到 wrapper 所在插件根：stderr={r.stderr!r}"
 
 
 def test_missing_script_is_reported_on_stderr(tmp_path):

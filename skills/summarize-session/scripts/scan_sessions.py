@@ -48,7 +48,6 @@ def _cwd_to_project_name(cwd: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", p)
 
 DEFAULT_CLAUDE_DIR = os.path.expanduser("~/.claude")
-DEFAULT_CODEX_DIR = os.path.expanduser("~/.codex")
 DEFAULT_MANIFEST = os.path.expanduser(
     "~/.claude/skills/summarize-session/summarized-sessions.json"
 )
@@ -211,49 +210,6 @@ def find_session_files(claude_dir: str, days: int, project_filter: str = None) -
     return sessions
 
 
-def find_codex_session_files(codex_dir: str, days: int,
-                             project_filter: str = None) -> list:
-    """Best-effort Codex session listing (experimental).
-
-    Codex documents transcript_path as convenient but unstable. Keep all
-    private-format knowledge in this adapter and fail closed on unknown shapes.
-    """
-    sessions_root = Path(codex_dir) / "sessions"
-    if not sessions_root.is_dir():
-        return []
-    cutoff = time.time() - days * 86400
-    found = []
-    for path in sessions_root.rglob("rollout-*.jsonl"):
-        try:
-            stat = path.stat()
-            if stat.st_mtime < cutoff:
-                continue
-            with path.open(encoding="utf-8", errors="replace") as handle:
-                first = handle.readline()
-            obj = json.loads(first)
-            if obj.get("type") != "session_meta" or not isinstance(obj.get("payload"), dict):
-                continue
-            payload = obj["payload"]
-            session_id = payload.get("id") or payload.get("session_id")
-            cwd = payload.get("cwd", "")
-            if not isinstance(session_id, str) or not isinstance(cwd, str):
-                continue
-            if project_filter and project_filter.lower() not in cwd.lower():
-                continue
-            found.append({
-                "session_id": session_id,
-                "project": Path(cwd).name or cwd,
-                "file_path": str(path),
-                "mtime": stat.st_mtime,
-                "size": stat.st_size,
-                "runtime": "codex",
-            })
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-    found.sort(key=lambda item: item["mtime"], reverse=True)
-    return found
-
-
 def extract_text(content) -> str:
     """从消息 content 中提取纯文本。"""
     if isinstance(content, str):
@@ -275,13 +231,9 @@ def extract_text(content) -> str:
 
 
 # 宿主注入的合成消息前缀/标记。它们的 role 也是 "user"，但不是人写的。
-#
-# Codex 把 AGENTS.md 整份注入成一条 `role: user` 的 `input_text`——本机 63 个真实
-# rollout 实测 **30 条（47.6%）** 的首条用户消息就是它。不排除的话，`--catch-up`
-# 里近一半会话的主题会显示成「# AGENTS.md instructions for ...」这种无意义前言。
+# （1.x 另有 Codex 的 AGENTS.md 注入前缀，2.0.0 随 Codex 支持一并移除。）
 _INJECTED_INTENT_PREFIXES = (
     "<command-message>init",
-    "# AGENTS.md instructions for",
     "# CLAUDE.md instructions for",
 )
 _INJECTED_INTENT_MARKERS = ("<INSTRUCTIONS>", "<user_instructions>", "<system-reminder>")
@@ -560,70 +512,6 @@ def parse_session(file_path: str, max_chars: int = 4000) -> dict:
     }
 
 
-def parse_codex_session(file_path: str, max_chars: int = 4000) -> dict:
-    """Parse the currently observed Codex rollout shape, or return an error."""
-    messages = []
-    cwd = ""
-    session_date = ""
-    try:
-        with open(file_path, encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not session_date and isinstance(obj.get("timestamp"), str):
-                    # 与 Claude 侧走同一套归一（`parse_session` 同名字段）。
-                    # 直接存原始串会让**同一个键**在两个 runtime 下是两种格式：
-                    # Codex 给 `2026-08-29T05:56:15.399Z`、Claude 给
-                    # `2026-08-28 06:02`，下游按后者解析必然失败。
-                    # 解析失败时回落原串——宁可格式不一致，也不能丢掉日期。
-                    try:
-                        session_date = datetime.fromisoformat(
-                            obj["timestamp"]).strftime("%Y-%m-%d %H:%M")
-                    except (ValueError, TypeError):
-                        session_date = obj["timestamp"]
-                payload = obj.get("payload")
-                if obj.get("type") == "session_meta" and isinstance(payload, dict):
-                    value = payload.get("cwd")
-                    cwd = value if isinstance(value, str) else cwd
-                    continue
-                if obj.get("type") != "response_item" or not isinstance(payload, dict):
-                    continue
-                if payload.get("type") != "message" or payload.get("role") not in {"user", "assistant"}:
-                    continue
-                texts = []
-                for item in payload.get("content", []):
-                    if not isinstance(item, dict) or item.get("type") not in {"input_text", "output_text"}:
-                        continue
-                    value = item.get("text")
-                    if isinstance(value, str) and value.strip():
-                        texts.append(value.strip())
-                text = "\n".join(texts)
-                if len(text) > 3:
-                    messages.append({"role": payload["role"], "text": text[:800]})
-    except OSError as exc:
-        return {"error": str(exc), "messages": [], "total_messages": 0, "cwd": cwd}
-    total = 0
-    truncated = []
-    for message in messages:
-        remaining = max_chars - total
-        if remaining <= 50:
-            break
-        text = message["text"][:remaining]
-        truncated.append({"role": message["role"], "text": text})
-        total += len(text)
-    return {
-        "messages": truncated,
-        "total_messages": len(messages),
-        "cwd": cwd,
-        "first_intent": extract_first_user_intent(messages),
-        "date": session_date,
-        "timerange": _extract_timerange(file_path),
-        "experimental": True,
-    }
-
-
 def get_current_session_id(claude_dir: str, cwd: str) -> str | None:
     """获取当前项目目录下最新的会话 ID。"""
     # 跨平台 cwd 编码（POSIX `/Users/...`、Windows `C:\\...`、Git Bash `/c/...` 全兼容）
@@ -681,17 +569,17 @@ def format_project_name(raw: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="扫描未总结的 Claude Code / Codex 会话")
-    parser.add_argument("--runtime", choices=("claude", "codex"), default="claude",
-                        help="会话来源；Codex transcript 适配当前为 experimental")
+    parser = argparse.ArgumentParser(description="扫描未总结的 Claude Code 会话")
+    # 隐藏的空操作：plugin cache 里多版本并存、定位器只取最高版本的脚本，旧版 SKILL.md
+    # 仍会传 `--runtime claude`。直接删除会让那种组合报 unrecognized arguments 退出 2。
+    parser.add_argument("--runtime", choices=("claude",), default="claude",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--days", type=int, default=7, help="回溯天数（默认 7）")
     parser.add_argument("--project", type=str, help="按项目目录名过滤")
     parser.add_argument("--manifest", type=str,
                         help="已总结会话清单路径")
     parser.add_argument("--claude-dir", type=str, default=DEFAULT_CLAUDE_DIR,
                         help="Claude 配置目录")
-    parser.add_argument("--codex-dir", type=str, default=DEFAULT_CODEX_DIR,
-                        help="Codex 配置目录（experimental）")
     parser.add_argument("--parse", action="store_true",
                         help="解析对话内容（默认只列出）")
     parser.add_argument("--session", type=str, nargs="+",
@@ -713,14 +601,6 @@ def main():
 
     args = parser.parse_args()
 
-    if args.runtime == "codex" and (
-        args.mark or args.mark_current or args.timerange or args.touched_repos
-    ):
-        print(json.dumps({
-            "error": "Codex 当前只支持 catch-up 扫描/解析；标记和当前会话操作仍为 experimental",
-        }, ensure_ascii=False))
-        sys.exit(2)
-
     if args.manifest is None:
         # 判据用「迁移是否已提交」而不是「canonical config 是否存在」：
         # `--set-default <path>` 只写配置、不搬数据，用后者当判据会让改一下默认库
@@ -731,11 +611,7 @@ def main():
             canonical_ns = use_canonical_namespace()
         except ImportError:
             canonical_ns = False        # 拿不到就保守走 legacy，绝不切走既有数据
-        args.manifest = (
-            DEFAULT_CONTEXT_MANIFEST
-            if args.runtime == "codex" or canonical_ns
-            else DEFAULT_MANIFEST
-        )
+        args.manifest = DEFAULT_CONTEXT_MANIFEST if canonical_ns else DEFAULT_MANIFEST
 
     # 标记模式
     if args.mark:
@@ -830,10 +706,10 @@ def main():
 
     # 扫描模式
     manifest = load_manifest(args.manifest, args.runtime)
-    finder = (lambda days, project=None: find_codex_session_files(
-        args.codex_dir, days, project)) if args.runtime == "codex" else (
-        lambda days, project=None: find_session_files(args.claude_dir, days, project))
-    parser_fn = parse_codex_session if args.runtime == "codex" else parse_session
+    def finder(days, project=None):
+        return find_session_files(args.claude_dir, days, project)
+
+    parser_fn = parse_session
 
     # 如果指定了 session ID，直接解析
     if args.session:
@@ -868,7 +744,6 @@ def main():
 
     result = {
         "runtime": args.runtime,
-        "experimental": args.runtime == "codex",
         "scan_range_days": args.days,
         "total_sessions_in_range": len(sessions),
         "already_summarized": len([s for s in sessions if s["session_id"] in manifest]),

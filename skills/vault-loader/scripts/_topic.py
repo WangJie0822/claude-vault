@@ -539,9 +539,11 @@ def parse_pin_and_words(raw, pool_size: int, pin_max: int) -> tuple[list[int], l
 def _call_model(prompt_text: str) -> str | None:
     """同步调模型。**只在子进程里跑**，父进程永远不碰它。
 
-    刻意不复用 context_vault.model.call_claude：那个是同步语义没错，但它走
-    choose_backend，而后者在 hook 环境抛 ValueError（PLUGIN_ROOT/CLAUDE_PLUGIN_ROOT
-    不在 hook 子进程 env）。这里直接固定 argv。
+    刻意不复用 context_vault.model.call_claude（两者 argv 同形，差别在别处）：
+    - 这里传 `creationflags=_no_window_flags()`：detached 提炼子进程在 Windows 上不得弹控制台；
+    - 兜底 `except Exception`：子进程内任何失败都只返回 None；
+    - 只依赖同级模块，不把 `context_vault` 包引入提炼子进程的导入面。
+    合并两份实现时，以上三点都不能丢。
     """
     exe = shutil.which("claude")
     if exe is None:

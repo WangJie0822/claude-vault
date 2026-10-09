@@ -708,9 +708,11 @@ def main() -> int:
         from context_vault.runtime import HookContext
         hook_context = HookContext.from_payload(hook_input)
         legacy_enabled, coexist_note = check_legacy_plugin(
-            hook_context.runtime.value, home=home, cwd=hook_context.cwd
+            home=home, cwd=hook_context.cwd
         )
-        should_claim = hook_context.runtime.value in {"claude", "codex"}
+        # 缺 `hook_event_name` 的畸形 payload 不去重：去重依赖宿主给的事件名，没有它
+        # 时按「每次都是新事件」处理（与 1.x 把它判成 UNKNOWN 时的行为一致）。
+        should_claim = bool(hook_context.event)
     except Exception as exc:
         hook_context = None
         print(f"[vault-loader] runtime 识别失败，使用 legacy state：{exc}", file=sys.stderr)
@@ -738,7 +740,8 @@ def main() -> int:
         try:
             from scripts._state import configure_context
             configure_context(hook_context.runtime.value, hook_context.session_id)
-            _metrics.configure_context(hook_context.runtime.value, hook_context.event_id)
+            _metrics.configure_context(hook_context.runtime.value,
+                                       hook_context.metrics_event_id)
         except Exception as exc:
             print(f"[vault-loader] runtime namespace 配置失败：{exc}", file=sys.stderr)
     if not config.get("enabled", True):

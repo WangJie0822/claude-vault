@@ -162,3 +162,9 @@ def test_write_is_verified_by_reading_back(_isolate_home, monkeypatch):
     res = cs.set_key("relevance.min_topical_score", "9",
                      home=_isolate_home, assume_yes=True)
     assert not res["ok"] and "核验" in res["error"]
+
+
+def test_retired_codex_switch_cannot_be_written(_isolate_home):
+    res = cs.set_key("runtimes.codex.enabled", "false", home=_isolate_home, assume_yes=True)
+    assert res["ok"] is False
+    assert "已废弃" in res["error"]

@@ -10,7 +10,7 @@
 
 ```bash
 SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
-python3 "$SS/scan_sessions.py" --runtime "$RUNTIME" --days $DAYS
+python3 "$SS/scan_sessions.py" --days $DAYS
 ```
 
 脚本输出 JSON，包含：
@@ -50,7 +50,7 @@ python3 "$SS/scan_sessions.py" --runtime "$RUNTIME" --days $DAYS
 1. 调用脚本解析完整对话：
    ```bash
    SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
-   python3 "$SS/scan_sessions.py" --runtime "$RUNTIME" --parse --session <uuid>
+   python3 "$SS/scan_sessions.py" --parse --session <uuid>
    ```
 
 2. 分析解析出的对话内容，识别：
@@ -104,7 +104,7 @@ python3 "$SS/scan_sessions.py" --runtime "$RUNTIME" --days $DAYS
 2. 标记已处理的会话为"已总结"：
    ```bash
    SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
-   python3 "$SS/scan_sessions.py" --runtime claude --mark <uuid1> <uuid2> ...
+   python3 "$SS/scan_sessions.py" --mark <uuid1> <uuid2> ...
    ```
 3. 重建索引
 4. 输出确认报告
@@ -120,7 +120,7 @@ python3 "$SS/scan_sessions.py" --runtime "$RUNTIME" --days $DAYS
 
 ## 已总结会话清单
 
-1.0 清单文件：`~/.context-vault/sessions/summarized-sessions.json`；legacy 文件只兼容读取。Codex 当前仅支持 experimental catch-up 扫描/解析，不执行 `--mark`。
+1.0 清单文件：`~/.context-vault/sessions/summarized-sessions.json`；legacy 文件只兼容读取。
 
 ```json
 {

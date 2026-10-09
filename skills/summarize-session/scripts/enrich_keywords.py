@@ -29,7 +29,7 @@ _LOOKS_LIKE_PLUGIN_ROOT = (_PLUGIN_ROOT / "context_vault" / "runtime.py").is_fil
 if _LOOKS_LIKE_PLUGIN_ROOT and str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from context_vault.model import call_claude, call_codex, choose_backend
+from context_vault.model import call_claude, choose_backend
 
 # sanitize / frontmatter 写入的权威实现在 _keywords.py——归集（archive_doc）与
 # 流程补全（keywords_gap）共用同一口径。此处导入同时起 re-export 作用，保持
@@ -46,14 +46,6 @@ def _call_claude(content: str) -> str | None:
         "只输出 JSON：{\"keywords\": [...]}。笔记：\n"
     )
     return call_claude(prompt + content, timeout=_TIMEOUT, model="haiku")
-
-
-def _call_codex(content: str) -> str | None:
-    prompt = (
-        "为下面这篇笔记生成 3-8 个中文/英文检索扩展词（同义词、别名、跨语言术语），"
-        "只输出符合 schema 的 JSON。笔记：\n"
-    )
-    return call_codex(prompt + content, timeout=_TIMEOUT)
 
 
 def _extract_json(text) -> str | None:
@@ -107,8 +99,9 @@ def main(argv=None) -> int:
     ap.add_argument("--vault", required=True)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--backend", choices=("auto", "claude", "codex"), default="auto",
-                    help="模型后端；auto 跟随当前插件运行时，不跨提供商回退")
+    ap.add_argument("--backend", choices=("auto", "claude"), default="auto",
+                    help="模型后端；auto 只在带 CLAUDE_PLUGIN_ROOT 的 hook 子进程里成立，"
+                         "手动运行（含 Claude Code 的 Bash 工具）请显式传 claude")
     args = ap.parse_args(argv)
 
     vault = Path(args.vault).expanduser().resolve()
@@ -117,9 +110,9 @@ def main(argv=None) -> int:
         return 1
 
     # backend 在循环**外**解析一次。两个理由：
-    # 1. `choose_backend("auto")` 在两个 PLUGIN_ROOT 变量都不存在时抛 ValueError，而
+    # 1. `choose_backend("auto")` 在环境里没有 `CLAUDE_PLUGIN_ROOT` 时抛 ValueError，而
     #    本脚本按设计就是「付费、手动 opt-in、不接自动管线」的 CLI——正常从普通终端跑，
-    #    两个变量都不会有。放在循环里意味着用户看到的是一条裸 traceback（且已经先
+    #    环境里没有这个变量。放在循环里意味着用户看到的是一条裸 traceback（且已经先
     #    `processed += 1` 了），而不是可操作的提示。`--dry-run` 提前 continue，
     #    所以这个坑只在真跑时触发，更隐蔽。
     # 2. 每篇重复调用没有意义。
@@ -152,7 +145,7 @@ def main(argv=None) -> int:
             processed += 1
             continue
         processed += 1
-        out = _call_codex(text) if backend == "codex" else _call_claude(text)
+        out = _call_claude(text)
         if out is None:
             print(f"跳过（{backend} 失败/缺失）: {note.relative_to(vault)}", file=sys.stderr)
             continue

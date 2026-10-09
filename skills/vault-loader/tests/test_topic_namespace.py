@@ -159,6 +159,7 @@ def test_adopt_runtime_does_not_re_derive(tmp_home: Path) -> None:
 
 @pytest.mark.parametrize("hostile", [
     "../../PWNED", r"..\..\PWNED", "", "unknown", "CLAUDE", "claude/../x", None, 3,
+    "codex",
 ])
 def test_adopt_runtime_keeps_the_whitelist(hostile) -> None:
     """白名单不可省：`_RUNTIME` 会被拼进 state 路径。

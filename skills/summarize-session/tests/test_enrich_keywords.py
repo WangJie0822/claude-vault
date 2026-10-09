@@ -1,5 +1,8 @@
 from pathlib import Path
 import sys
+
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -89,31 +92,42 @@ def test_main_limit_counts_attempted_calls(tmp_path, monkeypatch):
         calls["n"] += 1
         return None  # 模拟 claude 失败
     monkeypatch.setattr(E, "_call_claude", _fail)
-    # `--backend` 必须显式传：本脚本按设计从普通终端手动跑，两个 PLUGIN_ROOT 变量
-    # 都不会有，`auto` 无从推断（SKILL.md 也已要求流程内显式传 `--backend "$RUNTIME"`）。
+    # `--backend` 必须显式传：本脚本按设计从普通终端手动跑，环境里没有
+    # `CLAUDE_PLUGIN_ROOT`，`auto` 无从推断（SKILL.md 也已要求显式传 `--backend claude`）。
     rc = E.main(["--vault", str(vault), "--limit", "2", "--backend", "claude"])
     assert rc == 0
     assert calls["n"] == 2   # 即便全失败，也不超过 limit 次付费调用
 
 
-def test_auto_backend_outside_hook_fails_cleanly(tmp_path, capsys):
+def test_auto_backend_outside_hook_fails_cleanly(tmp_path, capsys, monkeypatch):
     """`--backend auto` 在 hook 之外必须给可操作提示，而不是裸 traceback。
 
-    `choose_backend("auto")` 在两个 PLUGIN_ROOT 变量都不存在时抛 ValueError，而这个
-    脚本正是「手动 opt-in、不接自动管线」的 CLI ⇒ 默认参数下必然走到。旧实现把它放在
-    循环里，用户看到的是 traceback，且已经先 `processed += 1`；`--dry-run` 提前
-    continue 又让这个坑只在真跑时才现，更隐蔽。
+    2.0.0 补充：auto 在 hook 外仍须**拒绝**，不得直接发起付费调用（`--limit` 默认不限量）。
+    两个出口都桩成绊线：一旦被调用，用例立即失败，而不是真的拉起 `claude -p`。
     """
-    import os
     vault = tmp_path / "v"
     vault.mkdir()
     (vault / "n.md").write_text("---\ntags: [t]\n---\n# x\n", encoding="utf-8")
     for var in ("PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
-        os.environ.pop(var, None)
+        monkeypatch.delenv(var, raising=False)
+
+    def _tripwire(*args, **kwargs):
+        raise AssertionError("hook 外的 auto 不得发起模型调用")
+
+    monkeypatch.setattr(E, "_call_claude", _tripwire)
+    monkeypatch.setattr(E, "call_claude", _tripwire)
 
     rc = E.main(["--vault", str(vault)])
     assert rc == 2, "应返回可辨识的退出码而不是抛异常"
     assert "backend" in capsys.readouterr().err.lower()
+
+
+def test_backend_codex_is_rejected_by_cli(tmp_path):
+    vault = tmp_path / "v"
+    vault.mkdir()
+    with pytest.raises(SystemExit) as exc:
+        E.main(["--vault", str(vault), "--backend", "codex"])
+    assert exc.value.code == 2
 
 
 def test_extract_json_handles_nested():

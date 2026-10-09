@@ -10,6 +10,18 @@ from typing import Callable
 import pytest
 
 
+def pytest_configure(config):
+    """剥离继承来的全部 `GIT_*`（大小写不敏感）。
+
+    `git rebase -x` 等由 git 派生的子进程会带着 `GIT_DIR` 进来，`tmp_git_repo` 里的
+    `git init` / `git config` 遵从它，就会改写真实仓库（2026-10-08 实证，含
+    `core.bare=true` 与让推送守卫失效的 `core.hooksPath`）。守卫见仓库根
+    `tests/test_git_env_isolation.py`。
+    """
+    for key in [k for k in os.environ if k.upper().startswith("GIT_")]:
+        del os.environ[key]
+
+
 @pytest.fixture(autouse=True)
 def _isolate_home(tmp_path_factory, monkeypatch):
     """**无条件**把 HOME/USERPROFILE 指向临时目录 —— 测试永远不该写真实主目录。

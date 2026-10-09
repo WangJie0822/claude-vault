@@ -1,14 +1,14 @@
 {
   "name": "context-vault-marketplace",
-  "description": "Self-marketplace for Context Vault — local knowledge capture and recall for Claude Code and Codex.",
+  "description": "Self-marketplace for Context Vault — local knowledge capture and recall for Claude Code.",
   "owner": {
     "name": "context-vault contributors"
   },
   "plugins": [
     {
       "name": "context-vault",
-      "description": "Capture and recall a local knowledge vault from Claude Code and Codex.",
-      "version": "1.4.2",
+      "description": "Capture and recall a local knowledge vault from Claude Code.",
+      "version": "2.0.0",
       "source": "./"
     }
   ]

@@ -1,6 +1,6 @@
 # Context Vault
 
-同时面向 Claude Code 与 Codex 的本地「知识库沉淀—召回」闭环插件。仓库名可暂时保留 `claude-vault`，插件 ID 从 1.0.0 起为 `context-vault`。三个 skill 协同构成闭环（另有第四个 `config` 作为运维入口，用来查看与修改本插件的配置项）：
+面向 Claude Code 的本地「知识库沉淀—召回」闭环插件（2.0.0 起不再支持 Codex，v1.4.2 是最后支持 Codex 的版本，需要时可从该 tag 自行构建）。仓库名可暂时保留 `claude-vault`，插件 ID 从 1.0.0 起为 `context-vault`。三个 skill 协同构成闭环（另有第四个 `config` 作为运维入口，用来查看与修改本插件的配置项）：
 
 | Skill | 作用 |
 |---|---|
@@ -8,7 +8,7 @@
 | **summarize-session** | 会话结束时把对话沉淀为结构化笔记、工作日志和 CLAUDE.md 更新，写入你的知识库。 |
 | **vault** | 手动检索：会话中需要调取特定笔记时，按关键词、分类或标签搜索。 |
 
-闭环：`summarize-session` 写入 → `vault-loader` 读取并注入 → 当前编码智能体启动时已带好相关上下文。两端共享 Vault 与配置，session state/metrics 按 runtime 隔离。
+闭环：`summarize-session` 写入 → `vault-loader` 读取并注入 → Claude Code 启动时已带好相关上下文。
 
 ---
 
@@ -23,26 +23,11 @@
 
 安装后 hook **自动生效**——插件自带的 `hooks/hooks.json` 会被 Claude Code 自动加载注册（SessionStart / UserPromptSubmit），**无需手动编辑 `~/.claude/settings.json`**。若要临时停用，见下方「停用逃生阀」。
 
-## 安装 Codex
-
-发布物采用标准 Codex marketplace 目录：`.agents/plugins/marketplace.json` + `plugins/context-vault/`。开发仓库先构建脱敏 staging，避免把 `.git`、本机设计稿和运行时文件一起装入 cache：
-
-```powershell
-python scripts/build_codex_artifact.py --output <空目录>
-codex plugin marketplace add <空目录>
-codex plugin add context-vault@context-vault-local
-```
-
-安装后 Codex 中的完整 skill 名为 `context-vault:vault`、
-`context-vault:summarize-session` 与 `context-vault:vault-loader`；Claude Code
-继续使用 `/vault`、`/summarize-session`。开发中的脏工作树只允许本地验证时附加
-`--allow-dirty`，正式发布必须从 clean、已提交的 tree 构建。
-
-Codex 与 Claude Code 共用 `hooks/hooks.json`。wrapper 优先识别 Codex 的 `PLUGIN_ROOT`，并兼容 Claude Code 的 `CLAUDE_PLUGIN_ROOT`。当前 Codex catch-up transcript 解析标记为 experimental；未知 rollout 形态会拒绝解析。
+> 2.x 不支持 Codex，请不要在 Codex 中安装。已在 Codex 中装过 1.x 的用户，先用 `codex plugin list` 找到 `context-vault@<marketplace>`（按 1.x README 安装的是 `context-vault@context-vault-local`），再执行 `codex plugin remove context-vault@<marketplace>`；还要继续在 Codex 里用 1.4.2 的，先读 `docs/MIGRATION.md` 的 2.0.0 一节再清理任何数据。
 
 ## 公共数据与兼容
 
-1.0 新装使用 `~/.context-vault/`：共享配置和知识库，state/metrics 按 `claude`、`codex` 隔离（**注入去重按项目目录，跨会话保持**）。旧 `~/.claude/skills/...` 与 metrics 继续兼容读取——**0.9.x 用户即使从未显式配过 `vault_path`，升级后读的仍是原来的 `~/.claude/knowledge-vault`**，不会被改指到新目录。
+1.0 新装使用 `~/.context-vault/`：共享配置和知识库，state/metrics 落在 `claude` 命名空间（**注入去重按项目目录，跨会话保持**）。旧 `~/.claude/skills/...` 与 metrics 继续兼容读取——**0.9.x 用户即使从未显式配过 `vault_path`，升级后读的仍是原来的 `~/.claude/knowledge-vault`**，不会被改指到新目录。
 
 > **升级后你会看到一个新目录**：hook 的事件去重 marker 无条件写入 `~/.context-vault/state/events/`，
 > 与是否迁移、是否开启 metrics 都无关。它只存事件摘要（不含 prompt、不含 cwd、不含笔记路径），
@@ -53,7 +38,7 @@ Codex 与 Claude Code 共用 `hooks/hooks.json`。wrapper 优先识别 Codex 的
 ```bash
 python scripts/migrate_context_vault.py
 python scripts/migrate_context_vault.py --apply
-python scripts/context_vault_doctor.py --runtime codex
+python scripts/context_vault_doctor.py
 ```
 
 ---
@@ -187,7 +172,7 @@ vault-loader 内置一套**可选**的效果评估机制：记录每轮召回的
 3. **记录什么**——prompt 关键词的**加盐 hash**（非明文；盐存在同目录下的 `.salt`，本机静态、启动时自动生成）、被召回笔记的**命中词明文**、笔记相对路径、打分与闸门决策。开着 `relevance.session_topic` 时另有：会话主题词的**加盐 hash**（同盐）、LLM 点名篇的相对路径（明文，与其它笔记路径同一口径）、首轮候选池篇数。**不记录 prompt 原文**。
 
    > ⚠️ **`.salt` 的保护是平台相关的，Windows 上没有强制手段。** POSIX 使用 `0600`；Windows 由 `~/.context-vault` 继承 ACL，可用 `icacls "$env:USERPROFILE\.context-vault\metrics"` 检查。介意时不要启用 metrics。
-4. **存在哪 + 体积**——1.0 分别写入 `~/.context-vault/metrics/claude/` 与 `~/.context-vault/metrics/codex/`；0.9.x legacy 数据仍在 `~/.claude/vault-loader-metrics/`。事件按月分桶；辅助文件一直保留到手动 `--purge`。
+4. **存在哪 + 体积**——1.0 起写入 `~/.context-vault/metrics/claude/`（2.0.0 之前的版本还可能留下 `~/.context-vault/metrics/codex/`，见 `docs/MIGRATION.md`）；0.9.x legacy 数据仍在 `~/.claude/vault-loader-metrics/`。事件按月分桶；辅助文件一直保留到手动 `--purge`。
 
    **体积**（2026-08-26 在作者本机 1058 条真实记录上重测，取代此前「3.7~5.9 KB / 90 天 11~16 MB」那组数——它低估了约 1.5 倍）：
 
@@ -205,14 +190,12 @@ vault-loader 内置一套**可选**的效果评估机制：记录每轮召回的
 5. **怎么清 + 残留告知**——报表与清空：
 
    ```bash
-   # VL = 当前已加载 skill 的 scripts 目录。两端的插件 cache 根不同，都试一遍取最新版：
-   # Claude Code 在 ~/.claude/plugins/cache，Codex 在 ~/.codex/plugins/cache。
-   # 分别取各自最新版而不是把两棵树混在一起排序——`sort -V` 排的是整条路径，
-   # 混排时 .codex 恒排在 .claude 之后，`tail -1` 会取到版本更低的那一个。
+   # VL = 当前已加载 skill 的 scripts 目录（Claude Code 插件 cache 里取最新版）：
    VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
-   [ -n "$VL" ] || VL=$(ls -d ~/.codex/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 
-   # --runtime all 同时处理 legacy（0.9.x 布局）、Claude 与 Codex 三个命名空间。
+   # --runtime all 同时处理 legacy（0.9.x 布局）与 claude 两个命名空间；对 2.0.0 之前留下的 metrics/codex/，
+   # --purge 会整目录删除（含 .salt），--reset-counts 只删其中两份计数文件，事件记录与人工标注不动。
+   # Codex 里还在用 1.4.2 时不要对 all 执行这两条，见 docs/MIGRATION.md。
    # 迁移是「复制」不是「移动」，legacy 目录在迁移后仍留在盘上——漏掉它，
    # --purge 只会清掉一半却照样报告「已清空 N 个数据文件」。
    python3 "$VL/analyze_metrics.py" --runtime all --report

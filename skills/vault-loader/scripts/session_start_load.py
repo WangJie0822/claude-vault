@@ -296,17 +296,18 @@ def main() -> int:
     legacy_enabled = False
     coexist_note = ""
 
-    # Configure state after payload parsing so concurrent Claude/Codex sessions
-    # never share an injection namespace.
+    # 解析 payload 之后再配置命名空间；2.0.0 起宿主恒为 Claude Code。
     try:
         from context_vault.coexist import check_legacy_plugin
         from context_vault.events import claim_event
         from context_vault.runtime import HookContext
         hook_context = HookContext.from_payload(hook_input)
         legacy_enabled, coexist_note = check_legacy_plugin(
-            hook_context.runtime.value, home=home, cwd=hook_context.cwd
+            home=home, cwd=hook_context.cwd
         )
-        should_claim = hook_context.runtime.value in {"claude", "codex"}
+        # 缺 `hook_event_name` 的畸形 payload 不去重：去重依赖宿主给的事件名，没有它
+        # 时按「每次都是新事件」处理（与 1.x 把它判成 UNKNOWN 时的行为一致）。
+        should_claim = bool(hook_context.event)
     except Exception as exc:
         print(f"[vault-loader] runtime 识别失败，使用 legacy state：{exc}", file=sys.stderr)
 
@@ -487,12 +488,13 @@ def main() -> int:
             system_message=(f"[DRY-RUN] 本应注入：\n{summary}" if summary else None),
         )
 
-    # 更新 state（项目相关笔记 + 工作日志路径），供 UserPromptSubmit(J) 去重。
+    # 更新 state，供 UserPromptSubmit(J) 去重。只记项目笔记：工作日志在正文里只有裸链接、
+    # 没有摘要，记进去会让 UPS 把它们当「已注入」排除，相关工作日志在提问时拿不到摘要。
     # 顺序：state 先写、emit 后发——_finish 会调 save_diag_ts，与 save_injected 写同一个
     # state 文件，两者都是读-改-写，反序会让先写的那次被覆盖。
     try:
         from scripts._state import save_injected
-        save_injected(cwd, [e.path for e in project_notes] + top_worklogs)
+        save_injected(cwd, [e.path for e in project_notes])
     except Exception as exc:
         _report_nonfatal("state 写入失败", exc)
 
@@ -519,7 +521,7 @@ def main() -> int:
             # import，形态不同，不能照搬它的位置。
             if hook_context is not None:
                 _m.configure_context(hook_context.runtime.value,
-                                     hook_context.event_id)
+                                     hook_context.metrics_event_id)
             _m.stage(_m.build_session_start_record(
                 session_id=hook_input.get("session_id", ""),
                 inj_chars=len(injection_text or ""),

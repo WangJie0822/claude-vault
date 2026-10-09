@@ -1,28 +1,9 @@
-"""CLI model backends used by optional, user-triggered enrichment tasks."""
+"""CLI model backend used by optional, user-triggered enrichment tasks."""
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
-import tempfile
-from pathlib import Path
-
-
-KEYWORDS_SCHEMA = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-        "keywords": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "maxItems": 8,
-        }
-    },
-    "required": ["keywords"],
-    "additionalProperties": False,
-}
 
 
 def call_claude(prompt: str, *, timeout: int = 60,
@@ -44,54 +25,18 @@ def call_claude(prompt: str, *, timeout: int = 60,
     return result.stdout if result.returncode == 0 else None
 
 
-def call_codex(prompt: str, *, timeout: int = 60,
-               schema: dict | None = None) -> str | None:
-    """Run an isolated Codex turn and return only its validated final message."""
-    executable = shutil.which("codex")
-    if executable is None:
-        return None
-    env = dict(os.environ)
-    env["VAULT_LOADER_DISABLE"] = "1"
-    try:
-        with tempfile.TemporaryDirectory(prefix="context-vault-codex-") as raw_tmp:
-            tmp = Path(raw_tmp)
-            schema_path = tmp / "output.schema.json"
-            output_path = tmp / "last-message.json"
-            schema_path.write_text(
-                json.dumps(schema or KEYWORDS_SCHEMA, ensure_ascii=False), encoding="utf-8"
-            )
-            argv = [
-                executable, "exec", "-",
-                "--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
-                "--sandbox", "read-only", "--disable", "hooks",
-                "--disable", "shell_tool", "--disable", "apps",
-                "--disable", "browser_use", "--disable", "computer_use",
-                "--disable", "multi_agent", "--disable", "code_mode_host",
-                "--output-schema", str(schema_path),
-                "--output-last-message", str(output_path),
-                "--color", "never", "-C", str(tmp),
-            ]
-            result = subprocess.run(
-                argv, input=prompt, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout,
-                env=env, shell=False,
-            )
-            if result.returncode != 0 or not output_path.is_file():
-                return None
-            return output_path.read_text(encoding="utf-8-sig")
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
-        return None
-
-
 def choose_backend(requested: str = "auto") -> str:
-    if requested in {"claude", "codex"}:
-        return requested
+    """解析 enrich 的模型后端。2.0.0 起只有 claude。
+
+    `auto` 只在有 `CLAUDE_PLUGIN_ROOT` 的进程里判为 claude——Claude Code 给 hook 子进程导出
+    该变量；skill 让模型在 Bash 工具里手动运行时没有它（2026-10-08 实测），普通终端同理，
+    这两种情况都拒绝。`enrich_keywords.py` 的 `--limit` 默认不限量，把 auto 直接等同
+    claude 会让一次误跑把整个 Vault 里缺 keywords 的笔记逐篇交给付费模型。
+    """
+    if requested == "claude":
+        return "claude"
     if requested != "auto":
         raise ValueError(f"unsupported backend: {requested}")
-    if os.environ.get("PLUGIN_ROOT"):
-        return "codex"
     if os.environ.get("CLAUDE_PLUGIN_ROOT"):
         return "claude"
-    raise ValueError(
-        "cannot infer model backend outside a hook; pass --backend claude or codex"
-    )
+    raise ValueError("cannot infer model backend outside a hook; pass --backend claude")

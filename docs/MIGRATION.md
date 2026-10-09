@@ -1,6 +1,67 @@
 # Context Vault 迁移指南
 
-## 0.9.x → 1.0.0（Claude Code + Codex）
+## 1.x → 2.0.0（移除 Codex 支持）
+
+2.0.0 起只支持 Claude Code，v1.4.2 是最后支持 Codex 的版本。配置、Vault、state、metrics、
+已总结会话清单的路径与格式都不变。按你的情况读对应小节。
+
+下文说的「三个退役目录」是：
+
+- `~/.context-vault/metrics/codex/`
+- `~/.context-vault/state/codex/`
+- `~/.context-vault/state/events/codex/`
+
+2.x 不再读写它们。删除时逐个按完整路径删，不要用通配符。
+
+### 只用 Claude Code
+
+升级后无需迁移。行为变化详见 CHANGELOG 2.0.0，要点：
+
+- 配置里残留的 `runtimes.codex.enabled` 已失效（`/config` 清单会标为已废弃）。若你曾用
+  `runtimes.codex.enabled=false` 关掉启动注入，升级后启动注入会恢复，请改用
+  `session_start.enabled=false`。不要改用 `runtimes.claude.enabled=false`：它会把提问时的注入也一起关掉。
+- 三个退役目录里主要是 1.x 被误记到 codex 命名空间的 SessionStart 数据，含笔记相对路径与会话 id，
+  可以删除。`analyze_metrics.py --runtime all --purge` 会删除其中的 `metrics/codex/`（连同 legacy 与
+  claude 两处的全部 metrics），另外两个目录需要手动删除。
+
+### 曾在 Codex 中用过 1.x，今后不再用
+
+按顺序操作：
+
+1. **先卸载 Codex 里的插件**：1.x 还装着时，会继续往三个退役目录写数据。
+   1. 运行 `codex plugin list`，找到 `context-vault@<marketplace>`。按 1.x README 安装的是
+      `context-vault@context-vault-local`。
+   2. 执行 `codex plugin remove context-vault@<marketplace>`。只写 `context-vault` 不带 marketplace 会报错。
+   3. 不再需要这个 marketplace 时，再执行 `codex plugin marketplace remove <marketplace>`。
+
+   以上命令按 codex-cli 0.153.0 核对。
+2. 再删除三个退役目录。注意其中的敏感内容：
+   - `state/codex/topics/` 里有从你的提问中提炼出的主题词明文；
+   - `metrics/codex/` 里有笔记路径与会话 id。
+3. 不要在 Codex 中安装 2.x。
+
+### Codex 继续用 1.4.2，Claude Code 升级到 2.x
+
+- 三个退役目录仍在被 Codex 中的 1.4.2 使用，**不要删除**。
+- 不要运行 `analyze_metrics.py --runtime all` 的 `--purge` 或 `--reset-counts`；canonical 配置存在时，
+  不带 `--runtime` 的同名命令也一样。原因：
+  - `--purge` 会整目录删除 `metrics/codex/`，连同 `.salt`；
+  - `--reset-counts` 会清掉其中的计数文件。
+- `runtimes.codex.enabled` 对 1.4.2 仍然生效，但 2.x 的 `/config` 拒绝写入它；需要改时手工编辑
+  `~/.context-vault/config.json`。
+- Codex 侧的 metrics 用 1.4.2 自带的 `analyze_metrics.py --runtime codex` 查看。
+- 不要把 2.x 装进 Codex。
+
+### 回退到 1.4.2
+
+数据格式没有变，回退不需要迁移数据。要回退时：
+
+1. 从仓库 tag `v1.4.2` 安装旧版本。
+2. 删除插件 cache 里 context-vault 的 `2.0.0` 目录。skill 定位脚本时按版本号取最高的那份
+   （`sort -V | tail -1`），留着 2.0.0 的话，hook 回到了 1.4.2，而 `/summarize-session`、`/config`
+   等仍会跑 2.0.0 的脚本。
+
+## 0.9.x → 1.0.0
 
 1.0.0 将插件 ID 从 `claude-vault` 改为 `context-vault`，并把新装的共享配置/数据根目录改为 `~/.context-vault/`。旧 Vault、配置、metrics、session manifest 和 state 不会自动删除。
 
@@ -19,7 +80,7 @@ python scripts/migrate_context_vault.py --apply
 
 迁移采用 staging + 原子配置提交，复制 legacy 数据到 runtime 命名空间，不删除源文件。若 `~/.context-vault/config.json` 已存在则拒绝覆盖。回退时停用/卸载 `context-vault`，重新启用旧 `claude-vault` 即可；旧数据仍在原位。
 
-不要同时启用两个插件 ID：Claude Code/Codex 会分别注册同名 hook，并发执行的 hook 之间不能互相阻止启动。先停用旧 ID，再启用新 ID，并新开会话验证每个事件只有一次注入。旧版专属的手工 settings hook 也必须移除。
+不要同时启用两个插件 ID：Claude Code 会分别注册同名 hook，并发执行的 hook 之间不能互相阻止启动。先停用旧 ID，再启用新 ID，并新开会话验证每个事件只有一次注入。旧版专属的手工 settings hook 也必须移除。
 
 以下章节保留 0.9.x 之前从源码/手工 hook 迁移到插件的历史说明。
 
@@ -79,12 +140,7 @@ python scripts/migrate_context_vault.py --apply
 **第 1 步 · dry-run 预览**（默认行为，只读扫描，不改动任何文件）：
 
 ```bash
-# 两端的插件 cache 根不同，**分别**取各自最新版，不要把两棵树混在一起排序：
-# `sort -V` 排的是整条路径，混排时 .codex 恒排在 .claude 之后，`tail -1` 会取到
-# 版本更低的那一个（本机实测取到 .codex 的 0.9.0，而 .claude 已有 0.9.1）。
-# 拆开写还顺带避开了 `~/.c{a,b}` 花括号展开的可移植性问题（dash 不支持）。
 VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
-[ -n "$VL" ] || VL=$(ls -d ~/.codex/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$VL/migrate_config.py"
 ```
 
@@ -104,12 +160,7 @@ python3 "$VL/migrate_config.py"
 **第 2 步 · 确认无误后 apply**（先备份，再原子写回清理后的 config）：
 
 ```bash
-# 两端的插件 cache 根不同，**分别**取各自最新版，不要把两棵树混在一起排序：
-# `sort -V` 排的是整条路径，混排时 .codex 恒排在 .claude 之后，`tail -1` 会取到
-# 版本更低的那一个（本机实测取到 .codex 的 0.9.0，而 .claude 已有 0.9.1）。
-# 拆开写还顺带避开了 `~/.c{a,b}` 花括号展开的可移植性问题（dash 不支持）。
 VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
-[ -n "$VL" ] || VL=$(ls -d ~/.codex/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$VL/migrate_config.py" --apply
 ```
 
@@ -118,12 +169,7 @@ python3 "$VL/migrate_config.py" --apply
 **第 3 步 · 如需撤销**（把第 2 步打印的备份路径填进去）：
 
 ```bash
-# 两端的插件 cache 根不同，**分别**取各自最新版，不要把两棵树混在一起排序：
-# `sort -V` 排的是整条路径，混排时 .codex 恒排在 .claude 之后，`tail -1` 会取到
-# 版本更低的那一个（本机实测取到 .codex 的 0.9.0，而 .claude 已有 0.9.1）。
-# 拆开写还顺带避开了 `~/.c{a,b}` 花括号展开的可移植性问题（dash 不支持）。
 VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
-[ -n "$VL" ] || VL=$(ls -d ~/.codex/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 python3 "$VL/migrate_config.py" --restore ~/.claude/projects/vault-loader-backups/config-<时间戳>.json
 ```
 

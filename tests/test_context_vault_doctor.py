@@ -14,9 +14,9 @@ def _write(path, data):
 def test_doctor_reports_migration_without_writing(tmp_path):
     legacy = tmp_path / ".claude/skills/vault-loader/config.json"
     _write(legacy, {"vault_path": str(tmp_path / "vault")})
-    report = diagnose(tmp_path, "codex")
+    report = diagnose(tmp_path, "claude")
     assert report["ok"] is True
-    assert report["runtime"] == "codex"
+    assert report["runtime"] == "claude"
     assert report["migration_needed"] is True
     assert report["coexistence_risk"] is False
     assert not (tmp_path / ".context-vault").exists()
@@ -57,3 +57,10 @@ def test_doctor_main_never_raises(tmp_path, monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert any("boom" in e for e in payload["errors"])
+
+
+def test_doctor_reports_no_codex_fields(tmp_path):
+    report = diagnose(tmp_path)
+    assert "codex" not in report["manifests"]
+    assert "PLUGIN_ROOT" not in report["environment"]
+    assert report["runtime"] == "claude"

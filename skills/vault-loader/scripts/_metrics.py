@@ -9,8 +9,9 @@
 本模块所有函数必须可被调用方用 try/except 完整兜住；模块顶层零 IO。
 
 模块顶层从 `context_vault` 导入 `lease_lock` / 路径工具，但**配了 ImportError
-façade**（与 `_state.py` / `_config_loader.py` 同款），所以 legacy 独立布局或
-3.10 及以下解释器上不会整体 import 失败。此处曾写「刻意不依赖任何内部模块」，
+façade**（与 `_state.py` / `_config_loader.py` 同款），所以 legacy 独立布局下不会
+整体 import 失败。（这里曾另写「3.10 及以下解释器」，那条理由来自 2.0.0 删除的
+coexist 对 tomllib 的依赖，已不成立。）此处曾写「刻意不依赖任何内部模块」，
 在双运行时改造引入这两个导入后已不成立——注释与实现不符比没有注释更误导。
 """
 from __future__ import annotations
@@ -41,10 +42,9 @@ try:
     from context_vault.atomic import lease_lock
     from context_vault.paths import canonical_config, context_home, use_canonical_namespace
 except ImportError:  # compatibility façade for isolated legacy script copies
-    # 与 `_state.py` / `_config_loader.py` 同款兜底。缺了它，legacy 独立布局或
-    # 3.10 及以下解释器（`context_vault.coexist` 用了 3.11 的 tomllib）会让本模块
-    # 整体 import 失败，于是每次 UserPromptSubmit 都多打一行 stderr——而 metrics
-    # 默认是关的，用户为一个自己没开的功能持续付噪声。
+    # 与 `_state.py` / `_config_loader.py` 同款兜底。缺了它，legacy 独立布局（拿不到
+    # `context_vault` 包）会让本模块整体 import 失败，于是每次 UserPromptSubmit 都多打
+    # 一行 stderr——而 metrics 默认是关的，用户为一个自己没开的功能持续付噪声。
     from contextlib import contextmanager
 
     def context_home(home: Path | None = None) -> Path:
@@ -126,12 +126,12 @@ def configure_context(runtime: str, event_id: str = "") -> None:
     """
     global _RUNTIME, _EVENT_ID
     # Existing Claude users stay on the 0.9.x metrics layout until they create
-    # or migrate canonical config. Codex always needs an explicit namespace.
+    # or migrate canonical config.
     if runtime in {"legacy", "unknown"} or (
             runtime == "claude" and not use_canonical_namespace()):
         _RUNTIME = "legacy"
     else:
-        _RUNTIME = runtime if runtime in {"claude", "codex"} else "legacy"
+        _RUNTIME = runtime if runtime in {"claude"} else "legacy"
     _EVENT_ID = event_id
 
 
@@ -939,7 +939,7 @@ def flush(home: Path, retention_days: int | None = None) -> None:
                 mark_pruned(home)
         except Exception as exc:  # noqa: BLE001 — 清理绝不影响主流程
             import sys
-            # 宿主拒绝写入（Codex workspace-write 沙箱把 per-user 目录放在可写区之外、
+            # 宿主拒绝写入（只读沙箱把 per-user 目录放在可写区之外、
             # 只读挂载、或文件被占用）不是本插件的故障，不该变成 host 可见的 hook 失败。
             #
             # 判据单点在 `context_vault/degrade.py`：此处曾内联第三份
@@ -986,6 +986,69 @@ def prune_expired(home: Path, retention_days: int) -> int:
         print(f"[vault-loader] metrics 保留期 {retention_days} 天，"
               f"已清理 {removed} 个过期会话文件", file=sys.stderr)
     return removed
+
+
+# 已退役的命名空间（2.0.0 移除 Codex 支持）。插件不再读写它们；只有用户显式
+# `--purge` / `--reset-counts` 且语义为 all 时按**路径**处理——不经 `configure_context`：
+# 白名单已不含这些值，经它会回落 legacy，等于把 legacy 扫两遍而退役目录照样漏掉。
+RETIRED_NAMESPACES = ("codex",)
+
+
+def _is_link_like(p: Path) -> bool:
+    isjunction = getattr(os.path, "isjunction", None)        # Python 3.12+
+    return p.is_symlink() or bool(isjunction and isjunction(p))
+
+
+def retired_metrics_dirs(home: Path) -> list[Path]:
+    """盘上实际存在的退役命名空间目录。链接 / junction 一律跳过：删除只针对
+    插件自己写出的真实目录，绝不跟随链接删除别处的数据。"""
+    out: list[Path] = []
+    for ns in RETIRED_NAMESPACES:
+        p = context_home(home) / "metrics" / ns
+        if p.is_dir() and not _is_link_like(p):
+            out.append(p)
+    return out
+
+
+def purge_retired(home: Path) -> tuple[int, int, list[str]]:
+    """删除退役命名空间的整个目录（含 `.salt`：不会再有任何记录需要与它对齐）。
+
+    返回 (数据文件数, 人工标注条数, 已删除的目录)。数据文件与 `purge()` 同一口径：
+    全部 `.jsonl`（含 annotations.jsonl）。
+    """
+    import shutil
+    n = n_ann = 0
+    removed: list[str] = []
+    for root in retired_metrics_dirs(home):
+        ann = root / "annotations.jsonl"
+        if ann.is_file():
+            try:
+                text = ann.read_text(encoding="utf-8", errors="replace")
+                n_ann += sum(1 for line in text.splitlines() if line.strip())
+            except OSError:
+                pass
+        n += sum(1 for _ in root.rglob("*.jsonl"))
+        shutil.rmtree(root)
+        if root.exists():
+            raise OSError(f"retired metrics directory still exists after purge: {root}")
+        removed.append(str(root))
+    return n, n_ann, removed
+
+
+def reset_retired_counts(home: Path) -> int:
+    """删退役命名空间里的两份派生文件，返回被清掉的计数条目数；不碰事件与标注。"""
+    n = 0
+    for root in retired_metrics_dirs(home):
+        counts = root / "near_miss_counts.json"
+        if counts.is_file():
+            try:
+                data = json.loads(counts.read_text(encoding="utf-8"))
+                n += len(data) if isinstance(data, dict) else 0
+            except (OSError, ValueError):
+                pass
+            counts.unlink(missing_ok=True)
+        (root / "nudge_ts.json").unlink(missing_ok=True)
+    return n
 
 
 def purge(home: Path) -> int:
