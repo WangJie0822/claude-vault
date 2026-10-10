@@ -86,7 +86,7 @@ try:
     from scripts._topic import (
         load_session_topic, spawn_topic_extraction, has_recent_topic_attempt,
         load_session_pinned, load_pinned_accounted, mark_pinned_accounted,
-        effective_pin_max,
+        effective_pin_max, split_pin_budget,
     )
     from scripts._candidate_pool import (build_topic_pool, count_project_notes, safe_int,
                                          SUMMARY_CHARS)
@@ -203,6 +203,68 @@ except Exception as _metrics_exc:  # noqa: BLE001
             return None
 
     _metrics = _MetricsStub()
+
+# 会话操作模块单独兜底（spec 2026-10-09 mod 注入可见与可控）：它服务的是 mod 的展示与操作，
+# 加载失败只让本轮没有快照，召回照常。
+try:
+    from scripts import _session_ops
+except Exception as _ops_exc:  # noqa: BLE001
+    print(f"[vault-loader] 会话操作模块不可用，本轮无快照：{_ops_exc}", file=sys.stderr)
+    _session_ops = None
+
+# 本轮的快照素材。生产每轮新进程；`main()` 入口与出口各清一次，防同进程多轮调用（测试）串味。
+_REPORT = None
+
+
+def _bind_report(hook_input: dict) -> None:
+    global _REPORT
+    _REPORT = None
+    if _session_ops is None:
+        return
+    try:
+        _REPORT = _session_ops.TurnReport.for_ups(hook_input)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 会话快照初始化失败：{exc}", file=sys.stderr)
+
+
+def _report_status(status: str) -> None:
+    if _REPORT is not None:
+        _REPORT.status = status
+
+
+def _take_session_ops(config: dict, home: Path, cfg_fallback=None):
+    """通过全部停用闸门后才读请求；标注在这里处理（与召回无关，闸门轮也处理）。
+
+    标注的拒收是终局（mod 收到即从队列删除），所以只在确知不该写时拒收：
+    - config 读坏回落默认值的那一轮（`cfg_fallback` 非空）不能据默认值判 `metrics_off`；
+    - dry_run 承诺「预览、不落盘」，不表示要丢弃用户的标注。
+    这两种都既不 ack 也不拒收，标注留在 mod 队列里下一轮重投。
+    """
+    rep = _REPORT
+    if rep is None or not rep.request_seen:
+        return None
+    # 闸门轮的出口不经过 _fill_report：在这里先报一次，否则快照恒为 false，mod 收到后把
+    # 标注按钮收掉（节点 2 Q-H1）。`prompt_h` 仍只在打分轮写，闸门轮不改变标注目标。
+    rep.metrics_on = bool((config.get("metrics", {}) or {}).get("enabled", False))
+    try:
+        ops = rep.take_ops()
+    except Exception as exc:  # noqa: BLE001
+        _report_nonfatal("会话操作读取失败", exc)
+        return None
+    if ops is None or not ops.annotations or cfg_fallback is not None:
+        return ops
+    mcfg = config.get("metrics", {}) or {}
+    if not mcfg.get("enabled", False):
+        rep.reject_annotations(ops.annotations, "metrics_off")
+    elif not config.get("dry_run", False):
+        try:
+            from scripts._annotations import apply_annotations
+            acked, rejected = apply_annotations(home, ops.annotations)
+            rep.acked.extend(acked)
+            rep.rejected.extend(rejected)
+        except Exception as exc:  # noqa: BLE001
+            _report_nonfatal("标注写入失败", exc)
+    return ops
 
 # 「未传」哨兵：fulltext_path=None 是有意义的取值（决策层判定本轮**不**注入全文），
 # 故不能用 None 区分"调用方没传"。没传 → 渲染层按 select_fulltext 自行回退计算
@@ -406,6 +468,40 @@ def render_pinned_section(pinned_paths, active_entries: dict, already: set, shor
         return "", []
     head = [INJECTION_NOTICE.rstrip("\n")] if with_notice else []
     return "\n".join([*head, PIN_HEADER, *lines]), rendered
+
+
+# 手动钉住另起一个小节头（spec N6：`PIN_HEADER` 一字不改，不用 mod 的用户注入正文不变）。
+USER_PIN_HEADER = "📌 本会话手动钉住（/vault-injected 里操作）："
+
+
+def render_user_pins_section(user_pins, active_entries: dict, already: set, short_chars: int,
+                             with_notice: bool = True):
+    """手动钉住小节。返回 (文本 或 "", 实际渲染 path 列表)。
+
+    与 `render_pinned_section` 同形：只从 `active_entries` 取、`.get()` 跳过缺失、path 与
+    summary 走 F5 净化。`already` 只含**本轮**已注入与本轮 LLM 点名渲染的篇——**不含**跨会话的
+    `fulltext_injected`：用户显式钉住的篇，被另一会话 24 小时内全文注入过不是不渲染的理由
+    （feasibility M4）。
+    """
+    lines: list[str] = []
+    rendered: list[str] = []
+    try:
+        for p in (user_pins or []):
+            if not isinstance(p, str) or p in already or p in rendered:
+                continue
+            e = active_entries.get(p)
+            if e is None:
+                continue
+            path_clean = sanitize_injected_text(p, keep_newlines=False)
+            lines.append(f"- [[{path_clean}]] — {_candidate_title(e, short_chars)}")
+            rendered.append(p)
+    except Exception as exc:                     # noqa: BLE001 — fail-open
+        print(f"[vault-loader] 手动钉住渲染失败：{exc}", file=sys.stderr)
+        return "", []
+    if not lines:
+        return "", []
+    head = [INJECTION_NOTICE.rstrip("\n")] if with_notice else []
+    return "\n".join([*head, USER_PIN_HEADER, *lines]), rendered
 
 
 def build_injection_text_ups(scored, keywords_str, prompt_keywords, ups_cfg, rel_cfg, vault_path,
@@ -632,6 +728,7 @@ def _stage_gate_record(config: dict, hook_input: dict, gate: str) -> None:
     metrics 关闭时也落盘、绕过 opt-in 边界。
     fail-open：任何异常只打 stderr，绝不连累召回。
     """
+    _report_status(f"gate:{gate}")
     if not config.get("metrics", {}).get("enabled", False):
         return
     try:
@@ -687,7 +784,57 @@ def _finish_with_metrics(config: dict, cwd: Path,
     return rc
 
 
+def _fill_report(*, config: dict, prompt: str, home: Path, active_entries: dict,
+                 decision, injected_paths, fulltext_title, hits_by_path,
+                 pinned_render, pinned_rendered, user_pins, user_rendered,
+                 excluded_paths) -> None:
+    """把本轮展示所需的数据写进 `_REPORT`。任何异常只降级为「快照内容不全」。"""
+    rep = _REPORT
+    if rep is None or not rep.request_seen or _session_ops is None:
+        return
+    try:
+        metrics_on = bool(config.get("metrics", {}).get("enabled", False))
+        conf_high = config["relevance"]["confidence_bands"]["high"]
+        topical = {ed.path: ed.topical for ed in decision.admitted}
+        items = []
+        for p in injected_paths:
+            hits = list((hits_by_path or {}).get(p, []))
+            item = {"path": p, "title": _session_ops.note_title(p),
+                    "confidence": _confidence_label(topical.get(p, 0.0), hits, conf_high),
+                    "fulltext": p == fulltext_title,
+                    "kind": "admitted_fulltext" if p == fulltext_title else "admitted_list"}
+            if metrics_on:
+                item["hits"] = [_session_ops.display_text(h, 40) for h in hits[:10]]
+            items.append(item)
+        rep.injected = items
+        rep.pins_llm = [{"path": p, "title": _session_ops.note_title(p),
+                         "rendered": p in pinned_rendered} for p in pinned_render]
+        rep.pins_user = [{"path": p, "title": _session_ops.note_title(p),
+                          "rendered": p in user_rendered} for p in user_pins]
+        rep.excluded = [{"path": p, "title": _session_ops.note_title(p)}
+                        for p in sorted(excluded_paths)]
+        rep.metrics_on = metrics_on
+        if metrics_on:
+            rep.prompt_h = _metrics.h(prompt, _metrics.get_salt(home)) if prompt else ""
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 会话快照填充失败：{exc}", file=sys.stderr)
+
+
 def main() -> int:
+    global _REPORT
+    _REPORT = None
+    try:
+        return _main_impl()
+    finally:
+        rep, _REPORT = _REPORT, None
+        if rep is not None:
+            try:
+                rep.finalize()
+            except Exception as exc:  # noqa: BLE001 — 快照只服务展示，绝不影响本轮注入
+                _report_nonfatal("会话快照写入失败", exc)
+
+
+def _main_impl() -> int:
     home = Path.home()
     _take_pin_account()          # 清掉同进程上一轮可能残留的延迟登记（生产每轮新进程，恒为空）
 
@@ -698,6 +845,7 @@ def main() -> int:
 
     cwd = Path(hook_input.get("cwd", os.getcwd()))
     prompt = hook_input.get("prompt", "")
+    _bind_report(hook_input)
     should_claim = False
     legacy_enabled = False
     coexist_note = ""
@@ -789,10 +937,13 @@ def main() -> int:
                 stable=hook_context.stable_event_id,
                 home=home,
             ):
+                _report_status("duplicate")
                 return 0
         except Exception as exc:
             _report_nonfatal("事件去重失败，继续执行", exc)
 
+    _report_status("pending")
+    session_ops = _take_session_ops(config, home, cfg_fallback)
     # ↓↓↓ 停用闸门到此为止，从这里开始才允许登记诊断 ↓↓↓
     if cfg_fallback == "corrupt":
         notify(config_corrupt(cfg_detail))
@@ -958,8 +1109,20 @@ def main() -> int:
     exclude_tags = {t.lower() for t in rel_cfg.get("exclude_note_tags", [])}
     active_entries = {p: e for p, e in entries.items() if not is_archived(e, exclude_tags)}
 
-    state = StateView(fulltext_injected=fulltext_injected, candidate_injected=candidate_injected)
+    excluded_paths: frozenset = frozenset()
+    user_pins_req: list = []
+    if session_ops is not None and _REPORT is not None:
+        try:
+            session_ops = _REPORT.restrict(active_entries.keys())
+            excluded_paths = _session_ops.excluded_set(session_ops)
+            user_pins_req = list(session_ops.pin)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vault-loader] 会话操作应用失败：{exc}", file=sys.stderr)
+
+    state = StateView(fulltext_injected=fulltext_injected, candidate_injected=candidate_injected,
+                      user_excluded=set(excluded_paths))
     decision = decide_injection(active_entries, signals, weights, config, state)
+    _report_status("dry_run" if config.get("dry_run", False) else "scored")
     # decision.gate_reason 恒为 ""：main() 已在 IO 之前用同一 gate_keywords 提前
     # return 0（见上方），本调用点 prompt_keywords/config 与该早退判定完全同源，
     # decide_injection 内部复算的 gate_keywords 结果必然一致，不会再触发 too_few_keywords。
@@ -1100,10 +1263,22 @@ def main() -> int:
     # 会话级固定注入：在 admitted 早退之前先渲染，admitted 为空时也要出（那正是机械召回失效的轮次）。
     # 正常路径在 build_injection_text_ups 之后用更宽的去重集重算，这里只服务 admitted 为空的早退分支。
     short_chars = rel_cfg["short_summary_chars"]
+    # LLM 点名的对账字段（pin_kwargs）仍用 pinned_paths（N5）；渲染用剔除本会话排除之后的列表，
+    # 名额由 split_pin_budget 与手动钉住合计分配（spec 2026-10-09 mod §6.2）。
+    user_cap, llm_cap = split_pin_budget(len(user_pins_req), config)
+    pinned_render = [p for p in pinned_paths if p not in excluded_paths][:llm_cap]
+    user_pins = [p for p in user_pins_req if p not in excluded_paths][:user_cap]
     pinned_text, pinned_rendered = "", []
-    if pinned_paths and not decision.admitted:
+    if pinned_render and not decision.admitted:
         pinned_text, pinned_rendered = render_pinned_section(
-            pinned_paths, active_entries, set(fulltext_injected), short_chars)
+            pinned_render, active_entries, set(fulltext_injected), short_chars)
+    user_rendered: list = []
+    if user_pins and not decision.admitted:
+        user_text, user_rendered = render_user_pins_section(
+            user_pins, active_entries, set(pinned_rendered), short_chars,
+            with_notice=not pinned_text)
+        if user_text:
+            pinned_text = f"{pinned_text}\n\n{user_text}" if pinned_text else user_text
 
     if not decision.admitted:
         # 落盘口径（1A-L12）：凡走到打分阶段的轮次一律落 `pinned_injected`（含 0），闸门早退不落——
@@ -1113,11 +1288,22 @@ def main() -> int:
             _metrics.annotate(pinned_injected=len(pinned_rendered))
         except Exception:      # noqa: BLE001
             pass
+        if user_pins_req:
+            try:
+                _metrics.annotate(user_pinned=list(user_rendered),
+                                  user_pinned_injected=len(user_rendered))
+            except Exception:      # noqa: BLE001
+                pass
+        _fill_report(config=config, prompt=prompt, home=home, active_entries=active_entries,
+                     decision=decision, injected_paths=[], fulltext_title=None, hits_by_path={},
+                     pinned_render=pinned_render, pinned_rendered=pinned_rendered,
+                     user_pins=user_pins, user_rendered=user_rendered,
+                     excluded_paths=excluded_paths)
 
     if not decision.admitted and pinned_text:
         display_cfg = config.get("display", {})
         summary = (build_summary_ups([], prompt_keywords, None, pinned_text, display_cfg, rel_cfg,
-                                     hits_by_path={}, pinned_paths=pinned_rendered)
+                                     hits_by_path={}, pinned_paths=pinned_rendered + user_rendered)
                    if display_cfg.get("user_visible", True) else None)
         # dry_run 契约：本分支是全部主注入出口之一，必须与下方"正常路径"同样只预览、
         # 不落 additionalContext——否则「admitted 为空、只剩 pinned」这一档会绕过
@@ -1159,27 +1345,46 @@ def main() -> int:
     injection_text, injected_paths, fulltext_title = build_injection_text_ups(
         scored, keywords_str, prompt_keywords, ups_cfg, rel_cfg, vault_path,
         hits_by_path=hits_by_path, fulltext_path=decision.fulltext_path)
-    if pinned_paths:
+    if pinned_render:
         # 清单分支头部已有 INJECTION_NOTICE，小节不再重复一份（1A-L7）；全文分支的 out_lines 没有外层
         # 声明、fence 只包 ft_body，小节仍须自带（`fulltext_title` 非 None 即全文分支）。
         pinned_text, pinned_rendered = render_pinned_section(
-            pinned_paths, active_entries, set(injected_paths) | set(fulltext_injected), short_chars,
+            pinned_render, active_entries, set(injected_paths) | set(fulltext_injected), short_chars,
             with_notice=fulltext_title is not None)
         if pinned_text:
             injection_text = injection_text + "\n\n" + pinned_text
+    user_rendered = []
+    if user_pins:
+        user_text, user_rendered = render_user_pins_section(
+            user_pins, active_entries, set(injected_paths) | set(pinned_rendered), short_chars,
+            with_notice=fulltext_title is not None and not pinned_rendered)
+        if user_text:
+            injection_text = injection_text + "\n\n" + user_text
     try:
         _metrics.annotate(pinned_injected=len(pinned_rendered))
     except Exception:      # noqa: BLE001
         pass
+    if user_pins_req:
+        try:
+            _metrics.annotate(user_pinned=list(user_rendered),
+                              user_pinned_injected=len(user_rendered))
+        except Exception:      # noqa: BLE001
+            pass
     # 权威的「用户看到了哪几篇」——渲染层刚算出来，直接落盘，别让读端去重建。
     try:
         _metrics.annotate(shown=list(injected_paths))
     except Exception:      # noqa: BLE001  metrics 故障绝不影响注入
         pass
+    _fill_report(config=config, prompt=prompt, home=home, active_entries=active_entries,
+                 decision=decision, injected_paths=injected_paths, fulltext_title=fulltext_title,
+                 hits_by_path=hits_by_path, pinned_render=pinned_render,
+                 pinned_rendered=pinned_rendered, user_pins=user_pins,
+                 user_rendered=user_rendered, excluded_paths=excluded_paths)
     summary_items = scored[: ups_cfg["max_notes"]]
     summary = (build_summary_ups(summary_items, prompt_keywords, fulltext_title,
                                  injection_text, display_cfg, rel_cfg,
-                                 hits_by_path=hits_by_path, pinned_paths=pinned_rendered)
+                                 hits_by_path=hits_by_path,
+                                 pinned_paths=pinned_rendered + user_rendered)
                if user_visible else None)
 
     if dry_run:
@@ -1203,6 +1408,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:
+        from context_vault.exe_search import harden_exe_search
+        harden_exe_search()
+    except Exception:  # noqa: BLE001 — 加固失败不得影响注入（fail-open）
+        pass
     try:
         sys.exit(main())
     except Exception as exc:

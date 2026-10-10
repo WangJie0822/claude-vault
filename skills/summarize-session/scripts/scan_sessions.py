@@ -10,6 +10,7 @@
   python3 scan_sessions.py --timerange <CWD>            # 提取当前会话时段
   python3 scan_sessions.py --touched-repos <CWD>        # 扫描本次会话实际修改的 git 仓库
 """
+from __future__ import annotations
 
 import json
 import os
@@ -277,7 +278,7 @@ def _extract_timerange(file_path: str) -> dict | None:
                 except json.JSONDecodeError:
                     continue
                 ts = obj.get("timestamp")
-                if ts:
+                if ts and isinstance(ts, str):
                     if first_ts_str is None:
                         first_ts_str = ts
                     last_ts_str = ts
@@ -466,7 +467,11 @@ def parse_session(file_path: str, max_chars: int = 4000) -> dict:
                     cwd = obj["cwd"]
                 if not session_date and "timestamp" in obj:
                     try:
-                        session_date = datetime.fromisoformat(obj["timestamp"]).strftime("%Y-%m-%d %H:%M")
+                        # 3.10 及以下的 fromisoformat 不认末尾 Z，与 _extract_timerange 同样先替换
+                        ts = obj["timestamp"]
+                        if isinstance(ts, str):
+                            ts = ts.replace("Z", "+00:00")
+                        session_date = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M")
                     except (ValueError, TypeError):
                         pass
 
@@ -781,4 +786,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from _exe_search import harden_exe_search
+    harden_exe_search()
     main()

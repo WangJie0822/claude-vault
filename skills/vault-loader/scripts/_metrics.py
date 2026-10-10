@@ -253,6 +253,11 @@ def h(text: str, salt: bytes) -> str:
     return hashlib.sha256(salt + text.encode("utf-8")).hexdigest()[:16]
 
 
+def session_file_stem(session_id: str) -> str:
+    """每会话 metrics 文件的文件名主干（不含 `.jsonl`）。写端与按会话回查的读端共用这一处。"""
+    return _SAFE.sub("_", session_id or "unknown")[:64] or "unknown"
+
+
 def write_record(home: Path, session_id: str, record: dict) -> Path:
     """追加一行 JSON 到该会话的独立文件。
 
@@ -269,7 +274,7 @@ def write_record(home: Path, session_id: str, record: dict) -> Path:
     代价由读取端承担：`analyze_metrics.load_records` 计数损坏行并经 stderr 报出，
     不静默——见该函数 docstring。
     """
-    safe = _SAFE.sub("_", session_id or "unknown")[:64] or "unknown"
+    safe = session_file_stem(session_id)
     month = time.strftime("%Y-%m")
     d = metrics_dir(home) / month
     d.mkdir(parents=True, exist_ok=True)
@@ -868,7 +873,9 @@ def stage(record: dict) -> None:
 # `shown`——并入会让 `sample_admitted` 把 pinned 当 admitted_list 抽进标注池（1B-M-1 取 (b)）。
 # `pinned_injected` 的落盘口径：凡走到打分阶段的轮次一律落（含 0），闸门早退不落——它的存在性是
 # 报表「功能开着却一次都没点名」那一档的分母，与 `inj_chars`「只在有正文时记」刻意不同（1A-L12）。
-_ANNOTATE_ALLOWED = frozenset({"inj_chars", "shown", "pinned_injected"})
+_ANNOTATE_ALLOWED = frozenset({"inj_chars", "shown", "pinned_injected",
+                               # 手动钉住（spec 2026-10-09 mod §6.2）：只在本轮请求带 pin 时补记
+                               "user_pinned", "user_pinned_injected"})
 
 
 def annotate(**fields: object) -> None:

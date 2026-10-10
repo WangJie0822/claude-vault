@@ -34,7 +34,9 @@ def _run(cwd: Path, prompt: str, env_extra: dict | None = None,
         text=True,
         encoding="utf-8",
         env=env,
-        timeout=5,
+        # 守的是挂死，不是性能（性能由 test_perf.py 判）。空闲时单次约 0.2s，
+        # 高负载下 5s 曾超时而单跑全绿（full-review P2B-E5），与同目录其它用例对齐取 60s。
+        timeout=60,
     )
 
 

@@ -282,7 +282,48 @@ def _finish(
     return 0
 
 
+_REPORT = None
+
+
+def _bind_report(hook_input: dict, home: Path) -> None:
+    """快照素材 + 无条件过期清理（spec §8.3：每次 SessionStart 都清，目录不存在即跳过）。"""
+    global _REPORT
+    _REPORT = None
+    try:
+        from scripts import _session_ops
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 会话操作模块不可用：{exc}", file=sys.stderr)
+        return
+    try:
+        _session_ops.cleanup_live(home)
+    except Exception as exc:  # noqa: BLE001
+        _report_nonfatal("会话快照清理失败", exc)
+    try:
+        _REPORT = _session_ops.TurnReport.for_session_start(hook_input, home)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 会话快照初始化失败：{exc}", file=sys.stderr)
+
+
+def _report_status(status: str) -> None:
+    if _REPORT is not None:
+        _REPORT.status = status
+
+
 def main() -> int:
+    global _REPORT
+    _REPORT = None
+    try:
+        return _main_impl()
+    finally:
+        rep, _REPORT = _REPORT, None
+        if rep is not None:
+            try:
+                rep.finalize()
+            except Exception as exc:  # noqa: BLE001
+                _report_nonfatal("会话快照写入失败", exc)
+
+
+def _main_impl() -> int:
     home = Path.home()
 
     try:
@@ -291,6 +332,7 @@ def main() -> int:
         hook_input = {}
 
     cwd = Path(hook_input.get("cwd", os.getcwd()))
+    _bind_report(hook_input, home)
     hook_context = None
     should_claim = False
     legacy_enabled = False
@@ -383,10 +425,12 @@ def main() -> int:
                 stable=hook_context.stable_event_id,
                 home=home,
             ):
+                _report_status("duplicate")
                 return 0
         except Exception as exc:
             _report_nonfatal("事件去重失败，继续执行", exc)
 
+    _report_status("pending")
     # ↓↓↓ 停用闸门到此为止，从这里开始才允许登记诊断 ↓↓↓
     if cfg_fallback == "corrupt":
         notify(config_corrupt(cfg_detail))
@@ -457,6 +501,14 @@ def main() -> int:
     project_notes = [e for e in entries.values() if _is_project_note(e)]
     project_notes.sort(key=lambda e: -e.mtime)
     project_notes = project_notes[: ss_cfg["max_notes"]]
+    if _REPORT is not None and _REPORT.request_seen:
+        try:
+            from scripts import _session_ops
+            _REPORT.session_start = [{"path": e.path, "title": _session_ops.note_title(e.path)}
+                                     for e in project_notes]
+            _REPORT.status = "dry_run" if config.get("dry_run", False) else "scored"
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vault-loader] 会话快照填充失败：{exc}", file=sys.stderr)
 
     top_worklogs = worklog_result.paths[: ss_cfg["max_recent_worklogs"]]
 
@@ -536,6 +588,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:
+        from context_vault.exe_search import harden_exe_search
+        harden_exe_search()
+    except Exception:  # noqa: BLE001 — 加固失败不得影响注入（fail-open）
+        pass
     try:
         sys.exit(main())
     except Exception as exc:

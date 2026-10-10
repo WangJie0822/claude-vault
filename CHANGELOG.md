@@ -2,6 +2,97 @@
 
 本文件记录 Context Vault（原 claude-vault）的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.0] - 2026-10-10
+
+### 行为变更（升级前请读）
+
+- **macOS / Linux：hook 可能从本版起才真正运行。** 旧版命令直接执行 `hooks/run-hook.cmd`，而该文件在
+  仓库里没有可执行位；在没有补可执行位的安装上，此前每次 hook 都被拒绝（`Permission denied`），插件
+  实际没有工作。判断方法：`ls -l ~/.claude/plugins/cache/*/*vault/*/hooks/run-hook.cmd`，权限位里没有
+  `x` 即旧版 hook 从未执行。这类安装更新后：
+  - 会话开始与每次提问都会注入相关笔记，并显示一行注入提示；
+  - `session_topic` 默认开启：每个会话在首次有召回候选的那一轮，把这一轮的提问原文与至多 50 篇候选
+    笔记的路径和摘要交给 `claude -p --model haiku` 提炼主题词。需要 PATH 上有 `claude`；走与主会话
+    相同的服务端点、消耗你的额度；失败后在 `state_ttl_hours`（默认 24 小时）窗口内不重试。关闭：配置
+    `relevance.session_topic: false`；
+  - 首次运行会创建 `~/.context-vault/`（配置、默认 Vault 目录与 state）。
+
+  不想要这些变化时，整体停用见 README「停用逃生阀」。曾在 `~/.claude/settings.json` 手工注册过同名
+  hook 的，按 `docs/MIGRATION.md` 移除，否则会与插件 hook 一起执行。
+- **Windows：hook 声明 `"shell": "bash"`，需要 Git for Windows。** 没装 Git Bash 的 Windows 不受支持
+  （此前在这类机器上同样不能运行，只是报 PowerShell 解析错误）。
+- **交互终端里会出现新目录 `~/.context-vault/state/live/`**：mod 与 Python 之间的按轮请求与会话快照
+  （最近一次注入、钉住、排除的笔记路径与标题；metrics 开启时另有命中词与提问的加盐 hash）。快照 24 小时、
+  请求与临时文件 1 小时后由会话开始时清理，`--purge` 一并清除；`claude -p` 等没有绘制界面的会话不写。
+  另有 Claude Code 配置目录下 `plugins/store/` 里的一个 store 文件（mod 的待写入标注，7 天过期），
+  `--purge` 与卸载都不清它。
+- **新增插件配置项 `mod_enabled`**（默认开）：关掉后 band 与 `/vault-injected` 都不出现，召回照常。它在
+  插件的 `userConfig` 里，不在 `~/.context-vault/config.json` 里；按 Claude Code 2.1.293 的插件文档可在
+  `/config` 里改（未实测）。
+- band 与 `/vault-injected` 需要能加载 mod 的 Claude Code。本插件的 mod 只在 2.1.293 上验证过
+  （`claude plugin validate` / `claude plugin test`）；用同样声明 `modules` / `types` / `userConfig` 的最小
+  探针插件验证过 2.1.286、2.1.250、2.1.220 都不因这些新字段拒绝插件、命令 hook 照常执行，其中后两者
+  不加载 mod。本插件本身没有在这三个版本上安装运行过。
+- 注入正文新增一个小节头「📌 本会话手动钉住（/vault-injected 里操作）：」，只在手动钉住过的会话出现
+  （模型可见）。
+
+### 新增
+
+- 输入框上方常驻显示最近一次 vault 注入（篇数、标题、钉住与排除数；没有召回的轮次保留上一次并标注）。
+- `/vault-injected` 面板：本会话排除、手动钉住、取消 LLM 自动点名、撤销；metrics 开启时可把注入的笔记
+  标为有用 / 无用，按 metrics 里那一轮的记录核对后写入 `annotations.jsonl`。被拒收的标注从队列删除、不再
+  重投（metrics 已关闭、找不到那一轮的记录、条目格式不对）；配置读坏、dry_run、会话 metrics 文件读不到、
+  标注文件被占用时留在队列里下次再投。详见 README「注入可见与可控」。
+- `analyze_metrics.py --report`：用户本会话排除单列为「用户排除」，不再计入「被跨轮去重压掉」与对照榜。
+- metrics 记录新增 `user_pinned` / `user_pinned_injected`（手动钉住时），跨轮去重字段新增取值
+  `user_excluded`。
+
+### 修复
+
+- `scan_sessions.py` 在 Python 3.9 上导入即失败（1.1.0 起；函数签名里用了 `X | Y` 标注），
+  `/summarize-session` 里所有调用它的步骤（时段推断、改动仓库扫描、标记已总结、`--catch-up`
+  列表）都不可用。
+- `scan_sessions.py` 在 Python 3.10 及以下解析不了 transcript 里带 `Z` 的时间戳，会话日期静默
+  回落为文件修改时间。
+- hook 命令改为 `/bin/sh "<插件根>/hooks/run-hook.cmd" <脚本> || exit 1`：不再依赖可执行位（见上），
+  插件根缺失时以退出码 1 失败（非阻断，不会拦截提交）。
+- `analyze_metrics.py`：有 `~/.context-vault/config.json` 但还没迁移的机器上，`--report` 把 legacy
+  metrics 统计两遍（事件数等全部翻倍），`--purge` 把同一目录扫两遍并打印两次。现在映射到同一目录的
+  命名空间只处理一次；这种机器上 `--review` / `--review-web` 也不再要求显式 `--runtime`。
+
+### 安全
+
+- 当前目录劫持（CWE-427），hook 的当前目录是你打开的仓库：
+  - Windows：wrapper 与各 CLI 不再**隐式**从当前目录解析 `py`、`python`、`git`、`claude`、`obsidian`
+    等程序名。在 Claude Code 里运行 hook 时宿主已设置防护变量；本次补上 CLI 在普通终端里运行、以及
+    Python 3.9–3.11 的 `shutil.which` 不认该变量两处。
+  - 所有平台：wrapper 探测 Python 之前、以及各 CLI 在 macOS / Linux 上启动时，丢弃 PATH 里的空条目、
+    `.` 与相对条目（如 `./node_modules/.bin`）——它们都指向当前目录。macOS / Linux 上 hook 自本版起才
+    真正运行，这一面随之首次可达，本版一并修复。
+  - 命令串首词改为绝对路径 `/bin/sh`，不再按 PATH 查找 `sh`。
+  - 边界：直接用 cmd.exe 运行 wrapper（不是 hook 的执行路径）时，PATH 里显式写的 `.` 仍会生效。
+
+### 文档
+
+- README「跨平台」节写明最低支持 Python 3.9、Windows 需要 Git for Windows；「停用逃生阀」补上项目
+  CLAUDE.md 注释与插件层停用两种方式。
+- `docs/MIGRATION.md` 增加本版升级与回退到 2.0.0 的说明。
+
+### 内部
+
+- 新增守卫 `tests/test_python_floor.py`：按 3.9 对本仓库的 `.py` 做 best-effort 静态检查（语法、
+  会在运行期求值的 `X | Y`、3.10–3.12 放宽的若干写法）。
+- 新增守卫：命令串形态（首词 `/bin/sh`、`shell` 字段、不得有 `args`、两个事件各自指向自己的入口）；
+  有 WSL 时用 dash 端到端执行命令串，并对 sh 段做 bashism 静态检查；PATH 含空 / 相对条目时不执行预置
+  程序；两份 `_exe_search` 的一致性、裸 `shutil.which` 调用点白名单、`__main__` 加固的静态与运行时检查。
+- 标注读写抽到 `_annotations.py`：`--review` / `--review-web` 与 mod 三个写者共用 `lease_lock`，带 `id`
+  的标注只写一次；三个写者都写 `ts`，两条都带 `ts` 时按时间取新（mod 的标注晚于点击时刻才投递），
+  本版之前写入、不带 `ts` 的旧记录仍按文件顺序后写覆盖。mod 的投递整批只取一次锁、最多等 0.25 秒；
+  `--review` 遇到锁被占用时提示后跳过该条，不再中断。
+- 新增 mod 测试（`tests/mod/`，`claude plugin test`）与静态守卫 `tests/test_mod_static.py`：`modules`
+  指向受跟踪的文件、manifest 形态、`claude plugin validate` 列出的调用只在白名单内（mod 不起子进程、不联网）、
+  mod 读取的快照字段都在契约夹具里。
+
 ## [2.0.0] - 2026-10-08
 
 ### 破坏性变更

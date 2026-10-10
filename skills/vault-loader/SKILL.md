@@ -170,8 +170,8 @@ vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Cl
 | `relevance.session_topic_top_n` | `30` | 首轮送进提炼子进程的 admitted 候选篇数；与 `session_topic_project_top_k` 并集后封顶 `session_topic_pool_max`。显式写过的值不会被 `migrate_config` 动 |
 | `relevance.session_topic_project_top_k` | `20` | 当前项目 `项目笔记/<仓库名>/`（含项目 CLAUDE.md 的 `extra_paths`）下按 mtime 最新的 N 篇并入首轮提炼候选池；worktree 内按主仓库名取。显式写过的值不会被 `migrate_config` 动 |
 | `relevance.session_topic_pool_max` | `50` | 首轮提炼候选池封顶：admitted 前 `session_topic_top_n` 全保留，**被截掉的是项目笔记那一片**——本轮 admitted 实际篇数达到本值时项目笔记一篇都进不了池（要保住项目片就把本值随 `session_topic_top_n` 一起调大；开 `metrics` 后报表「候选池」行会点破「项目笔记恒为 0」）。显式写过的值不会被 `migrate_config` 动 |
-| `relevance.session_pin_enabled` | `true` | 会话级固定注入总开关（**需 `relevance.session_topic` 同时为 `true`**——点名来自同一个提炼子进程，`session_topic: false` 时本开关无效）：首轮 LLM 点名的笔记在整个会话（`state_ttl_hours` 内）每轮注入其 summary，**独占额外名额**（不占 `user_prompt_submit.max_notes`），机械召回为空时也注入；闸门早退（指代型/关键词不足/subagent 事件通知/**命中 `skip_slash_commands`**）轮次不注入。关掉则提炼 prompt 与候选池回到 1.2.1 形态 |
-| `relevance.session_pin_max` | `1` | 首轮最多点名几篇；读端每轮也按此值收口（TTL 内调低立即少注入；`0` 等价于关掉点名），读写两侧硬上限 8。首版取 1：点错时只污染一篇 |
+| `relevance.session_pin_enabled` | `true` | 会话级固定注入总开关（**需 `relevance.session_topic` 同时为 `true`**——点名来自同一个提炼子进程，`session_topic: false` 时本开关无效）：首轮 LLM 点名的笔记在整个会话（`state_ttl_hours` 内）每轮注入其 summary，**独占额外名额**（不占 `user_prompt_submit.max_notes`），机械召回为空时也注入；闸门早退（指代型/关键词不足/subagent 事件通知/**命中 `skip_slash_commands`**）轮次不注入。关掉则提炼 prompt 与候选池回到 1.2.1 形态。不影响 `/vault-injected` 里的手动钉住（用户的显式操作） |
+| `relevance.session_pin_max` | `1` | 首轮最多点名几篇；读端每轮也按此值收口（TTL 内调低立即少注入；`0` 等价于关掉点名），读写两侧硬上限 8。首版取 1：点错时只污染一篇。本会话有手动钉住时，点名实际上限为 `min(本值, 8 − 手动钉住篇数)`（手动先占位，合计不超过 8） |
 
 > ⚠️ **`skip_slash_commands` 的两条边界**（2026-09-16 实测，本机 metrics 加盐 hash × transcript 对拍 335 个 slash 命令轮）：
 >

@@ -1,7 +1,16 @@
 {
   "name": "context-vault",
   "description": "Capture and recall a local knowledge vault from Claude Code.",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": { "name": "context-vault contributors" },
-  "license": "MIT"
+  "license": "MIT",
+  "types": "./hooks/vault-mod.d.ts",
+  "userConfig": {
+    "mod_enabled": {
+      "type": "boolean",
+      "title": "Injection band and pane",
+      "description": "Show the latest vault injection above the prompt and enable /vault-injected (exclude, pin, annotate). Turning it off leaves recall unchanged.",
+      "default": true
+    }
+  }
 }

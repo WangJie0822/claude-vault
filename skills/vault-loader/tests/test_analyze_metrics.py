@@ -408,6 +408,70 @@ def test_review_eof_after_saving_one_returns_0(tmp_home, monkeypatch):
     from scripts.analyze_metrics import load_annotations
     assert load_annotations(tmp_home) == {("near_miss", "notes/foo.md"): "relevant"}
 
+
+def _seed_two_near_miss(tmp_home):
+    _ph = _seed_review_context(tmp_home, "sessA", "这轮问的是内存泄露")
+    _metrics.write_record(tmp_home, "sessA", {
+        "_schema": 1, "ts": 1.0, "session": "sessA", "prompt_id": "p0",
+        "prompt_h": _ph,
+        "cwd_h": "x", "kw_h": [], "n_kw": 0, "gate": "", "relaxed": False,
+        "admitted": [], "near_miss": [{"path": "notes/foo.md", "topical": 3.8,
+                                       "dedup": ""},
+                                      {"path": "notes/bar.md", "topical": 3.0,
+                                       "dedup": ""}],
+        "near_miss_scorelow": [{"path": "notes/foo.md", "topical": 3.8},
+                               {"path": "notes/bar.md", "topical": 3.0}],
+        "n_excluded": 5, "ft": {"path": "", "arm": ""},
+    })
+
+
+def _drive_review(tmp_home, monkeypatch, answers):
+    import builtins
+    from scripts import analyze_metrics as am
+
+    class _FakeTTYStdin:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_home))
+    monkeypatch.setattr(sys, "argv", ["analyze_metrics.py", "--review"])
+    monkeypatch.setattr(sys, "stdin", _FakeTTYStdin())
+    it = iter(answers)
+
+    def _fake_input(prompt=""):
+        try:
+            return next(it)
+        except StopIteration:
+            raise EOFError
+
+    monkeypatch.setattr(builtins, "input", _fake_input)
+    return am.main()
+
+
+def test_review_writes_ts(tmp_home, monkeypatch):
+    """节点 2 Q-M2：--review 不带 ts 时，迟到的 mod 标注会按「后写覆盖」压过这次更新的判断。"""
+    import time
+    from scripts.analyze_metrics import annotations_path
+    _seed_two_near_miss(tmp_home)
+    before = int(time.time())
+    assert _drive_review(tmp_home, monkeypatch, ["r", "q"]) == 0
+    rows = [json.loads(x) for x in annotations_path(tmp_home).read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert isinstance(rows[0].get("ts"), int) and before <= rows[0]["ts"] <= int(time.time())
+
+
+def test_review_survives_lock_timeout(tmp_home, monkeypatch, capsys):
+    """节点 2 Q-M3：引入锁之后 save_annotation 会抛 TimeoutError，交互循环不得因此崩溃。"""
+    from scripts import analyze_metrics as am
+
+    def _busy(*_a, **_k):
+        raise TimeoutError("busy")
+
+    _seed_two_near_miss(tmp_home)
+    monkeypatch.setattr(am, "save_annotation", _busy)
+    assert _drive_review(tmp_home, monkeypatch, ["r", "q"]) == 0
+    assert "未保存" in capsys.readouterr().err
+
 # ===== P3（full-review High）：load_records 全量物化 =====
 
 def _seed_bulk(home, n_sessions, per_session, admitted_n):

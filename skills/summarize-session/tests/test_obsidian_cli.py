@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -696,3 +697,18 @@ def test_property_set_fallback_no_fm_with_quotes(tmp_vault):
         cli.property_set("a.md", "note", 'say "no"')
         back = cli.property_read("a.md", "note")
     assert back["data"]["value"] == 'say "no"'
+
+
+def test_cli_ignores_obsidian_planted_in_cwd_on_windows(tmp_vault, tmp_path, monkeypatch):
+    """Windows 分支：which 返回当前目录里的 obsidian.BAT（Python 3.9–3.11 的行为）时不得执行它。"""
+    monkeypatch.setattr("obsidian_cli.sys.platform", "win32")
+    monkeypatch.setattr("obsidian_cli.shutil.which",
+                        lambda n, *a, **k: os.path.join(os.curdir, n + ".BAT"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    called = []
+    monkeypatch.setattr("obsidian_cli.subprocess.run",
+                        lambda *a, **k: called.append(a) or MagicMock())
+    cli = ObsidianCLI(str(tmp_vault), enabled=True)
+    assert cli._cli(["read", 'path="a.md"']) == {"ok": False, "reason": "cli-not-found"}
+    assert called == []

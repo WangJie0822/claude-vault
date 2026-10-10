@@ -31,7 +31,14 @@
 
 > **升级后你会看到一个新目录**：hook 的事件去重 marker 无条件写入 `~/.context-vault/state/events/`，
 > 与是否迁移、是否开启 metrics 都无关。它只存事件摘要（不含 prompt、不含 cwd、不含笔记路径），
-> 保留 90 天后自动清理。这是唯一一个未经迁移就会出现的新目录，此处如实说明以免被当成迁移已发生。
+> 保留 90 天后自动清理。
+>
+> 在交互终端里使用时还会出现 `~/.context-vault/state/live/`（见下节「注入可见与可控」的「数据」）：放 mod
+> 与 Python 之间的按轮请求和会话快照，内容是最近一次注入、钉住与排除的笔记路径和标题，metrics 开启时
+> 另有命中词与提问的加盐 hash。它只在能加载 mod、`mod_enabled` 没关、且会话有绘制界面时出现；快照
+> 24 小时、请求与临时文件 1 小时后由下一次会话开始时清理，`analyze_metrics.py --purge` 一并清除；
+> `claude -p` 等没有绘制界面的会话不写它。
+> 这两个是仅有的未经迁移就会出现的新目录，此处如实说明以免被当成迁移已发生。
 
 迁移默认只预览；`--apply` 只复制、不删除旧数据，并在新配置已存在或读写两端 Vault 冲突时停止：
 
@@ -40,6 +47,55 @@ python scripts/migrate_context_vault.py
 python scripts/migrate_context_vault.py --apply
 python scripts/context_vault_doctor.py
 ```
+
+---
+
+## 注入可见与可控（band 与 `/vault-injected`）
+
+插件自带一个 mod（`hooks/vault-mod.js`），在交互终端里：
+
+- **输入框上方常驻一行**：最近一次注入了几篇、标题，钉住与本会话排除的篇数。打分了但没有命中时显示
+  「无注入」；后台通知、指代词提问等被闸门跳过的轮次保留上一次的内容，并标「（本轮未召回）」。你在面板
+  里做的操作若没能送达 Python（例如两侧算出的主目录不一致），这一行会改为告警，每个会话只告警一次。
+- **`/vault-injected` 打开面板**，操作在下一次提问时生效：
+  - 对最近一次注入的每篇：**排除**——本会话之后的提问不再注入它（机械召回、升级为全文、自动点名都不会
+    再选它）；已经注入过的不会撤回；会话开始注入的项目固定上下文不受影响（`/compact` 之后照常注入）。
+  - **钉住**：之后每次打分的提问都以摘要注入（被闸门跳过的轮次不注入）。手动钉住先占位，与 LLM 自动
+    点名合计不超过 8 篇：手动钉住 n 篇时，自动点名最多 `min(session_pin_max, 8 − n)` 篇。
+  - 自动点名的篇可以**取消**，效果等于本会话排除它；手动钉住与排除都可以撤销；会话开始注入的项目笔记
+    也可以钉住。
+  - 上限：排除 50 篇、手动钉住 8 篇、取消自动点名 8 篇，到上限时按钮直接拒绝并提示。
+  - 「本会话」按会话 id 算：`/clear` 或 `/resume` 进入另一个会话后，操作与告警额度从空开始。
+- **标注**：metrics 开启（`config.json::metrics.enabled`）且不在 dry_run 时，面板里有「有用 / 无用」按钮。
+  标注先排在本插件的 store 里（7 天过期、最多 200 条；队列在所有会话之间共享），随之后的提问交给
+  Python，按 metrics 里那一轮的记录核对后写入 `annotations.jsonl`。每条标注的去向：
+  - 核对通过：写入并从队列移除；同一条只会写一次。
+  - **拒收：从队列删除、不再重投**——metrics 已关闭（面板会提示）、会话的 metrics 记录里找不到那一轮、
+    条目格式不对。
+  - 暂不判定、留在队列里下次再投：配置文件读坏的那一轮、dry_run、会话的 metrics 文件读不到（例如
+    `--purge` 之后；`--purge` 之前标的标注不会再写入）、`annotations.jsonl` 正被别的写者占用。
+  - 写入发生在本轮注入之前，等标注文件的锁最多 0.25 秒，等不到就整批留到下一轮。
+- **关闭**：插件配置项 `mod_enabled` 设为 `false` 后，band 与 `/vault-injected` 都不出现，召回照常。它是
+  插件的配置项（`.claude-plugin/plugin.json` 的 `userConfig`），不在 `~/.context-vault/config.json` 里。按
+  Claude Code 2.1.293 的插件文档：首次安装时安装界面会列出它；它也是 `/config` 菜单里的一行，在那里改动后
+  插件随即重新加载。这两点都没有实测；更新到本版时会不会弹出设置界面，同样尚未实测。
+- **不显示的地方**：`claude -p`；VS Code 的聊天面板（输入框上方这一行只在终端与 Desktop 上绘制）。
+  Desktop 的 Code 标签里是否可用尚未实测：那里的会话入口类型若不是 `cli`，召回本身就不运行。
+- **版本**：本插件的 mod 只在 Claude Code 2.1.293 上验证过（`claude plugin validate` 与 `claude plugin test`；
+  交互终端里的实际绘制尚无运行记录）。另用一个同样声明 `modules` / `types` / `userConfig` 的最小探针插件
+  在 2.1.286、2.1.250、2.1.220 上验证过：三者都不因这些新字段拒绝插件，命令 hook 照常执行；2.1.250 与
+  2.1.220 不加载 mod（没有 band 与命令）。本插件本身没有在这三个版本上安装运行过（2026-10-10，Windows 11）。
+- **数据**：
+  - `~/.context-vault/state/live/`：mod 写的按轮请求（排除、钉住、取消点名的笔记路径与待写入的标注）与
+    Python 写的会话快照（最近一次注入、钉住、排除与会话开始注入的路径和标题，拒收与已写入的标注 id；
+    metrics 开启时另有命中词明文与提问的加盐 hash）。POSIX 上快照由 Python 以目录 0700、文件 0600 写出；
+    mod 先建目录或写请求时用宿主的默认权限（未在 POSIX 实测）。
+  - store：Claude Code 配置目录下 `plugins/store/` 里以 `context-vault_` 开头的文件，内容是待写入的标注
+    （笔记路径、会话 id、提问的加盐 hash、判断）。`--purge` 不清它，卸载也不清，需要时手工删除。
+  - 展示状态放在 Claude Code 的 `$.state` 里，按其文档其它插件的 mod 也能读到（含会话 id、提问 hash 与笔记
+    路径；未实测）。
+  - 停用逃生阀开着时：会话开始仍会清理 `live/` 里的过期文件，有 mod 请求的那一轮仍写一份标为停用的快照。
+    要让 `live/` 完全不写入，同时把 `mod_enabled` 关掉。
 
 ---
 
@@ -69,13 +125,15 @@ function claude { & claude.exe --plugin-dir "<插件目录绝对路径>" @args }
 
 ## 跨平台
 
-支持 **macOS**、**Linux**、**Windows**。
+支持 **macOS**、**Linux**、**Windows**。需要 Python **3.9** 或更高版本，更低版本不保证可用。
 
 hook 通过一个 polyglot 包装脚本运行，按以下顺序探测 Python 解释器：
 
 1. `py` 启动器（Windows `py.exe`）
 2. `python3`
 3. `python`
+
+hook 命令以 `/bin/sh` 执行这个包装脚本，不依赖文件的可执行位。Windows 上 Claude Code 用 Git Bash 执行本插件的 hook，需要安装 Git for Windows；没装时本插件的 hook 无法运行。若 Claude Code 提示给 hook 改用 `"shell": "powershell"`，不要照做：命令串与 PowerShell 不兼容，插件更新也会覆盖这类改动。
 
 若找不到任何 Python 解释器，hook 会**静默跳过**——绝不阻断你的 Claude Code 会话。
 
@@ -124,13 +182,16 @@ hook 通过一个 polyglot 包装脚本运行，按以下顺序探测 Python 解
 
 ## 停用逃生阀
 
-三种方式可在不卸载的情况下停用 vault-loader：
+四种方式可在不卸载的情况下停用 vault-loader：
 
 | 方式 | 作用范围 |
 |---|---|
 | `VAULT_LOADER_DISABLE=1`（环境变量） | 仅当前进程 |
 | 创建 `~/.context-vault/.disabled`（文件；旧 `~/.claude/.vault-loader-disabled` 也兼容） | 持续生效直到删除该文件 |
 | 在 `~/.context-vault/config.json` 中设 `enabled: false` | 永久生效直到改回 |
+| 在项目的 `CLAUDE.md` 里写停用注释（写法见 vault-loader 的 SKILL.md） | 仅该项目 |
+
+这四种都在 hook 的 Python 脚本启动之后才判定。插件本身出了问题（例如 hook 每次都报错）时，在 Claude Code 的插件管理里停用或卸载本插件。
 
 ### 按 slash 命令跳过（`skip_slash_commands`）
 
@@ -169,7 +230,7 @@ vault-loader 内置一套**可选**的效果评估机制：记录每轮召回的
    { "metrics": { "enabled": true } }
    ```
 
-3. **记录什么**——prompt 关键词的**加盐 hash**（非明文；盐存在同目录下的 `.salt`，本机静态、启动时自动生成）、被召回笔记的**命中词明文**、笔记相对路径、打分与闸门决策。开着 `relevance.session_topic` 时另有：会话主题词的**加盐 hash**（同盐）、LLM 点名篇的相对路径（明文，与其它笔记路径同一口径）、首轮候选池篇数。**不记录 prompt 原文**。
+3. **记录什么**——prompt 关键词的**加盐 hash**（非明文；盐存在同目录下的 `.salt`，本机静态、启动时自动生成）、被召回笔记的**命中词明文**、笔记相对路径、打分与闸门决策。开着 `relevance.session_topic` 时另有：会话主题词的**加盐 hash**（同盐）、LLM 点名篇的相对路径（明文，与其它笔记路径同一口径）、首轮候选池篇数。在 `/vault-injected` 里手动钉住过的轮次另有本轮实际渲染的手动钉住篇的相对路径（`user_pinned`）与篇数（`user_pinned_injected`）。**不记录 prompt 原文**。
 
    > ⚠️ **`.salt` 的保护是平台相关的，Windows 上没有强制手段。** POSIX 使用 `0600`；Windows 由 `~/.context-vault` 继承 ACL，可用 `icacls "$env:USERPROFILE\.context-vault\metrics"` 检查。介意时不要启用 metrics。
 4. **存在哪 + 体积**——1.0 起写入 `~/.context-vault/metrics/claude/`（2.0.0 之前的版本还可能留下 `~/.context-vault/metrics/codex/`，见 `docs/MIGRATION.md`）；0.9.x legacy 数据仍在 `~/.claude/vault-loader-metrics/`。事件按月分桶；辅助文件一直保留到手动 `--purge`。

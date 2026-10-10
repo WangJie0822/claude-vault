@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 
@@ -35,3 +36,19 @@ def test_claude_flags_still_exist_in_real_cli():
     out = subprocess.run([exe, "--help"], capture_output=True, text=True,
                          encoding="utf-8", errors="replace", timeout=60).stdout
     assert "--model" in out, "claude 不再支持 --model；call_claude 需要同步更新"
+
+
+def test_call_claude_ignores_claude_planted_in_cwd(tmp_path, monkeypatch):
+    """Python 3.9–3.11 的 which 会返回当前目录里的 claude.cmd 并被直接执行。"""
+    from context_vault import exe_search
+    monkeypatch.setattr(exe_search.sys, "platform", "win32")
+    monkeypatch.setattr(exe_search.shutil, "which", lambda n, *a, **k: os.path.join(os.curdir, n + ".CMD"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    ran = []
+    # 桩返回一个失败的 CompletedProcess：被误调时 call_claude 照常走完，由下面的断言报出，
+    # 而不是在取 .returncode 时抛 AttributeError
+    monkeypatch.setattr(model.subprocess, "run",
+                        lambda *a, **k: ran.append(a) or subprocess.CompletedProcess(a, 1, "", ""))
+    assert model.call_claude("hi") is None
+    assert ran == []

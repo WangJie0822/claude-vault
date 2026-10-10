@@ -129,6 +129,23 @@ def effective_pin_max(config) -> int:
         return max(0, min(MAX_PIN_HARD_CAP, max_default))
 
 
+def split_pin_budget(n_user: int, config) -> "tuple[int, int]":
+    """手动钉住与 LLM 点名的**合计**上限单点（spec 2026-10-09 mod 注入可见与可控 §6.2）。
+
+    返回 (手动钉住上限, LLM 点名上限)。手动优先占位；两者合计不超过 `MAX_PIN_HARD_CAP`。
+    LLM 侧仍以 `effective_pin_max` 为上界：`session_pin_enabled: false` 只关 LLM 点名，
+    不关手动钉住（手动钉住是用户的显式操作）。没有手动钉住时返回 (0, effective_pin_max)，
+    即与改动前完全相同。
+    """
+    try:
+        n = max(0, int(n_user))
+    except (TypeError, ValueError):
+        n = 0
+    user_cap = min(n, MAX_PIN_HARD_CAP)
+    llm_cap = max(0, min(effective_pin_max(config), MAX_PIN_HARD_CAP - user_cap))
+    return user_cap, llm_cap
+
+
 def load_session_topic(cwd: Path, session_id: str, ttl_hours: float) -> list[str]:
     """读该会话的主题词。缺失 / 损坏 / 过期 / 结构不对 → 空列表，绝不抛异常。
 
@@ -544,6 +561,11 @@ def _call_model(prompt_text: str) -> str | None:
     - 兜底 `except Exception`：子进程内任何失败都只返回 None；
     - 只依赖同级模块，不把 `context_vault` 包引入提炼子进程的导入面。
     合并两份实现时，以上三点都不能丢。
+
+    这里刻意用裸 `shutil.which` 而不是 `which_no_cwd`（后者在 `context_vault` 里，违反上面第三点）：
+    安全前提是 `spawn_topic_extraction` 以插件目录为 cwd 起本子进程，Python 3.9–3.11 的
+    `shutil.which` 在 Windows 上先搜的是那个目录而不是用户项目。改那里的 cwd 前先改这里；
+    裸调用点由 `tests/test_exe_search.py::test_bare_shutil_which_only_at_reviewed_sites` 登记。
     """
     exe = shutil.which("claude")
     if exe is None:

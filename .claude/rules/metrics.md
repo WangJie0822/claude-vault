@@ -2,6 +2,7 @@
 paths:
   - "skills/vault-loader/scripts/_metrics.py"
   - "skills/vault-loader/scripts/analyze_metrics.py"
+  - "skills/vault-loader/scripts/_annotations.py"
   - "skills/vault-loader/scripts/session_start_load.py"
   - "skills/vault-loader/scripts/prompt_submit_load.py"
 ---

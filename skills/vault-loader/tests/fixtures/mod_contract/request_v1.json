@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "exclude": ["项目笔记/demo/a.md"],
+  "pin": ["项目笔记/demo/b.md"],
+  "unpin_llm": [],
+  "annotations": [
+    {"id": "ann-00000001", "path": "项目笔记/demo/c.md", "kind": "admitted_list",
+     "verdict": "relevant", "session": "<SESSION_UUID>",
+     "prompt_h": "0123456789abcdef", "ts": 1791550000}
+  ]
+}

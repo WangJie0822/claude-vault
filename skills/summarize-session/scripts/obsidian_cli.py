@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from _exe_search import which_no_cwd
+
 OBSIDIAN_PROC = "Obsidian"
 DEFAULT_TIMEOUT = 5.0
 
@@ -132,7 +134,7 @@ class ObsidianCLI:
         """Obsidian GUI 是否在运行 + obsidian CLI 是否可调用。结果缓存到 skill 运行期。
 
         - mac/linux：pgrep + zsh -lc 'command -v obsidian'
-        - Windows：tasklist + shutil.which('obsidian')
+        - Windows：tasklist + which_no_cwd('obsidian')（不接受当前目录里的同名文件）
         """
         if self._probe_cache is not None:
             return self._probe_cache
@@ -182,8 +184,8 @@ class ObsidianCLI:
 
         # 2. 检测 obsidian CLI 可用性
         if is_windows:
-            # Windows 上 obsidian 安装到用户 PATH（如 .COM/.EXE），shutil.which 可直接找到
-            if shutil.which("obsidian") is None:
+            # Windows 上 obsidian 安装到用户 PATH（如 .COM/.EXE）；不接受当前目录里的同名文件
+            if which_no_cwd("obsidian") is None:
                 self._probe_cache = {"ok": False, "reason": "cli-not-registered"}
                 return self._probe_cache
         else:
@@ -214,7 +216,7 @@ class ObsidianCLI:
         prefix = f'"{self._vault_name}" ' if self._vault_name else ""
 
         if sys.platform == "win32":
-            obsidian_exe = shutil.which("obsidian")
+            obsidian_exe = which_no_cwd("obsidian")
             if not obsidian_exe:
                 return {"ok": False, "reason": "cli-not-found"}
             # caller 传入的 args 含 POSIX shlex.quote 包装；用 shlex.split(posix=True) 反解析
@@ -620,4 +622,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from _exe_search import harden_exe_search
+    harden_exe_search()
     main()

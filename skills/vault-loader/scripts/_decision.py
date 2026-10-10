@@ -17,10 +17,17 @@ from scripts._scorer import (
 from scripts._signal_collect import extract_slash_command_name, is_pure_cjk_keywords
 
 
+# 本会话由用户在 mod pane 里排除的篇（spec 2026-10-09 mod 注入可见与可控 §6.1）。
+# 与 "fulltext_injected" / "candidate_injected" 同列为 EntryDecision.dedup 的取值，但语义不同：
+# 它**不是**「曾注入过」，`analyze_metrics` 里按「曾注入过」分桶的三处消费方必须单列它。
+USER_EXCLUDED = "user_excluded"
+
+
 @dataclass
 class StateView:
     fulltext_injected: set[str] = field(default_factory=set)
     candidate_injected: set[str] = field(default_factory=set)
+    user_excluded: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -31,7 +38,7 @@ class EntryDecision:
     hits: list[str]        # 该篇命中的查询词（S1 渲染与臂归因共用）
     admitted: bool
     admit_arm: str         # "topical" | "keyword_bypass" | "upgrade_candidate" | ""
-    dedup: str             # "" | "fulltext_injected" | "candidate_injected"
+    dedup: str             # "" | "fulltext_injected" | "candidate_injected" | USER_EXCLUDED
     # dedup 可达性（F3 校准，供 Task 10 回放归因）：
     # - "fulltext_injected"：恒 admitted=False——该 dedup 桶从不放行，只出现在 Decision.excluded。
     # - "candidate_injected"：admitted=True（topical 升到 fulltext_topical_threshold，落
@@ -268,6 +275,16 @@ def decide_injection(active_entries: dict, signals: Signals, weights: dict,
     for path, entry in active_entries.items():
         t = topical_score(entry, signals, weights, use_kw,
                           tag_df=tag_df, n_docs=n_docs, tag_idf_floor=floor)
+        if path in state.user_excluded:
+            # 用户排除优先于两个去重分支：否则「曾弱候选注入」的篇升到全文阈值时会被重新放行。
+            # 仍相关时置 any_relevant，避免出现「未匹配到强相关笔记」的兜底提示。
+            if t >= min_topical:
+                any_relevant = True
+            excluded.append(EntryDecision(
+                path=path, topical=t, total=0.0, hits=[],
+                admitted=False, admit_arm="", dedup=USER_EXCLUDED,
+            ))
+            continue
         if path in state.fulltext_injected:
             if t >= min_topical:
                 any_relevant = True   # 仍相关但已拿全文 → 不重注、抑制兜底

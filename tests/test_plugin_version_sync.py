@@ -33,12 +33,15 @@ CLAUDE.md「发布流程」已把「同步 bump 两处」写成约定，但此�
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN_JSON = ROOT / ".claude-plugin" / "plugin.json"
 MARKETPLACE_JSON = ROOT / ".claude-plugin" / "marketplace.json"
 VERSION_FILE = ROOT / "VERSION"
+CHANGELOG = ROOT / "CHANGELOG.md"
+_VERSION_HEADING = re.compile(r"^## \[(\d+\.\d+\.\d+)\]", re.M)
 
 
 def _load(path: Path) -> dict:
@@ -92,6 +95,31 @@ def test_all_manifests_follow_root_version():
     assert expected == claude["version"]
     assert _self_entry(market, claude["name"])["version"] == expected
     assert claude["name"] == "context-vault"
+
+
+def _first_version_section(text: str) -> str | None:
+    m = _VERSION_HEADING.search(text)
+    return m.group(1) if m else None
+
+
+def test_changelog_first_version_section_follows_root_version():
+    """bump `VERSION` 时必须同时把 CHANGELOG 的 `[Unreleased]` 改成该版本节。
+
+    只看第一个带版本号的节：开发期它上面可以有 `[Unreleased]`，那时它仍等于当前已发布的版本。
+    漏改的后果：发布提交的 message 由 CHANGELOG 该版一节生成，按版本号取不到那一节。
+    """
+    expected = VERSION_FILE.read_text(encoding="utf-8").strip()
+    first = _first_version_section(CHANGELOG.read_text(encoding="utf-8"))
+    assert first == expected, (
+        f"CHANGELOG 第一个版本节是 {first!r}，VERSION 是 {expected!r}："
+        "bump 版本号时把 `## [Unreleased]` 改成 `## [<版本>] - <日期>`。"
+    )
+
+
+def test_first_version_section_skips_unreleased():
+    assert _first_version_section("# x\n\n## [Unreleased]\n\n### a\n\n## [2.1.0] - d\n\n## [2.0.0] - d\n") == "2.1.0"
+    assert _first_version_section("## [Unreleased]\n\n### a\n") is None
+    assert _first_version_section("### [9.9.9]\n## [1.2.3] - d\n") == "1.2.3"
 
 
 def test_marketplace_entry_points_to_self():

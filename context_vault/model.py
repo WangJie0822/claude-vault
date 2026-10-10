@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
+
+from context_vault.exe_search import which_no_cwd
 
 
 def call_claude(prompt: str, *, timeout: int = 60,
                 model: str = "haiku") -> str | None:
-    executable = shutil.which("claude")
+    executable = which_no_cwd("claude")
     if executable is None:
         return None
     env = dict(os.environ)

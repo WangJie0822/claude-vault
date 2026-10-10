@@ -15,6 +15,19 @@ paths:
 
 > 本文件是 CLAUDE.md「硬约束索引 · Hook 管线与 runtime」的正文。「## 迁移原文」小节自 CLAUDE.md（基线 `3ac359f`，该提交只在开发仓库可取）迁出，除少量已失效的指代、路径与行号锚点外逐字保留；小节内「本文件」「本节」「此处」「上一版」凡指文档位置的，均指原 CLAUDE.md，出现的数字是当时的读数。此后新增内容写在「## 现行补充」里，按 CLAUDE.md「写入约定」执行。
 
+## 现行补充
+
+- 命令串 `/bin/sh "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd" <脚本> || exit 1`：
+  - wrapper 在 git 里一直是 100644，直接执行它在 Linux 原生文件系统上是 126（2026-10-09，WSL Ubuntu 26.04，dash，ext4；`/mnt/<盘符>` 显示 777 会掩盖）；
+  - 首词用绝对路径：裸名 `sh` 按 PATH 查找，当前目录条目在前时会执行仓库里预置的 `sh`；
+  - `|| exit 1`：dash 打不开文件时退出码 2，UserPromptSubmit 收到 2 会拦截提交（2.0.0 旧命令串此时是 127）；
+  - `"shell": "bash"` 声明对 Git Bash 的依赖（2.1.293 二进制所见：无 Git Bash 时报 `requires bash but Git Bash was not found`，未实测）；非 Windows 上宿主恒以 `/bin/sh -c` 执行；
+  - 不得加 `args`：exec form 下 `command` 被当成可执行文件，wrapper 是 100644、Windows 不能 spawn `.cmd`；
+  - 已知残余：shell form 下宿主对占位符做不转义的文本替换；
+  - 2.1.293 实测两种声明都执行到脚本。「`.` 读入入口文件」被否：dash 的 `.` 不传参数，失败以 2 退出。
+- 宿主三个平台只走 sh 段，batch 段只在 cmd.exe 直接运行时执行；sh 段只用 POSIX 构造（`test_sh_section_has_no_bashisms`），dash 由 WSL 用例覆盖。
+- 当前目录劫持（CWE-427）：宿主 2.1.293 启动时设 `NoDefaultCurrentDirectoryInExePath=1`（hook 子进程实测为 1），wrapper 两段与 `harden_exe_search` 再各设一次；`where.exe` 与 Python 3.9–3.11 的 `shutil.which` 不认它，故用 `where $PATH:` 与 `which_no_cwd`（例外 `_topic._call_model`：子进程 cwd 是插件目录，不得导入 `context_vault`）。该变量只去掉隐式当前目录；PATH 显式的空、`.`、相对条目由 sh 段与 `harden_exe_search` 的 POSIX 分支丢弃，batch 段不处理。`harden_exe_search` 放在 `__main__` 块，测试调 `main()` 时不改写环境；helper 两份是因 summarize-session 脚本不保证能导入 `context_vault`。
+
 ## 迁移原文（基线 `3ac359f`）
 
 ### Hook 管线（`hooks/`）
@@ -42,3 +55,7 @@ paths:
 - 退役的直接动因之一：1.x 的宿主识别在 Claude Code 2.1.293 上把部分 SessionStart 判成 Codex，作者本机 `metrics/codex/` 185 条记录中 183 条是 session_start，涉及 156 个会话，其中 117 个能在本机找到 Claude Code transcript；`claude -p` 下两次探针未复现，交互与后台模式的 payload 未取到，成因未坐实。
 - Windows 守卫随之改写（`tests/test_hook_command_claude.py`）：按 Claude Code 的方式把插值后的完整 `command` 交给 Git Bash 执行，核对 stdin 到达脚本，覆盖「有 / 没有 `CLAUDE_PLUGIN_ROOT`」两种形态。上文「只有 `PLUGIN_ROOT` / 两者都无 / 两者不一致」三种形态里有两种依赖 `PLUGIN_ROOT`，随它一起退役。依据的实测（2026-10-08，Git for Windows 2.55.0，GNU bash 5.3.15）：Git Bash 把 `.cmd` 交给 cmd.exe 执行，polyglot 探针只输出 batch 段的标记，所以 Windows 上覆盖的是 batch 段、macOS / Linux 上覆盖的是 sh 段。守卫取 bash 必须从 git 的安装位置推出 Git Bash，不能取 PATH 上第一个 bash：Windows 常规终端里那是 System32 的 WSL 启动器（同日实测：用它执行插值后的命令串 rc=127、`No such file or directory`），整组用例会误报红。没装 Git Bash 的 Windows 上 Claude Code 改用 PowerShell 执行同一条命令串，当前命令串在那里解析失败、脚本没被执行（1.x 起既有，不是 2.0.0 引入），守卫不覆盖这一形态。
 - 订正一处实测：上文「`CLAUDE_PLUGIN_ROOT` 不在 hook 子进程环境里」未标注测量版本；Claude Code 2.1.293 的 `claude -p` 探针实测 hook 子进程环境里有该变量。wrapper 仍保留「取不到就回落自身位置」。
+
+## 历史订正（hook 命令串改为 `/bin/sh` 执行）
+
+- 上文三处随之失效：迁移原文「单文件而非 `.cmd`+`.sh` 两份」的理由（宿主现在显式以 `/bin/sh` 执行 wrapper，不再直接执行它）；2.0.0 订正里「Windows 上覆盖的是 batch 段」与「没装 Git Bash 的 Windows 改用 PowerShell 执行同一条命令串」（现状见「现行补充」）。迁移原文的 `run-hook.cmd:12-13` 指 batch 段两条 `if exist` 择根判断，行号已漂移。

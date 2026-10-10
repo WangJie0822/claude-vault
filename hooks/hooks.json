@@ -1,5 +1,6 @@
 {
   "description": "context-vault: auto-inject local knowledge into session context",
+  "modules": ["./vault-mod.js"],
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +8,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/session_start_load.py"
+            "shell": "bash",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/session_start_load.py || exit 1"
           }
         ]
       }
@@ -17,7 +19,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/prompt_submit_load.py"
+            "shell": "bash",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" skills/vault-loader/scripts/prompt_submit_load.py || exit 1"
           }
         ]
       }

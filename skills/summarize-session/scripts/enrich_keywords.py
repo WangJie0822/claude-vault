@@ -162,4 +162,6 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    from _exe_search import harden_exe_search
+    harden_exe_search()
     sys.exit(main())

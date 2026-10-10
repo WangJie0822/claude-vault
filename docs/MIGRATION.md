@@ -1,5 +1,32 @@
 # Context Vault 迁移指南
 
+## 2.0.0 → 2.1.0（hook 命令串改为 `/bin/sh` 执行；新增注入可见与可控 mod）
+
+配置、Vault、state、metrics 的路径不变，格式只做加性扩展（state 下新增 `live/`；metrics 记录与
+`annotations.jsonl` 新增字段），升级不需要迁移数据。行为变化见 CHANGELOG 对应版本的
+「行为变更（升级前请读）」，按平台看：
+
+- **macOS / Linux**：旧版的 hook 可能从未运行过（`hooks/run-hook.cmd` 没有可执行位）。
+  - 判断：`ls -l ~/.claude/plugins/cache/*/*vault/*/hooks/run-hook.cmd`，权限位里没有 `x` 即从未运行。
+  - 升级后会开始注入笔记，`session_topic` 默认会在每个会话首次有召回候选时调用一次 haiku；不想要时
+    配置 `relevance.session_topic: false`，或按 README「停用逃生阀」整体停用。
+  - 曾为绕过「hook 不运行」在 `~/.claude/settings.json` 手工注册过 `session_start_load.py` /
+    `prompt_submit_load.py` 的，升级后会与插件 hook 重复执行。用仓库自带的
+    `python3 scripts/migrate_settings.py` 先看会删哪些（默认只预览），确认后加 `--apply`（先备份再删）。
+- **Windows**：需要 Git for Windows。没装时本插件的 hook 无法运行（此前同样不能运行）。
+
+### 回退到 2.0.0
+
+1. 从仓库 tag `v2.0.0` 安装旧版本。
+2. 删除插件 cache 里 context-vault 更高版本的目录。skill 定位脚本时按版本号取最高的那份
+   （`sort -V | tail -1`），留着更高版本时 hook 回到了 2.0.0，而 `/summarize-session`、`/config`
+   等仍会跑新版脚本。
+3. macOS / Linux 上回退等于让 hook 回到「从未运行」的状态（同样是因为没有可执行位）。
+4. 2.0.0 不读也不清理本版新增的 `~/.context-vault/state/live/`，以及 Claude Code 配置目录下
+   `plugins/store/` 里以 `context-vault_` 开头的 store 文件（mod 的待写入标注），需要时手工删除。
+   `annotations.jsonl` 里本版写入的行多了 `id` 与 `ts` 两个字段，2.0.0 读取时忽略它们，因此同一篇的
+   多条判断回到按文件顺序后写覆盖；2.0.0 的 `--report` 会把本版记下的「用户排除」计入「被跨轮去重压掉」。
+
 ## 1.x → 2.0.0（移除 Codex 支持）
 
 2.0.0 起只支持 Claude Code，v1.4.2 是最后支持 Codex 的版本。配置、Vault、state、metrics、

@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import sys
+import time
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -23,6 +24,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts import _metrics
+from scripts._annotations import (  # noqa: F401 — 再导出，既有调用点与测试按原名使用
+    DEFAULT_KIND, KINDS, VERDICTS, _normalize_context_ids, annotations_path,
+    load_annotations, save_annotation,
+)
+from scripts._decision import USER_EXCLUDED
 from scripts._entrypoint import INTERACTIVE_ENTRYPOINTS
 from scripts._output import INJECTION_NOTICE, sanitize_injected_text
 
@@ -110,7 +116,7 @@ SUPPORTED_SCHEMAS = frozenset({1, 2})
 # 置 0 会把「这条记录写于加字段之前」和「它真的是 0」混成同一个值。
 _NUMERIC_TOP_FIELDS = ("n_admitted", "inj_chars", "n_excluded", "ts",
                        "n_topic_words", "pinned_injected", "n_topic_extracted",
-                       "n_pool", "n_pool_proj")
+                       "n_pool", "n_pool_proj", "user_pinned_injected")
 
 
 def _drop_bad_numeric_fields(r: dict) -> int:
@@ -145,6 +151,7 @@ def _drop_bad_numeric_fields(r: dict) -> int:
 
 _LIST_TOP_FIELDS: dict[str, tuple] = {
     "llm_pinned": (str,),
+    "user_pinned": (str,),
     "llm_pinned_rank": (int, type(None)),
     "llm_pinned_dedup": (str, type(None)),
     "topic_extracted_h": (str,),
@@ -210,7 +217,7 @@ class _Acc:
                  "topic_rounds", "topic_words_sum", "topic_field_n",
                  "topic_off_n", "pin_rounds", "pin_injected_sum", "pin_n",
                  "pin_rank_top3", "pin_rank_top10", "pin_rank_missing",
-                 "pin_field_n", "pin_off_n", "pin_dedup_n",
+                 "pin_field_n", "pin_off_n", "pin_dedup_n", "pin_user_excluded_n",
                  "pool_n", "pool_sum", "pool_proj_n", "pool_proj_sum", "pool_proj_rounds",
                  "skip_on_n")
 
@@ -245,7 +252,7 @@ class _Acc:
         # 前者是携带 `pinned_injected` 的轮次数（分母），后者是 `pin_on=False` 的轮次数（不进分母）。
         self.pin_rounds = self.pin_injected_sum = self.pin_n = 0
         self.pin_rank_top3 = self.pin_rank_top10 = self.pin_rank_missing = 0
-        self.pin_field_n = self.pin_off_n = self.pin_dedup_n = 0
+        self.pin_field_n = self.pin_off_n = self.pin_dedup_n = self.pin_user_excluded_n = 0
         # 首轮候选池构成（1B-H-1）：只有触发提炼的那一轮带字段。
         self.pool_n = self.pool_sum = self.pool_proj_n = self.pool_proj_sum = self.pool_proj_rounds = 0
 
@@ -356,7 +363,8 @@ def _acc_near_miss(r: dict, a: _Acc) -> None:
         # 两栏计数直接相比。而真·擦肩榜排除旧记录、对照榜若跨新旧就是
         # apples-to-oranges —— 真实数据上更极端：新格式记录为 0 时一栏全空、另一栏
         # 全满，读者的自然结论「我没有擦肩笔记」恰好是错的。
-        if is_new and d and isinstance(nm.get("path"), str) and nm["path"]:
+        if (is_new and d and d != USER_EXCLUDED
+                and isinstance(nm.get("path"), str) and nm["path"]):
             a.suppressed[nm["path"]] += 1
 
 
@@ -450,7 +458,10 @@ def _acc_pin(r: dict, a: _Acc) -> None:
         for i, rk in enumerate(ranks):
             if rk is None:
                 a.pin_n += 1
-                if i < len(dedup) and isinstance(dedup[i], str) and dedup[i]:
+                d_i = dedup[i] if i < len(dedup) else None
+                if d_i == USER_EXCLUDED:
+                    a.pin_user_excluded_n += 1        # 用户本会话排除，不是「曾注入过」
+                elif isinstance(d_i, str) and d_i:
                     a.pin_dedup_n += 1
                 else:
                     a.pin_rank_missing += 1
@@ -513,6 +524,7 @@ def _acc_to_dict(a: _Acc) -> dict:
         "pin_field_n": a.pin_field_n,
         "pin_off_n": a.pin_off_n,
         "pin_dedup_n": a.pin_dedup_n,
+        "pin_user_excluded_n": a.pin_user_excluded_n,
         "pool_n": a.pool_n,
         "pool_sum": a.pool_sum,
         "pool_proj_n": a.pool_proj_n,
@@ -655,6 +667,7 @@ def _render_pin(s: dict) -> str:
     return (f"pinned：{rounds}/{field_n} 轮注入 {s.get('pin_injected_sum', 0)} 篇；"
             f"LLM 点名 {n} 篇：机械 top-3 内 {s.get('pin_rank_top3', 0)} / top-10 内 "
             f"{s.get('pin_rank_top10', 0)} / 被跨轮去重压掉 {s.get('pin_dedup_n', 0)} / "
+            f"用户排除 {s.get('pin_user_excluded_n', 0)} / "
             f"不在本轮 admitted {s.get('pin_rank_missing', 0)}" + tail)
 
 
@@ -760,7 +773,7 @@ def render_report(s: dict, show_paths: bool = False) -> str:
     if _n_full:
         _cov = _n_full / (_n_full + _n_leg) * 100 if (_n_full + _n_leg) else 100.0
         lines.append("")
-        _shown = {("打分不够" if not _k else _k): _v
+        _shown = {("打分不够" if not _k else _DEDUP_LABELS.get(_k, _k)): _v
                   for _k, _v in (s.get("dedup_full") or {}).items()}
         lines.append(f"excluded 成因分布（全量口径，覆盖 {_n_full}/{_n_full + _n_leg} "
                      f"= {_cov:.1f}% 的记录）: {_shown}")
@@ -825,15 +838,14 @@ def render_report(s: dict, show_paths: bool = False) -> str:
     return "\n".join(lines)
 
 
-VERDICTS = ("relevant", "irrelevant", "unsure")
+# dedup 写端取值 → 报表标签。未登记的取值原样显示。
+_DEDUP_LABELS = {USER_EXCLUDED: "用户本会话排除"}
 
-# 四类标注：near_miss 问「该不该被召回」；两个 admitted_* 问「机械打分打得
-# 对不对」，分开是因为代价不对等——全文注入单篇上限 8192 字节，清单条目只有
-# 一行 summary，混成一个桶之后「全文错了 30%」与「清单错了 30%」在数据里长得
-# 一模一样；llm_pinned 问的是另一个问题——「LLM 精排这次点名点对了没有」
+# 四类标注（定义在 `_annotations.KINDS`，本模块再导出）：near_miss 问「该不该被召回」；
+# 两个 admitted_* 问「机械打分打得对不对」，分开是因为代价不对等——全文注入单篇上限
+# 8192 字节，清单条目只有一行 summary，混成一个桶之后「全文错了 30%」与「清单错了 30%」
+# 在数据里长得一模一样；llm_pinned 问的是另一个问题——「LLM 精排这次点名点对了没有」
 # （点名条目强制入选、不参与机械打分，故不能并进 admitted_* 任何一桶）。
-KINDS = ("near_miss", "admitted_fulltext", "admitted_list", "llm_pinned")
-DEFAULT_KIND = "near_miss"   # 旧记录（写于加字段之前）一律归此类
 
 # kind → 「该记录里这篇是否以该 kind 出现」。**显式、全覆盖**：此前 `sample_admitted_events` 与
 # `sample_events_with_hits` 各写一条 if/elif 链、末尾 `else` 兜 near_miss——加第 5 个 kind 时漏改一处
@@ -1140,10 +1152,6 @@ def attach_contexts(items, records_factory, resolve, want: int = 3):
     return out
 
 
-def annotations_path(home: Path) -> Path:
-    return _metrics.metrics_dir(home) / "annotations.jsonl"
-
-
 REVIEW_CSS = """
 :root{--bg:#fbfbfa;--fg:#23221f;--mut:#6b6862;--line:#e3e0da;--card:#fff;
 --ok:#2f7d5b;--no:#b4453a;--un:#8a7a3d;--acc:#3a5c9e}
@@ -1303,8 +1311,9 @@ def apply_web_annotations(home: Path, payload, *, items=None) -> tuple[int, list
             errs.append(f"#{i}: kind 非法 {kind!r}")
             continue
         try:
+            # 带写入时刻：mod 标注延迟投递、按 ts 合并，不带 ts 的这条会被迟到的旧判断压过
             save_annotation(home, path, verdict, kind=kind,
-                            context_ids=id_map.get((path, kind)))
+                            context_ids=id_map.get((path, kind)), ts=time.time())
             saved += 1
         except Exception as exc:           # noqa: BLE001
             errs.append(f"#{i}: 写入失败 {exc}")
@@ -1576,110 +1585,22 @@ def _apply_kind_quota(ranked: list[dict], k: int) -> list[dict]:
     return fts[:n_ft] + pins[:n_pin] + lists[:n_list]
 
 
-def _normalize_context_ids(raw) -> list[dict]:
-    """把 `[(session, prompt_h), ...]` 归一成可落盘的 dict 列表。
+def _distinct_runtimes(runtimes: tuple[str, ...], home: Path) -> tuple[str, ...]:
+    """去掉映射后指向同一 `metrics_dir` 的命名空间，保留先出现的那个。
 
-    畸形输入一律降级为空列表，**绝不抛异常**：标注是这套机制里唯一不可再生的数据
-    （见 `_metrics.purge` 的定性），为了一个附属字段让整条写入失败是本末倒置。
-    落 dict 而非裸元组，是因为 JSON 没有元组、读回来会变成 list，
-    带键名才能在日后加字段时不必猜位置。
+    判据是 `configure_context` 之后的实际目录，不是命名空间的名字：claude 是否
+    映射回 legacy 由 `use_canonical_namespace` 决定，在这里重写一遍会与它分叉。
+    比较前 `resolve()`，一个目录是另一个的链接时也只处理一次。
     """
-    out: list[dict] = []
-    try:
-        for item in (raw or []):
-            s, ph = item                      # 长度不为 2 即抛，由下面兜住
-            if isinstance(s, str) and isinstance(ph, str) and s and ph:
-                out.append({"session": s, "prompt_h": ph})
-    except Exception:                          # noqa: BLE001
-        return []
-    return out
-
-
-def save_annotation(home: Path, path: str, verdict: str, *,
-                    kind: str = DEFAULT_KIND, context_ids=None) -> None:
-    """追加一条标注。后写覆盖先写（读取时按 (kind, path) 合并）。
-
-    `kind` 强制 keyword-only：它与 `path`/`verdict` 是相邻同类型字符串，位置
-    传参一旦对调会静默错位——同 `_metrics.build_record` 的 session_id/prompt_id，
-    那处已实证「对调后 84 个既有测试全绿，类型系统与既有断言都拦不住」。
-    """
-    if verdict not in VERDICTS:
-        raise ValueError(f"verdict 必须是 {VERDICTS} 之一，收到 {verdict!r}")
-    if kind not in KINDS:
-        raise ValueError(f"kind 必须是 {KINDS} 之一，收到 {kind!r}")
-    p = annotations_path(home)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    rec = {"_schema": _metrics.SCHEMA, "path": path,
-           "verdict": verdict, "kind": kind}
-    ids = _normalize_context_ids(context_ids)
-    if ids:
-        # 不传 / 归一后为空则**不落该键**：旧记录与新记录都是合法形态，
-        # 读端不必区分「没有这个字段」与「有但是空的」两种情况。
-        rec["context_ids"] = ids
-    with open(p, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
-def load_annotations(home: Path) -> dict[tuple[str, str], str]:
-    """读取全部人工标注，返回 `{(kind, path): verdict}`。
-
-    **键是 (kind, path) 而非裸 path**：同一篇笔记「作为擦肩候选该不该被召回」
-    与「作为已注入内容召回得对不对」是两个独立判断，共用 path 键会让两者互相
-    覆盖（`--review` 的去重也会因此漏抽）。缺 `kind` 的旧记录归 `near_miss`。
-
-    **坏行必须计数并经 stderr 报出，不能静默跳过**——与
-    `load_records`（`:27-58`）同一约定，且标注比普通 metrics 更该有可见性：
-    `_metrics.purge` 的 docstring 把它定性为「用户逐条投入时间标出的、删了
-    不可重新生成」的数据，静默丢一条，用户永远不知道自己的标注没了。
-
-    两类坏数据分别计数：`bad_record`（JSON 解析失败，或解析成功但不是带 path
-    的 dict——结构本身不像一条标注）、`bad_verdict`（结构合法但 verdict 不在
-    `VERDICTS` 内，例如手工改坏文件、或未来 schema 演进遗留的旧值）。
-    """
-    out: dict[tuple[str, str], str] = {}
-    p = annotations_path(home)
-    if not p.exists():
-        return out
-    bad_record = bad_verdict = 0
-    try:
-        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except json.JSONDecodeError:
-                bad_record += 1
-                continue
-            # path 必须是**非空字符串**：只判真值的话，`{"path": ["a"]}` 会通过，
-            # 随后 `out[r["path"]]` 拿 list 当 dict 键直接抛 unhashable TypeError，
-            # 整个 --review 未捕获崩溃；`{"path": 123}` 更糟——可哈希、静默存成 int 键，
-            # 之后与字符串路径永不相等，标注等于凭空消失（L-SEC-2）。
-            # annotations.jsonl 是本机文件，损坏可能来自手工编辑或磁盘异常，
-            # 不是可信输入。
-            if not (isinstance(r, dict) and isinstance(r.get("path"), str)
-                    and r["path"].strip()):
-                bad_record += 1
-                continue
-            verdict = r.get("verdict")
-            if verdict not in VERDICTS:
-                bad_verdict += 1
-                continue
-            # kind 缺失=写于加字段之前，一律归 near_miss（已完成的 20 条正属此类）。
-            # 未知 kind 与非法 verdict 同等处理，计入 bad_record——手工编辑或未来
-            # schema 演进都可能留下它，静默接受会让两类标注的统计悄悄混淆。
-            kind = r.get("kind", DEFAULT_KIND)
-            if kind not in KINDS:
-                bad_record += 1
-                continue
-            out[(kind, r["path"])] = verdict      # 后写覆盖
-    except OSError:
-        pass
-    if bad_record or bad_verdict:
-        print(f"[vault-loader] annotations.jsonl 跳过 {bad_record} 行解析/结构异常 + "
-              f"{bad_verdict} 行 verdict 非法（该文件不可重新生成，请检查）",
-              file=sys.stderr)
-    return out
+    seen: set[Path] = set()
+    out: list[str] = []
+    for runtime in runtimes:
+        _metrics.configure_context(runtime)
+        d = _metrics.metrics_dir(home).resolve()
+        if d not in seen:
+            seen.add(d)
+            out.append(runtime)
+    return tuple(out)
 
 
 def main() -> int:
@@ -1716,6 +1637,10 @@ def main() -> int:
     # 漏掉它时 `--purge` 只清一半却报告「已清空 N 个数据文件」，`--report` 也看不到
     # 那半边——「没有数据」与「数据在另一个命名空间」不可区分。
     runtimes = ("legacy", "claude") if selected == "all" else (selected,)
+    # 按映射后的实际目录去重：canonical config 存在而迁移未提交时，`configure_context`
+    # 把 claude 映射回 legacy，两项指向同一个目录——不去重时 `--report` 的事件数翻倍，
+    # `--purge` 把同一目录扫两遍并打印两次（full-review P2B-E1）。退役目录仍按 `selected` 判。
+    runtimes = _distinct_runtimes(runtimes, home)
 
     def all_records():
         for runtime in runtimes:
@@ -1753,6 +1678,12 @@ def main() -> int:
         except OSError as exc:
             print(f"metrics 清理失败，仍有数据保留：{exc}", file=sys.stderr)
             return 2
+        n_live = 0
+        try:
+            from scripts import _session_ops
+            n_live = _session_ops.purge_live(home)
+        except Exception as exc:  # noqa: BLE001
+            print(f"会话快照清理失败：{exc}", file=sys.stderr)
         # 把实际扫过的目录打出来：这是不可逆删除，用户必须能看出「漏了哪一个」。
         # 只报一个总数时，「清了 0 个」与「压根没扫到那个目录」完全不可区分。
         msg = f"已清空 {n} 个数据文件（扫描目录：{'、'.join(scanned)}）"
@@ -1763,6 +1694,8 @@ def main() -> int:
             # 的最后一道知情提示，此时最不该因一行坏 JSON 报错或少报。
             msg += (f"（其中 {n_ann} 条人工标注已删除，不可恢复；"
                     f"含 near-miss 与精度两类，未去重）")
+        if n_live:
+            msg += f"（另清除会话快照 {n_live} 个）"
         print(msg)
         return 0
     if args.review_web:
@@ -1851,8 +1784,15 @@ def main() -> int:
             if ans == "q":
                 break
             if ans in code:
-                save_annotation(home, item["path"], code[ans], kind=item["kind"],
-                                context_ids=item.get("context_ids"))
+                try:
+                    # ts 同 apply_web_annotations：按 ts 合并时这条更新的判断才不会被迟到的 mod 标注压过
+                    save_annotation(home, item["path"], code[ans], kind=item["kind"],
+                                    context_ids=item.get("context_ids"), ts=time.time())
+                except TimeoutError:
+                    # 标注文件的锁被别的写者（mod 投递、另一个 --review）占着
+                    print("标注文件正被占用，本条未保存；稍后重跑 --review 可再标。",
+                          file=sys.stderr)
+                    continue
                 saved += 1
         print(f"已标注，结果在 {annotations_path(home)}")
         return 0

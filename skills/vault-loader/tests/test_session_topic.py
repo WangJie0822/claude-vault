@@ -329,8 +329,11 @@ def test_spawn_does_not_block(tmp_path: Path, monkeypatch) -> None:
             started["kw"]["stdout"] == subprocess.DEVNULL and
             started["kw"]["stderr"] == subprocess.DEVNULL), \
         f"stdio 未按预期设置：{started['kw']}"
-    # cwd 应指向 skills/vault-loader（父路径）
-    assert "vault-loader" in started["kw"]["cwd"], f"cwd 错误：{started['kw']['cwd']}"
+    # cwd 必须恰为插件内的 skills/vault-loader：_call_model 在提炼子进程里用裸 shutil.which("claude")
+    # 后直接执行，它不搜用户项目目录的唯一前提就是这个 cwd（full-review P1-M1）
+    from scripts import _topic
+    assert Path(started["kw"]["cwd"]) == Path(_topic.__file__).resolve().parents[1], \
+        f"cwd 错误：{started['kw']['cwd']}"
 
 
 def test_spawn_sends_prompt_via_stdin_not_argv(tmp_path: Path, monkeypatch) -> None:

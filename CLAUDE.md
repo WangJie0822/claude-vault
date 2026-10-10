@@ -13,6 +13,7 @@ This file is the resident project guidance for Claude Code; detailed rule bodies
 |---|---|
 | Hook 管线与 runtime | `.claude/rules/hooks-runtime.md` |
 | vault-loader 注入、打分、主题词与配置表 | `.claude/rules/vault-loader.md` |
+| mod（注入可见与可控） | `.claude/rules/mod.md` |
 | metrics | `.claude/rules/metrics.md` |
 | summarize-session | `.claude/rules/summarize-session.md` |
 | 分发边界与发布 | `.claude/rules/distribution.md` |
@@ -58,10 +59,11 @@ Read 到匹配文件时 rules 会自动注入；上下文里已出现该 rules �
 
 ### Hook 管线与 runtime
 
-- `hooks/hooks.json` 是 Claude Code 的薄声明，由 `hooks/run-hook.cmd` 路由；候选根固定为 `CLAUDE_PLUGIN_ROOT` → wrapper 相对路径，`PLUGIN_ROOT` 不是候选（2.0.0 起）。
-- 守卫必须按 Claude Code 的方式执行声明中的完整 `command`（插值 `${CLAUDE_PLUGIN_ROOT}` 后交给 bash；Windows 上必须是 Git Bash，不能用 PATH 上的 WSL 启动器），核对 stdin 到达脚本，并覆盖「有该变量」「没有该变量」两种形态。没装 Git Bash 的 Windows 改由 PowerShell 执行，当前命令串在那里解析失败，守卫不覆盖。
+- `hooks/hooks.json` 是 Claude Code 的薄声明，由 `hooks/run-hook.cmd` 路由，`modules` 只指向 `hooks/vault-mod.js`；候选根固定为 `CLAUDE_PLUGIN_ROOT` → wrapper 相对路径，`PLUGIN_ROOT` 不是候选（2.0.0 起）。
+- 守卫必须按 Claude Code 的方式执行声明中的完整 `command`（插值 `${CLAUDE_PLUGIN_ROOT}` 后交给宿主的 shell：macOS / Linux 是 `/bin/sh -c`，Windows 是 Git Bash、不能用 PATH 上的 WSL 启动器；dash 由 WSL 用例覆盖），核对 stdin 到达脚本，并覆盖「有该变量」「没有该变量」两种形态。命令串为 `/bin/sh "<root>/hooks/run-hook.cmd" <脚本> || exit 1`、声明 `"shell": "bash"`、不得加 `args`：不依赖可执行位、不按 PATH 找 `sh`，插件根缺失时不以 2 拦截提交；没装 Git Bash 的 Windows 不支持。
 - **所有 hook fail-open**：顶层 `try/except` 兜底 `exit 0`，任何 hook 都不得阻断会话。
-- `run-hook.cmd` 是 polyglot（同一文件既是 batch 又是 POSIX sh），两种解释器都要能解析，保持 LF 行尾；wrapper 按 `py` → `python3` → `python` 探测，找不到即静默 `exit 0`。
+- 不得从当前目录解析程序名：「`which` 后执行」用 `which_no_cwd`（例外 `_topic._call_model`，勿「统一」；裸调用点由白名单守卫登记）；summarize-session 的 CLI 与两个 hook 入口在 `__main__` 块先调 `harden_exe_search()`（Windows 设变量、POSIX 过滤 PATH）；两份 helper 的函数定义由守卫保持一致。
+- `run-hook.cmd` 是 polyglot（同一文件既是 batch 又是 POSIX sh），两种解释器都要能解析，保持 LF 行尾；宿主三个平台都只走 sh 段（只用 POSIX sh 构造，探测前丢弃 PATH 的空条目与相对条目），batch 段只在 cmd.exe 直接运行时执行；wrapper 按 `py` → `python3` → `python` 探测，找不到即静默 `exit 0`。
 - 宿主恒为 Claude（2.0.0 起没有宿主识别）；入口只对带 `hook_event_name` 的 payload 做事件去重，事件 marker 用 `O_EXCL`。state 与 metrics 按命名空间（legacy / claude）隔离，注入去重按 cwd，不按 session 切。
 - runtime 命名空间是进程级全局：新起的子进程、同一进程里的另一个 hook 入口，都必须各自配置；`_state` 与 `_metrics` 是两个独立全局。子进程用 `current_runtime()` 交出、`adopt_runtime()` 接收，走 argv 不走 stdin；`{claude}` 白名单与 `_safe_component` 清洗必须原样保留（只剩一个取值也不得当死代码删掉）。SessionStart 入口里不要把 `_metrics` 的 import 提到与 `_state.configure_context()` 并列（UPS 入口有 `_MetricsStub` 兜底，可以并列）。
 - `has_legacy_data()` 会被本类缺陷的副作用自举翻转：没有 committed 迁移标记的机器上，补配 `configure_context` 式的修复会静默空转。
@@ -78,6 +80,11 @@ Read 到匹配文件时 rules 会自动注入；上下文里已出现该 rules �
 - 停用逃生阀有四种：环境变量、文件、config、项目 CLAUDE.md 注释。
 - 配置表是机器契约：`skills/vault-loader/SKILL.md` 锚点内，每个 `DEFAULT_CONFIG` 叶子键必须有一行表格；锚点缺失时守卫抛错，不回落全文；废弃键走显式豁免清单 `_EXEMPT`。
 - 改 `_signal_collect.py`、`_scorer.py`、`_decision.py`、`_state.py`、`_topic.py`、`_candidate_pool.py`、`context_vault/atomic.py`、配置项或配置表前先 Read `.claude/rules/vault-loader.md`；pin 与 slash 的接线在 `prompt_submit_load.py`，读它时自动加载的是 hooks-runtime 与 metrics，改那部分也要先 Read 本组正文。
+
+### mod（注入可见与可控）
+
+- mod 与 Python 只经按轮请求文件和会话快照交换数据（`state/live/`，与命名空间无关），事件 `e` 原样传递；不要改回往 `e` 里加字段，不要把 `live/` 挪进 `state/claude/`。
+- 快照统一由 `TurnReport.finalize` 写；排除在决策层最先判、`user_excluded` 不是「曾注入过」；`PIN_HEADER` 不改，合计上限只走 `split_pin_budget`；标注核对后整批在锁内写，拒收是终局。改 mod 两侧（含入口里的 `_take_session_ops`）前先 Read `.claude/rules/mod.md`。
 
 ### metrics
 
@@ -102,6 +109,7 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 - 测试不得写真实 HOME：vault-loader 与 config 两个根由 conftest 的 autouse fixture 无条件隔离；`tests/` 与 summarize-session 根没有该 fixture，需在用例内 monkeypatch HOME 与 `USERPROFILE`（Windows 上 `Path.home()` 取后者）。
 - 判定性能回归或「有无回归」须 median-of-N 加 A/B 交替，不靠单次 pass/fail；把失败归为「环境性」必须逐条拿到该条自己的报错原文；修法不是让用例跳过，而是显式声明测哪个平台分支。
 - 变异不转红先查方法（结果解析、用例是否绕过被测层、对照组形态），再做阳性对照；变异转红也要核对原因（不合法的变异会以 `NameError` 假转红）；手工构造被测对象的用例，要补一条从真实产出喂入的端到端用例；容量类守卫要锁绝对下界。
+- 本仓库 Python 代码最低兼容 **3.9**（README「跨平台」节），由 `tests/test_python_floor.py` 做 best-effort 静态检查；标注之外的 `X | Y` 有 future import 也不可用；新写法过不了守卫时改写法，不要放宽守卫。
 - 写测试或排查失败前先 Read `.claude/rules/testing.md`。
 
 ## 分发边界（重要）
@@ -153,7 +161,7 @@ python -m pytest packaging/
 
 ## 约束与约定
 
-- 任何改动必须保持 **macOS / Linux / Windows 三平台兼容**（polyglot wrapper 适配三平台 shell）。
+- 任何改动必须保持 **macOS / Linux / Windows 三平台兼容**（wrapper 的 sh 段在三个平台上执行）。
 - hook 必须 fail-open，永不阻断会话。
 - vault-loader 对 Vault 只读；summarize-session 是唯一写入方（且只追加/新建，不删除已有笔记）。
 - git 跟踪文件中不写 Obsidian `[[...]]` wikilink（vault 是个人知识库层、不随仓库分发）。

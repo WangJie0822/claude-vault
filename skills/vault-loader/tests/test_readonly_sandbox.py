@@ -25,14 +25,18 @@ PS_ROUTED = {"state 写入失败", "事件去重失败，继续执行",
              "metrics 写入失败", "metrics 构造失败",
              # 该 except 包裹的 nudge_due / bump_near_miss_counts / mark_nudged
              # 全都写 metrics_dir（还会 mkdir + chmod），是明确的写盘点。
-             "near-miss 提示失败"}
+             "near-miss 提示失败",
+             # mod 通道（spec 2026-10-09）：读即删请求、标注追加、快照原子写，都写 live/ 或 metrics_dir
+             "会话操作读取失败", "标注写入失败", "会话快照写入失败"}
 # 刻意**不**路由、保持裸 print 的那些，连同理由（避免下次有人「顺手补齐」）：
 #   模块加载失败 / 诊断模块不可用 / metrics 模块不可用 —— import 期故障，此时
 #     诊断层本身可能就没加载成功，走 stderr 是唯一还可靠的通道；
 #   诊断渲染失败 / gate 记录构造失败 / runtime 识别失败 —— 纯计算，不碰文件系统；
 #   崩溃兜底 —— 顶层 except，必须无条件可见。
 SS_ROUTED = {"state 写入失败", "事件去重失败，继续执行",
-             "SessionStart metrics 落盘失败"}
+             "SessionStart metrics 落盘失败",
+             # mod 通道（spec 2026-10-09）：live/ 的过期清理与快照原子写
+             "会话快照清理失败", "会话快照写入失败"}
 
 
 def _literal(node: ast.AST) -> str:

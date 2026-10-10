@@ -10,7 +10,7 @@ WRAPPER = ROOT / "hooks/run-hook.cmd"
 
 
 def _run_cmd(args: list[str], env: dict) -> subprocess.CompletedProcess:
-    """Invoke run-hook.cmd via cmd.exe (Windows native path)."""
+    """Invoke run-hook.cmd via cmd.exe (direct execution; hooks.json runs it through /bin/sh)."""
     return subprocess.run([str(WRAPPER)] + args, capture_output=True, env=env)
 
 
@@ -196,3 +196,88 @@ def test_batch_section_is_pure_ascii():
     batch = raw.split(b"\nBATCH\n", 1)[0]
     bad = [(i, b) for i, b in enumerate(batch) if b > 127]
     assert not bad, f"batch 段含非 ASCII 字节（偏移, 值）: {bad[:5]}"
+
+
+_BASHISMS = [
+    (r"\[\[", "[[ ]]"), (r"(?<![=!<>])==(?!=)", "=="), (r"^\s*function\s", "function"),
+    (r"\$'", "$'...'"), (r"<<<", "here-string"), (r"^\s*(source|local|declare|typeset)\s", "bash 内建"),
+    (r"\bpipefail\b", "pipefail"), (r"\$\{[A-Za-z_]+(:?[0-9]+:|//|\^\^|,,)", "bash 参数展开"),
+    (r"&>", "&>"), (r"\$RANDOM|\$BASH_|\$PIPESTATUS", "bash 专有变量"),
+]
+
+
+def test_sh_section_has_no_bashisms():
+    """sh 段在 macOS / Linux 上由 /bin/sh 执行（Debian / Ubuntu 是 dash），混进 bashism 时
+    hook 静默失效；而 Windows 上的 bash 与 Git 自带的 sh 都会照常执行它（full-review T-H1）。"""
+    import re
+    sh = WRAPPER.read_text(encoding="utf-8").split("\nBATCH\n", 1)[1].splitlines()
+    bad = [(i, ln.strip(), why) for i, ln in enumerate(sh, 1) if not ln.lstrip().startswith("#")
+           for pat, why in _BASHISMS if re.search(pat, ln)]
+    assert not bad, bad
+
+
+_VAR = "NoDefaultCurrentDirectoryInExePath"
+_SET_LINE = b'set "NoDefaultCurrentDirectoryInExePath=1"\n'
+
+
+def _env_without_var(**extra):
+    """Windows 上环境变量名不分大小写：按 upper() 剥，否则 Claude Code 注入的那份删不掉。"""
+    env = {k: v for k, v in os.environ.items() if k.upper() != _VAR.upper()}
+    env.update(extra)
+    return env
+
+
+def _hijack_fixture(tmp_path, wrapper_bytes):
+    root = tmp_path / "plugin"
+    (root / "hooks").mkdir(parents=True)
+    (root / "hooks" / "run-hook.cmd").write_bytes(wrapper_bytes)
+    (root / "s").mkdir()
+    (root / "s" / "x.py").write_text(
+        "import sys\nprint('REAL_SCRIPT_RAN:' + sys.stdin.read())\n", encoding="utf-8")
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "py.bat").write_bytes(
+        b'@echo off\r\necho PLANTED_RAN\r\necho x> "%~dp0PLANTED"\r\n')
+    return root, evil, evil / "PLANTED"
+
+
+def _run_batch(root, evil, env):
+    return subprocess.run([str(root / "hooks" / "run-hook.cmd"), "s/x.py"], cwd=evil,
+                          input=b'{"p":1}', capture_output=True, env=env, timeout=60)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="batch 段只在 Windows 上经 cmd.exe 执行")
+def test_batch_hijack_probe_has_teeth(tmp_path):
+    """阳性对照：去掉加固那一行的 wrapper 必须执行到 cwd 里预置的 py.bat。
+
+    没有这条，下一条用例的绿不说明任何事——例如环境变量没剥干净时两条都会绿。
+    """
+    raw = WRAPPER.read_bytes()
+    assert raw.count(_SET_LINE) == 1
+    root, evil, marker = _hijack_fixture(tmp_path, raw.replace(_SET_LINE, b""))
+    _run_batch(root, evil, _env_without_var(CLAUDE_PLUGIN_ROOT=str(root)))
+    assert marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="batch 段只在 Windows 上经 cmd.exe 执行")
+def test_batch_ignores_py_planted_in_cwd(tmp_path):
+    """P2A-P1：宿主没设该变量时，cmd.exe 先搜 cwd，会执行项目里预置的 py.bat。"""
+    root, evil, marker = _hijack_fixture(tmp_path, WRAPPER.read_bytes())
+    r = _run_batch(root, evil, _env_without_var(CLAUDE_PLUGIN_ROOT=str(root)))
+    assert not marker.exists(), r.stdout
+    assert b'REAL_SCRIPT_RAN:{"p":1}' in r.stdout, (r.stdout, r.stderr)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="batch 段只在 Windows 上经 cmd.exe 执行")
+def test_batch_falls_back_when_launcher_missing_and_py_planted(tmp_path):
+    """`where py` 本身搜 cwd：PATH 上没有 py 启动器、cwd 有 py.bat 时，它判「有 py」，
+    而执行 `py` 时 cmd 已不搜 cwd，找不到后直接 exit——python3 / python 的回落永远走不到。"""
+    sysdir = os.path.join(os.environ["SystemRoot"], "System32")
+    if os.path.exists(os.path.join(sysdir, "py.exe")):
+        pytest.skip("该机 py 启动器在 System32，构造不出缺少启动器的 PATH")
+    root, evil, marker = _hijack_fixture(tmp_path, WRAPPER.read_bytes())
+    env = _env_without_var(CLAUDE_PLUGIN_ROOT=str(root),
+                           PATH=os.pathsep.join([sysdir, os.path.dirname(sys.executable)]))
+    r = _run_batch(root, evil, env)
+    assert not marker.exists(), r.stdout
+    assert b"REAL_SCRIPT_RAN" in r.stdout, (r.stdout, r.stderr)

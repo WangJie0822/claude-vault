@@ -13,6 +13,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from datetime import datetime
+
+import scan_sessions
 from scan_sessions import extract_first_user_intent
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "scan_sessions.py"
@@ -122,3 +125,41 @@ def test_scan_lists_and_parses_a_real_shape_claude_session(tmp_path):
     assert parsed["first_intent"] == "修复召回失效的问题"
     assert parsed["cwd"] == "/work/repo"
     assert any(m["role"] == "assistant" and "召回日志" in m["text"] for m in parsed["conversation"])
+
+
+class _Py310Datetime(datetime):
+    """还原 3.10 及以下的 `fromisoformat`：只认 `isoformat()` 能产出的格式，不认末尾 `Z`
+    （官方文档 datetime.fromisoformat「Changed in version 3.11」）。本机 3.11+ 原生支持 `Z`，
+    不打桩的话这条路径在本机上没有判别力。"""
+
+    @classmethod
+    def fromisoformat(cls, date_string):
+        if date_string.endswith("Z"):
+            raise ValueError(f"Invalid isoformat string: {date_string!r}")
+        return super().fromisoformat(date_string)
+
+
+def _write_session(tmp_path: Path) -> Path:
+    path = tmp_path / "sess-1.jsonl"
+    path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in _SESSION_ROWS) + "\n",
+                    encoding="utf-8")
+    return path
+
+
+def test_session_date_comes_from_z_timestamp_on_py310_and_below(tmp_path, monkeypatch):
+    """transcript 的 timestamp 带 `Z`；3.9/3.10 上若直接 fromisoformat 会抛错，日期被静默
+    回落成文件 mtime（full-review 代码评审 L6）。"""
+    monkeypatch.setattr(scan_sessions, "datetime", _Py310Datetime)
+    assert scan_sessions.parse_session(str(_write_session(tmp_path)))["date"] == "2026-10-08 01:00"
+
+
+def test_session_date_on_native_datetime(tmp_path):
+    assert scan_sessions.parse_session(str(_write_session(tmp_path)))["date"] == "2026-10-08 01:00"
+
+
+def test_non_string_timestamp_is_skipped_not_raised(tmp_path):
+    rows = [dict(_SESSION_ROWS[0], timestamp=1791513983)] + _SESSION_ROWS[1:]
+    path = tmp_path / "sess-1.jsonl"
+    path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                    encoding="utf-8")
+    assert scan_sessions.parse_session(str(path))["date"] == "2026-10-08 01:00"

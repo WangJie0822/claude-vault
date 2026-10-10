@@ -1,0 +1,19 @@
+{
+  "v": 1,
+  "status": "scored",
+  "event": "UserPromptSubmit",
+  "prompt_id": "<PROMPT_UUID>",
+  "request_digest": "0123456789abcdef0123456789abcdef",
+  "injected": [
+    {"path": "项目笔记/demo/c.md", "title": "c", "confidence": "中", "fulltext": false,
+     "kind": "admitted_list", "hits": ["demo"]}
+  ],
+  "pins": {"llm": [{"path": "项目笔记/demo/d.md", "title": "d", "rendered": true}],
+           "user": [{"path": "项目笔记/demo/b.md", "title": "b", "rendered": true}]},
+  "excluded": [{"path": "项目笔记/demo/a.md", "title": "a"}],
+  "session_start": [],
+  "rejected": [],
+  "acked": [],
+  "metrics_on": true,
+  "prompt_h": "0123456789abcdef"
+}

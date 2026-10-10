@@ -111,6 +111,18 @@ def test_apply_skips_unanswered(tmp_path):
     assert len(load_annotations(tmp_path)) == 1
 
 
+def test_apply_writes_ts(tmp_path):
+    """节点 2 Q-M2：网页标注带写入时刻，迟到投递的 mod 标注才不会按「后写覆盖」压过它。"""
+    import time
+    from scripts.analyze_metrics import annotations_path
+    before = int(time.time())
+    n, errs = apply_web_annotations(
+        tmp_path, [{"path": "n/b.md", "kind": "admitted_list", "verdict": "relevant"}])
+    assert (n, errs) == (1, [])
+    row = json.loads(annotations_path(tmp_path).read_text(encoding="utf-8").splitlines()[0])
+    assert isinstance(row.get("ts"), int) and before <= row["ts"] <= int(time.time())
+
+
 def test_apply_tolerates_malformed_payload(tmp_path):
     """请求体结构不对时报错而不是抛异常 —— 它决定 HTTP 响应码。"""
     n, errs = apply_web_annotations(tmp_path, ["not a dict", {"path": 1}])
