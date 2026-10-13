@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 UPS = SCRIPTS / "prompt_submit_load.py"
 # 占位 UUID 拆开拼接：发布闸门按 8-4-4-4-12 hex 拦截疑似真实 session id（test_no_secrets_in_tree）
@@ -15,6 +17,39 @@ SID = "-".join(("11111111", "2222", "3333", "4444", "555555555555"))
 PID1 = "-".join(("aaaaaaaa", "bbbb", "cccc", "dddd", "000000000001"))
 PID2 = "-".join(("aaaaaaaa", "bbbb", "cccc", "dddd", "000000000002"))
 PID3 = "-".join(("aaaaaaaa", "bbbb", "cccc", "dddd", "000000000003"))
+FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "mod_contract" / "snapshot_v1.json"
+
+
+def _shape(obj):
+    """键树：dict 递归，list 取首个 dict 元素的形状（空列表记 None，不比条目）。"""
+    if isinstance(obj, dict):
+        return {k: _shape(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        items = [_shape(x) for x in obj if isinstance(x, dict)]
+        return {"[]": items[0] if items else None}
+    return None
+
+
+def _assert_same_shape(a, b, where="$"):
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return
+    if "[]" in a or "[]" in b:
+        if a.get("[]") is not None and b.get("[]") is not None:
+            _assert_same_shape(a["[]"], b["[]"], where + "[]")
+        return
+    assert set(a) == set(b), f"{where}: {sorted(set(a) ^ set(b))}"
+    for k in a:
+        _assert_same_shape(a[k], b[k], f"{where}.{k}")
+
+
+def _preset_topic(repo: Path, words, pinned, state="ok") -> None:
+    """在 canonical 命名空间预置本会话的 topics entry：has_recent_topic_attempt 为真，不会 spawn。"""
+    from scripts import _state, _topic
+    _state.configure_context("claude")
+    try:
+        _topic.save_session_topic(repo, SID, words, pinned=pinned, accounted=False, state=state)
+    finally:
+        _state.configure_context("unknown")
 
 
 def _live(home: Path) -> Path:
@@ -32,8 +67,14 @@ def _req(home: Path, pid: str, obj: dict) -> Path:
     return p
 
 
+def _reject_constant(c):
+    raise AssertionError(f"快照含非有限数值 {c}：mod 的 JSON.parse 会整份拒收（full-review S-1）")
+
+
 def _snap(home: Path) -> dict:
-    return json.loads((_live(home) / f"{_sid_h()}.json").read_text(encoding="utf-8"))
+    # 按 JS 的口径严格解析：Python 默认接受 Infinity / NaN，宽松读法对这条不变量恒绿
+    return json.loads((_live(home) / f"{_sid_h()}.json").read_text(encoding="utf-8"),
+                      parse_constant=_reject_constant)
 
 
 def _config(home: Path, vault: Path, **extra) -> None:
@@ -300,10 +341,121 @@ def test_legacy_user_gets_live_snapshot_but_no_canonical_state(tmp_home, tmp_vau
 
 def test_full_request_overhead_is_bounded(tmp_home, tmp_vault, tmp_git_repo, write_frontmatter_cache):
     """满载请求（50 排除 + 50 标注）相对无请求的额外耗时。median of 5，交替测量。"""
-    import statistics
-    import time as _t
     _config(tmp_home, tmp_vault)
     _seed(tmp_vault, write_frontmatter_cache)
+    w, wo = _overhead(tmp_home, tmp_git_repo)
+    print(f"\nmod overhead: with={w:.4f}s without={wo:.4f}s")
+    assert w - wo < 0.25
+
+
+def test_snapshot_shape_matches_contract_fixture(tmp_home, tmp_vault, tmp_git_repo,
+                                                 write_frontmatter_cache):
+    """真实入口跑出的快照与契约夹具逐层同形（节点 1 T2：只比顶层会漏掉条目级键漂移）。"""
+    _config(tmp_home, tmp_vault, relevance={"session_topic": True, "session_pin_max": 1})
+    _seed(tmp_vault, write_frontmatter_cache)
+    _preset_topic(tmp_git_repo, ["注入设计"], ["笔记/beta.md"])
+    _req(tmp_home, PID1, {"v": 1, "pin": ["笔记/alpha.md"], "exclude": ["笔记/gamma.md"]})
+    _run(tmp_home, tmp_git_repo, PID1)
+    snap = _snap(tmp_home)
+    for key in ("injected", "excluded", "llm", "thresholds"):
+        assert snap[key], key                     # 每块都有内容，否则同形比较是空网
+    assert snap["pins"]["llm"] and snap["pins"]["user"]
+    _assert_same_shape(_shape(snap), _shape(json.loads(FIXTURE.read_text(encoding="utf-8"))))
+    llm = snap["llm"]
+    assert (llm["state"], llm["in_scoring"], llm["words"]) == ("ok", 1, ["注入设计"])
+    beta = next(i for i in snap["injected"] if i["path"] == "笔记/beta.md")
+    assert beta["llm_also_pinned"] is True and beta["topic_hits"] == ["注入设计"]
+    rank = snap["pins"]["llm"][0]["rank"]
+    assert isinstance(rank, int) and rank >= 1
+
+
+def test_metrics_off_snapshot_still_has_hits(tmp_home, tmp_vault, tmp_git_repo,
+                                             write_frontmatter_cache):
+    _config(tmp_home, tmp_vault, metrics={"enabled": False})
+    _seed(tmp_vault, write_frontmatter_cache)
+    _req(tmp_home, PID1, {"v": 1})
+    _run(tmp_home, tmp_git_repo, PID1)
+    snap = _snap(tmp_home)
+    assert snap["metrics_on"] is False and "prompt_h" not in snap
+    assert snap["injected"] and all(i["hits"] for i in snap["injected"])
+
+
+def test_gate_turn_reports_llm_state(tmp_home, tmp_vault, tmp_git_repo, write_frontmatter_cache):
+    _config(tmp_home, tmp_vault, relevance={"session_topic": True})
+    _seed(tmp_vault, write_frontmatter_cache)
+    _preset_topic(tmp_git_repo, [], [], state="pending")
+    _req(tmp_home, PID1, {"v": 1})
+    _run(tmp_home, tmp_git_repo, PID1, prompt="继续")
+    snap = _snap(tmp_home)
+    assert snap["status"] == "gate:deictic_only"
+    assert snap["llm"] is not None, "闸门轮快照缺 llm：_report_llm 没在闸门之前调用"
+    assert (snap["llm"]["state"], snap["llm"]["in_scoring"]) == ("pending", None)
+
+
+def test_unavailable_when_claude_not_on_path(tmp_home, tmp_vault, tmp_git_repo,
+                                             write_frontmatter_cache):
+    """PATH 上没有 claude：spawn 不落盘，状态必须是「无法发起」而不是一直「尚未发起」（节点 1 T7）。
+    PATH 指向空目录同时保证本用例绝不会真起付费的 claude 子进程。"""
+    _config(tmp_home, tmp_vault, relevance={"session_topic": True})
+    _seed(tmp_vault, write_frontmatter_cache)
+    empty = tmp_home / "emptybin"
+    empty.mkdir()
+    _req(tmp_home, PID1, {"v": 1})
+    _run(tmp_home, tmp_git_repo, PID1, env_extra={"PATH": str(empty)})
+    llm = _snap(tmp_home)["llm"]
+    assert (llm["state"], llm["fail"]) == ("unavailable", "no_claude")
+
+
+@pytest.mark.parametrize("extra", [
+    {"relevance": {"session_topic": False, "fulltext_topical_threshold": float("inf")}},
+    {"relevance": {"session_topic": False, "min_topical_score": float("nan")}},
+    {"scoring": {"session_topic_hit": float("inf")}},
+    {"scoring": {"prompt_keyword_hit": float("inf")}},          # 打分权重 inf ⇒ topical inf
+], ids=["ft_topical", "min_topical", "topic_hit_weight", "topical"])
+def test_snapshot_stays_strict_json_with_nonfinite_config(tmp_home, tmp_vault, tmp_git_repo,
+                                                          write_frontmatter_cache, extra):
+    """配置里的非有限数值不得让快照变成 mod 解析不了的 JSON（full-review S-1 / T-M1）。
+    `_config` 用 json.dumps 写配置，会如实落 Infinity / NaN；严格解析的 `_snap` 本身就是断言。"""
+    _config(tmp_home, tmp_vault, **extra)
+    _seed(tmp_vault, write_frontmatter_cache)
+    _req(tmp_home, PID1, {"v": 1})
+    empty = tmp_home / "emptybin"
+    empty.mkdir()
+    _run(tmp_home, tmp_git_repo, PID1, env_extra={"PATH": str(empty)})
+    snap = _snap(tmp_home)
+    assert snap["status"] == "scored"
+
+
+@pytest.mark.parametrize("lit", ["Infinity", "NaN", "1e400"])
+def test_unreadable_topic_ts_does_not_cost_recall(tmp_home, tmp_vault, tmp_git_repo,
+                                                  write_frontmatter_cache, lit):
+    """topics entry 的 ts 非有限：召回照常、快照照写，精排状态按「没有记录」处理（full-review Q1 / T-M2）。
+    PATH 指向空目录：此时会尝试发起提炼，不得真起付费的 claude 子进程。"""
+    from scripts import _state
+    from scripts._state import session_topics_path
+    _config(tmp_home, tmp_vault, relevance={"session_topic": True})
+    _seed(tmp_vault, write_frontmatter_cache)
+    _state.configure_context("claude")
+    try:
+        p = session_topics_path(tmp_git_repo)
+    finally:
+        _state.configure_context("unknown")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('{"topics": {"%s": {"words": ["注入设计"], "ts": %s, "state": "ok"}}}' % (SID, lit),
+                 encoding="utf-8")
+    _req(tmp_home, PID1, {"v": 1})
+    empty = tmp_home / "emptybin"
+    empty.mkdir()
+    out = _run(tmp_home, tmp_git_repo, PID1, env_extra={"PATH": str(empty)})
+    assert "alpha" in _ctx(out) or "beta" in _ctx(out)
+    snap = _snap(tmp_home)
+    assert snap["status"] == "scored"
+    assert (snap["llm"]["state"], snap["llm"]["fail"]) == ("unavailable", "no_claude")
+
+
+def _overhead(tmp_home: Path, tmp_git_repo: Path) -> "tuple[float, float]":
+    import statistics
+    import time as _t
     full = {"v": 1, "exclude": [f"笔记/x{i}.md" for i in range(50)],
             "annotations": [_ann("0123456789abcdef", "笔记/alpha.md", f"ann-{i:08d}")
                             for i in range(50)]}
@@ -314,6 +466,15 @@ def test_full_request_overhead_is_bounded(tmp_home, tmp_vault, tmp_git_repo, wri
         _req(tmp_home, pid_a, full)
         t0 = _t.perf_counter(); _run(tmp_home, tmp_git_repo, pid_a); with_req.append(_t.perf_counter() - t0)
         t0 = _t.perf_counter(); _run(tmp_home, tmp_git_repo, pid_b); without.append(_t.perf_counter() - t0)
-    print(f"\nmod overhead: with={statistics.median(with_req):.4f}s "
-          f"without={statistics.median(without):.4f}s")
-    assert statistics.median(with_req) - statistics.median(without) < 0.25
+    return statistics.median(with_req), statistics.median(without)
+
+
+def test_full_request_overhead_is_bounded_with_topic_state(tmp_home, tmp_vault, tmp_git_repo,
+                                                           write_frontmatter_cache):
+    """session_topic 开着且有 topics entry：快照多读两次状态（spec §3.3）不得拉高开销。"""
+    _config(tmp_home, tmp_vault, relevance={"session_topic": True})
+    _seed(tmp_vault, write_frontmatter_cache)
+    _preset_topic(tmp_git_repo, ["注入设计"], ["笔记/beta.md"])
+    w, wo = _overhead(tmp_home, tmp_git_repo)
+    print(f"\nmod overhead (topic state): with={w:.4f}s without={wo:.4f}s")
+    assert w - wo < 0.25

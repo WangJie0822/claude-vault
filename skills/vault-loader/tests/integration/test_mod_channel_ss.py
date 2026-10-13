@@ -62,7 +62,11 @@ def test_marker_yields_session_start_snapshot(tmp_home, tmp_vault, tmp_git_repo,
     snap = json.loads((_live(tmp_home) / f"{_h()}.json").read_text(encoding="utf-8"))
     assert snap["event"] == "SessionStart" and snap["prompt_id"] is None
     assert snap["session_start"] == [
-        {"path": f"项目笔记/{tmp_git_repo.name}/design.md", "title": "design"}]
+        {"path": f"项目笔记/{tmp_git_repo.name}/design.md", "title": "design",
+         "why": ["project_dir"], "tags": []}]
+    fixture = json.loads((Path(__file__).resolve().parents[1] / "fixtures" / "mod_contract"
+                          / "snapshot_v1.json").read_text(encoding="utf-8"))
+    assert set(snap["session_start"][0]) == set(fixture["session_start"][0])
     assert not marker.exists()
 
 

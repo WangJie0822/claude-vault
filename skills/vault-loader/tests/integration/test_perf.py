@@ -66,13 +66,14 @@ def large_vault(tmp_home: Path) -> Path:
 
 
 def _run_script(script_name: str, cwd: Path, prompt: str = "",
-                extra: dict | None = None) -> tuple[float, str]:
+                extra: dict | None = None, env_extra: dict | None = None) -> tuple[float, str]:
     payload = {"cwd": str(cwd), "prompt": prompt}
     payload.update(extra or {})
     hook_input = json.dumps(payload)
     env = os.environ.copy()
     # 子进程强制 UTF-8（镜像生产；Windows 默认 GBK 会令 hook 输出 emoji/中文失败）
     env.setdefault("PYTHONUTF8", "1")
+    env.update(env_extra or {})
     t0 = time.perf_counter()
     r = subprocess.run(
         [sys.executable, str(SCRIPT_DIR / script_name)],
@@ -157,6 +158,55 @@ def test_prompt_submit_under_300ms(tmp_home: Path, large_vault: Path) -> None:
     # 所以 A/B 必须交替（ABBA），且不要在有并发 agent 的机器上下性能结论。
     assert observed < 0.3, (
         f"UserPromptSubmit 性能超标: {observed:.3f}s（500 笔记参考基线，中位数）")
+
+
+def test_prompt_submit_with_mod_request_under_300ms(tmp_home: Path, large_vault: Path) -> None:
+    """交互终端里 mod 每轮都写请求文件：UPS 因此多走 `_report_llm` 两次、`_fill_report` /
+    `_fill_provenance` 与快照写入。上面两条用例的 session_id / prompt_id 不是 UUID，
+    `_session_ops.request_path` 返回 None，这些代码一行都不执行（full-review T-H1：让新代码
+    每次调用慢 100 ms，有请求的 UPS 到 0.38 s，那三条性能守卫照样全绿）。
+
+    先证明测的是 mod 在场路径（每轮快照 prompt_id 对得上、status 为 scored、`llm.state` 为 ok，
+    即两次 describe 都读到了预置的 entry），再谈耗时。PATH 指向空目录：预置失效时这里会尝试
+    发起提炼，不得真起付费的 claude 子进程（那种情形下 `llm.state` 是 unavailable，断言会先红）。
+    """
+    import hashlib
+    from scripts import _state, _topic
+
+    cfg = tmp_home / ".context-vault" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(large_vault)}))
+    # 占位 UUID 拆开拼接：发布闸门按 8-4-4-4-12 hex 拦截疑似真实 session id
+    sid = "-".join(("11111111", "2222", "3333", "4444", "555555555555"))
+    _state.configure_context("claude")
+    try:
+        _topic.save_session_topic(NEUTRAL_CWD, sid, ["相关性打分"], pinned=[], accounted=False,
+                                  state="ok")
+    finally:
+        _state.configure_context("unknown")
+    live = tmp_home / ".context-vault" / "state" / "live"
+    live.mkdir(parents=True, exist_ok=True)
+    sid_h = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:24]
+    empty = tmp_home / "emptybin"
+    empty.mkdir()
+    prompt = "召回 扩展词 相关性打分 回归测试 语义检索 关键词匹配 怎么优化实现"
+    samples = []
+    for i in range(WARMUP + SAMPLES):
+        pid = "-".join(("aaaaaaaa", "bbbb", "cccc", "dddd", f"{i:012d}"))
+        (live / f"{sid_h}-{pid}.req.json").write_text('{"v": 1}', encoding="utf-8")
+        elapsed, _ = _run_script(
+            "prompt_submit_load.py", NEUTRAL_CWD, prompt=prompt,
+            extra={"session_id": sid, "prompt_id": pid, "hook_event_name": "UserPromptSubmit"},
+            env_extra={"PATH": str(empty)})
+        snap = json.loads((live / f"{sid_h}.json").read_text(encoding="utf-8"))
+        assert (snap["prompt_id"], snap["status"]) == (pid, "scored"), snap.get("status")
+        assert snap["llm"] is not None and snap["llm"]["state"] == "ok", snap["llm"]
+        if i >= WARMUP:
+            samples.append(elapsed)
+    observed = statistics.median(samples)
+    assert observed < 0.3, (
+        f"mod 在场的 UserPromptSubmit 性能超标: median {observed:.3f}s（{SAMPLES} 样本，"
+        f"500 笔记 fixture）\n全部样本: {[f'{s:.3f}' for s in sorted(samples)]}")
 
 
 def test_prompt_submit_with_metrics_enabled_stays_within_budget(

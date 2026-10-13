@@ -327,7 +327,8 @@ def test_file_stays_under_byte_budget_with_pins(tmp_path: Path, charset: str, ch
     for i in range(MAX_TOPIC_SESSIONS + 4):
         # 恰好顶到 MAX_PIN_PATH_CHARS（3 位序号 + 1 位 j + ".md" = 7 字符）：超过即被读端丢弃（B-L9）
         pins = [f"{ch * (MAX_PIN_PATH_CHARS - 7)}{i:03d}{j}.md" for j in range(k)]
-        save_session_topic(repo, f"sess-{i}", [word] * 8, pinned=pins, accounted=False)
+        save_session_topic(repo, f"sess-{i}", [word] * 8, pinned=pins, accounted=False,
+                           state="failed", fail="exit_nonzero")
 
     p = session_topics_path(repo)
     size = p.stat().st_size

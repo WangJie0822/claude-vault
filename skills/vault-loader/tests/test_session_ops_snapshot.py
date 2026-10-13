@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -26,6 +27,11 @@ def test_display_text_is_single_line_and_clean(raw):
 def test_display_text_truncates_and_rejects_non_str():
     assert len(ops_mod.display_text("x" * 500)) == 120
     assert ops_mod.display_text(None) == ""
+
+
+@pytest.mark.parametrize("cp", [0x061C, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064])
+def test_display_text_strips_added_invisibles(cp):
+    assert chr(cp) not in ops_mod.display_text(f"a{chr(cp)}b")
 
 
 def test_note_title_uses_stem():
@@ -103,6 +109,17 @@ def test_snapshot_keys_match_contract_fixture(tmp_path):
     fixture = json.loads(SNAP_FIXTURE.read_text(encoding="utf-8"))
     assert set(snap) == set(fixture)
     assert set(snap["pins"]) == set(fixture["pins"])
+
+
+def test_snapshot_new_keys_default_to_unknown(tmp_path):
+    _write_request(tmp_path, {"v": 1})
+    rep = ops_mod.TurnReport.for_ups(_hook(), tmp_path)
+    rep.take_ops()
+    rep.status = "scored"
+    rep.finalize()
+    snap = json.loads(ops_mod.snapshot_path(SID, tmp_path).read_text(encoding="utf-8"))
+    assert snap["llm"] is None and snap["thresholds"] is None     # 未计算：mod 显示「未知」
+    assert isinstance(snap["ts"], int) and abs(snap["ts"] - time.time()) < 60
 
 
 def test_reject_annotations_records_reason(tmp_path):
@@ -248,3 +265,45 @@ def test_snapshot_keeps_not_in_index_when_many_annotations_rejected(tmp_path):
 def test_ensure_live_dir_creates_private_dir(tmp_path):
     ops_mod.ensure_live_dir(tmp_path)
     assert ops_mod.live_dir(tmp_path).is_dir()
+
+
+MOD_JS = Path(__file__).resolve().parents[3] / "hooks" / "vault-mod.js"
+INVISIBLES = [0x061C, *range(0x200B, 0x2010), 0x2028, 0x2029, *range(0x202A, 0x202F),
+              *range(0x2060, 0x2065), *range(0x2066, 0x206A), 0xFEFF]
+
+
+def test_invisible_char_sets_match_mod():
+    """mod 的 STRIP_RE 与 Python display_text 剥同一批不可见字符（spec 2026-10-12 §3.5）。"""
+    m = re.search(r"const STRIP_RE = /\[(.+?)\]/g", MOD_JS.read_text(encoding="utf-8"))
+    assert m, "找不到 STRIP_RE"
+    js = re.compile("[" + m.group(1) + "]")
+    assert js.sub("", "a" + chr(7) + "b") == "ab"                   # 阳性对照：类解析没失效
+    for cp in INVISIBLES:
+        ch = chr(cp)
+        assert ch not in js.sub("", f"a{ch}b"), f"mod 未剥 U+{cp:04X}"
+        assert ch not in ops_mod.display_text(f"a{ch}b"), f"Python 未剥 U+{cp:04X}"
+
+
+def _js_object_keys(src: str, name: str) -> set:
+    """取 vault-mod.js 里 `const NAME = { k: '…', … }` 的键集合（值是单引号字符串）。"""
+    m = re.search(r"const %s = \{(.*?)\}\n" % name, src, re.S)
+    assert m, f"找不到 {name}"
+    keys = set(re.findall(r"(\w+): '", m.group(1)))
+    assert keys, f"{name} 解析出空集"                                # 阳性对照：解析没失效
+    return keys
+
+
+def test_llm_and_dedup_enums_match_mod():
+    """快照 `llm.state` / `llm.fail`、`pins.llm[].dedup`、`session_start[].why` 的值域两侧逐一相同。
+    此前 mod 的白名单是手抄的：Python 多出一个值时，mod 把它当 null 处理、保留上一次的状态（full-review A2）。"""
+    from scripts import _decision, _topic
+    from scripts.session_start_load import _REASON_LABELS
+    src = MOD_JS.read_text(encoding="utf-8")
+    assert _js_object_keys(src, "LLM_TEXT") == set(_topic.LLM_STATES)
+    assert _js_object_keys(src, "FAIL_TEXT") == set(_topic.LLM_FAILS)
+    assert _js_object_keys(src, "DEDUPS") == {"fulltext_injected", "candidate_injected",
+                                               _decision.USER_EXCLUDED}
+    assert _js_object_keys(src, "REASONS") == set(_REASON_LABELS)
+    # mod 的白名单从文案表派生，不再手抄一份
+    assert "const LLM_STATES = new Set(Object.keys(LLM_TEXT))" in src
+    assert "const LLM_FAILS = new Set(Object.keys(FAIL_TEXT))" in src

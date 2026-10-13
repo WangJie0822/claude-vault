@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -86,6 +87,27 @@ MAX_PIN_HARD_CAP = 8          # 读写两侧的绝对上限；配置 session_pin
 # save_session_topic 的「未传即保留」哨兵。与 `prompt_submit_load._UNSET`（「调用方没传
 # fulltext_path」）语义不同、且都按 identity 比较——同名会诱人把一个传给另一个（1B-L-6），故改名。
 _KEEP = object()
+
+# topics entry 的提炼状态（spec 2026-10-12 §3.2）。白名单：读端遇到集合外的值一律归 failed / error。
+TOPIC_STATES = ("pending", "ok", "failed")
+TOPIC_FAILS = ("no_claude", "timeout", "exit_nonzero", "error")
+# 本轮 spawn 结果里表示「发起不了」的两种（describe 据此显示 unavailable，节点 1 T7）
+_UNAVAILABLE = ("no_claude", "spawn_error")
+# describe_session_topic 输出的 state / fail 全集，即快照 `llm` 的值域；mod 侧 LLM_TEXT / FAIL_TEXT
+# 的键必须与它逐一相同（`test_session_ops_snapshot.py` 的 parity 用例）。保持元组：取值来自可篡改
+# 的 JSON，`x in 元组` 遇到 list / dict 只返回 False，frozenset 会抛 TypeError。
+LLM_STATES = ("off", "idle", "unavailable", "pending", "ok", "failed")
+LLM_FAILS = ("no_claude", "spawn_error", "timeout", "exit_nonzero", "lost", "error", "dry_run")
+
+# topics entry 的 ts 允许比本机时钟超前多少秒（时钟回拨的余量）。超前更多的视为无效：伪造的
+# 未来 ts 否则永不过期，且会在条数淘汰时把刚写入的会话挤出去（full-review S-3）。
+_TS_SKEW_SEC = 300
+
+
+def _valid_ts(ts, now: float) -> bool:
+    """有限、非 bool 的数，且不超前本机时钟 `_TS_SKEW_SEC` 以上。读端与写端共用这一个判据。"""
+    return (isinstance(ts, (int, float)) and not isinstance(ts, bool)
+            and math.isfinite(ts) and ts <= now + _TS_SKEW_SEC)
 
 # Windows 控制台弹窗抑制。非 Windows 上 subprocess 无此常量，getattr 兜底为 0
 # （0 是 creationflags 的中性值，POSIX 分支本就不传它）。
@@ -221,7 +243,10 @@ def _load_entry(cwd: Path, session_id: str, ttl_hours: float) -> dict | None:
         if not isinstance(entry, dict):
             return None
         ts = entry.get("ts", 0)
-        if not isinstance(ts, (int, float)) or time.time() - ts > ttl_hours * 3600:
+        now = time.time()
+        # `_valid_ts` 挡掉 inf / nan / bool / 超前太多的 ts：只判 isinstance 时 `now - inf > ttl`
+        # 恒假、NaN 比较恒假，这类条目永不过期，下游 `int(now - ts)` 还会抛（full-review Q1）
+        if not _valid_ts(ts, now) or now - ts > ttl_hours * 3600:
             return None
         return entry
     except Exception as exc:                       # noqa: BLE001
@@ -304,6 +329,94 @@ def has_recent_topic_attempt(cwd: Path, session_id: str, ttl_hours: float) -> bo
     return _load_entry(cwd, session_id, ttl_hours) is not None
 
 
+_LAST_SPAWN: "str | None" = None
+
+
+def take_spawn_outcome() -> "str | None":
+    """取走并清空最近一次 `spawn_topic_extraction` 的结果：`spawned` / `no_claude` / `spawn_error`。
+
+    只在同一进程内交给会话快照（spec 2026-10-12 §3.3），不落盘：父进程找不到 claude 时
+    spawn 不写占位，事后读文件分不出「没装 claude」与「尚未发起」（节点 1 T7）。
+    """
+    global _LAST_SPAWN
+    v, _LAST_SPAWN = _LAST_SPAWN, None
+    return v
+
+
+def describe_session_topic(cwd: Path, session_id: str, config: dict, *,
+                           spawn_outcome: "str | None" = None,
+                           now: "float | None" = None) -> dict:
+    """LLM 精排（主题词提炼 + 点名）此刻的状态，只服务 mod 展示（spec 2026-10-12 §3.2）。
+
+    返回的键恒定、无值为 None，契约按键树比对；state / fail 的全集是 `LLM_STATES` / `LLM_FAILS`。
+    按顺序判定：
+
+    | 条件 | state | fail |
+    |---|---|---|
+    | `relevance.session_topic` 关（缺键按关，与主流程 spawn 门禁同一默认） | off | None |
+    | 本轮 spawn 结果是 no_claude / spawn_error | unavailable | 该结果 |
+    | TTL 内没有有效 entry（缺失、过期、ts 无效） | idle | dry_run 开着时为 dry_run（主流程永不发起） |
+    | entry 的 state 缺失 | 有词判 ok，否则 pending | None |
+    | entry 的 state 在 TOPIC_STATES 内 | 照写 | failed 时取 entry 的 fail，不在白名单判 error |
+    | entry 的 state 不在白名单 | failed | error |
+    | 以上得到 pending 且年龄超过 TOPIC_TIMEOUT_SEC + PENDING_GRACE_SEC | failed | lost |
+
+    最后一条保证子进程被杀、写回被吞、占位覆盖了先写的失败时，不会永远显示「提炼中」。
+    `now` 只用于算 `age_s`；TTL 由 `_load_entry` 按真实时钟判。
+
+    读取走 `_load_entry` 单点。spawn 门禁不读本函数，也不读 entry 的 `state` / `fail`（topics 侧只看
+    `load_session_topic` 的词与 `has_recent_topic_attempt`），所以改这两个字段不会改变是否发起。
+    这不等于 topics 文件被篡改时不会重复付费：伪造的 ts 曾能把本会话挤出条数上限，现由
+    `_valid_ts` 与「淘汰不动本会话」挡住。
+    """
+    rel = (config or {}).get("relevance", {}) or {}
+    topic_on = bool(rel.get("session_topic", False))
+    pin_max = effective_pin_max(config)
+    out = {"state": "off", "fail": None, "words": [], "in_scoring": None, "n_pinned": None,
+           "age_s": None, "pin_on": topic_on and pin_max > 0, "stale_pins": False}
+    if not topic_on:
+        return out
+    if spawn_outcome in _UNAVAILABLE:
+        out.update(state="unavailable", fail=spawn_outcome)
+        return out
+    ups = (config or {}).get("user_prompt_submit", {}) or {}
+    ttl = ups.get("state_ttl_hours", DEFAULT_CONFIG["user_prompt_submit"]["state_ttl_hours"])
+    entry = _load_entry(cwd, session_id, ttl)
+    if entry is None:
+        out["state"] = "idle"
+        if (config or {}).get("dry_run", False):
+            out["fail"] = "dry_run"      # 主流程的 spawn 门禁含 `not dry_run`：等多少轮都不会发起（full-review A1）
+        return out
+    now = time.time() if now is None else now
+    ts = entry.get("ts", 0)
+    age = 0
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        age = max(0, int(now - ts))
+    raw_words = entry.get("words")
+    words = _clean_words(raw_words) if isinstance(raw_words, list) else []
+    raw_pins = entry.get("pinned")
+    pinned = _clean_pinned(raw_pins)[:pin_max] if isinstance(raw_pins, list) else []
+    raw = entry.get("state")
+    fail = None
+    if raw is None:                       # 旧 entry（无 state）：有词即完成，否则按年龄推断
+        state = "ok" if words else "pending"
+    elif raw in TOPIC_STATES:
+        state = raw
+    else:
+        state, fail = "failed", "error"
+    if state == "pending" and age > TOPIC_TIMEOUT_SEC + PENDING_GRACE_SEC:
+        state, fail = "failed", "lost"
+    elif state == "failed" and fail is None:
+        f = entry.get("fail")
+        fail = f if f in TOPIC_FAILS else "error"
+    out.update(state=state, fail=fail, words=words, age_s=age)
+    if state == "ok":
+        out["n_pinned"] = len(pinned)
+    else:
+        out["stale_pins"] = bool(pinned)
+    return out
+
+
 def _clean_words(words) -> list[str]:
     out: list[str] = []
     try:
@@ -326,8 +439,14 @@ def _clean_words(words) -> list[str]:
     return out[:MAX_TOPIC_WORDS]
 
 
-def save_session_topic(cwd: Path, session_id: str, words, *, pinned=_KEEP, accounted=_KEEP) -> None:
-    """写该会话的主题词。超过 MAX_TOPIC_SESSIONS 时按 ts 淘汰最旧的。"""
+def save_session_topic(cwd: Path, session_id: str, words, *, pinned=_KEEP, accounted=_KEEP,
+                       state=None, fail=None) -> None:
+    """写该会话的主题词。超过 MAX_TOPIC_SESSIONS 时按 ts 淘汰最旧的，但不淘汰本会话；
+    ts 无效（`_valid_ts`）的他会话条目在写入时清掉。
+
+    `state` / `fail`（spec 2026-10-12 §3.2）只在显式传入且在白名单里时写，**不继承**旧值：
+    占位若继承上一窗口的 `ok`，「提炼中」会被显示成「已完成」。`fail` 只随 `state="failed"` 写。
+    """
     try:
         if not session_id:
             return
@@ -351,18 +470,22 @@ def save_session_topic(cwd: Path, session_id: str, words, *, pinned=_KEEP, accou
             a_val = accounted if accounted is not _KEEP else prev.get("accounted")
             if isinstance(a_val, bool):
                 entry["accounted"] = a_val
-            topics[session_id] = entry
+            if state in TOPIC_STATES:
+                entry["state"] = state
+                if state == "failed" and fail in TOPIC_FAILS:
+                    entry["fail"] = fail
+            # ts 无效的他会话条目读端本就当不存在，写入时一并清掉（full-review S-3）
+            others = {k: v for k, v in topics.items()
+                      if k != session_id and _valid_ts(v.get("ts"), now)}
+            topics = {**others, session_id: entry}
             if len(topics) > MAX_TOPIC_SESSIONS:
-                # 转换为带索引的列表，使 ts 相同时后插入的胜出
-                items_with_idx = [(i, k, v) for i, (k, v) in enumerate(topics.items())]
-                # 按 ts 升序排列，二级键是插入顺序（升序），取最后 MAX_TOPIC_SESSIONS 个
-                ordered = sorted(
-                    items_with_idx,
-                    key=lambda item: (
-                        item[2].get("ts", 0) if isinstance(item[2].get("ts", 0), (int, float)) else 0,
-                        item[0]
-                    ))
-                topics = dict((k, v) for _, k, v in ordered[-MAX_TOPIC_SESSIONS:])
+                # 与下面的字节裁剪同一不变量：刚写入的这条永不被淘汰。否则 32 条容差内的未来 ts
+                # 就能把它挤出去，下一轮 spawn 门禁重开、再付一次费。其余按 ts 升序淘汰，ts 相同时
+                # 后插入的胜出（二级键是插入顺序）。
+                ordered = sorted(((i, k, v) for i, (k, v) in enumerate(others.items())),
+                                 key=lambda item: (item[2]["ts"], item[0]))
+                topics = dict((k, v) for _, k, v in ordered[-(MAX_TOPIC_SESSIONS - 1):])
+                topics[session_id] = entry
 
             # 条数裁剪之后再做**字节裁剪**。条数上限单独用不住：一条 entry 的字节数
             # 跨字符集差 3 倍以上（实测满尺寸 ASCII 1041B / 3 字节中文 2625B /
@@ -406,6 +529,9 @@ def save_session_topic(cwd: Path, session_id: str, words, *, pinned=_KEEP, accou
 
 TOPIC_MODEL = "haiku"
 TOPIC_TIMEOUT_SEC = 120        # 子进程自杀上限；实测 LLM 中位 21s，给 6 倍余量
+# 显式或推断的 pending 超过 TOPIC_TIMEOUT_SEC + 这个余量即判结果丢失：超时只约束 claude 进程本身，
+# 不含子进程解释器启动与取锁的时间（节点 1 R-L1）。
+PENDING_GRACE_SEC = 30
 _NUM_PREFIX = re.compile(r"^\s*\d+\s*[.、)]\s*")
 _LABEL_PREFIX = re.compile(r"^\s*(关键词|主题词|主题|keywords?|words)\s*[:：]\s*", re.I)
 # 双段输出的标签串本身永远不是主题词（终审 M-6 / post-review A-M2 的第二道防线：挡住没被正则枚举到的
@@ -553,6 +679,9 @@ def parse_pin_and_words(raw, pool_size: int, pin_max: int) -> tuple[list[int], l
     return idx, words
 
 
+_LAST_FAIL: "str | None" = None
+
+
 def _call_model(prompt_text: str) -> str | None:
     """同步调模型。**只在子进程里跑**，父进程永远不碰它。
 
@@ -566,9 +695,14 @@ def _call_model(prompt_text: str) -> str | None:
     安全前提是 `spawn_topic_extraction` 以插件目录为 cwd 起本子进程，Python 3.9–3.11 的
     `shutil.which` 在 Windows 上先搜的是那个目录而不是用户项目。改那里的 cwd 前先改这里；
     裸调用点由 `tests/test_exe_search.py::test_bare_shutil_which_only_at_reviewed_sites` 登记。
+
+    失败原因写进模块级 `_LAST_FAIL`（`no_claude` / `timeout` / `exit_nonzero` / `error`），签名保持
+    `-> str | None`：约 13 处测试替身直接替换本函数，改返回形态会让它们静默解包出错（节点 1 T5）。
     """
+    global _LAST_FAIL
     exe = shutil.which("claude")
     if exe is None:
+        _LAST_FAIL = "no_claude"
         return None
     env = dict(os.environ)
     env["VAULT_LOADER_DISABLE"] = "1"          # 防递归：子进程不得再触发本 hook
@@ -579,9 +713,16 @@ def _call_model(prompt_text: str) -> str | None:
             input=prompt_text, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=TOPIC_TIMEOUT_SEC,
             env=env, shell=False, creationflags=_no_window_flags())
-    except Exception:                           # noqa: BLE001
+    except subprocess.TimeoutExpired:
+        _LAST_FAIL = "timeout"
         return None
-    return r.stdout if r.returncode == 0 else None
+    except Exception:                           # noqa: BLE001
+        _LAST_FAIL = "error"
+        return None
+    if r.returncode != 0:
+        _LAST_FAIL = "exit_nonzero"
+        return None
+    return r.stdout
 
 
 def spawn_topic_extraction(cwd: Path, session_id: str, prompt: str,
@@ -595,9 +736,15 @@ def spawn_topic_extraction(cwd: Path, session_id: str, prompt: str,
     传给子进程，不放 argv——argv 在本机进程表全程可见（如 `ps`/任务管理器）且无
     长度上限，与本项目 metrics 层"只存加盐 hash、刻意不落 transcript_path"的隐私
     口径不一致。argv 只留 cwd/session_id 两个非敏感定位参数。
+
+    本轮结果另记进 `_LAST_SPAWN`（由 `take_spawn_outcome` 取走），占位写 `state="pending"`
+    （spec 2026-10-12 §3.2–3.3）。
     """
+    global _LAST_SPAWN
+    _LAST_SPAWN = None
     try:
         if shutil.which("claude") is None:
+            _LAST_SPAWN = "no_claude"
             return False
         # 写读两侧同一单点：session_pin_enabled 关 ⇒ 0 ⇒ 子进程走 1.2.1 单段模板、不点名
         # （SKILL.md 承诺「回到 1.2.1 形态」）；读端 `load_session_pinned(pin_max=…)` 用同一个值。
@@ -654,9 +801,11 @@ def spawn_topic_extraction(cwd: Path, session_id: str, prompt: str,
         #
         # 子进程完成时用真实结果再 save 一次覆盖它（ts 一并刷新），故占位不会让提炼
         # 结果丢失；spawn 失败（Popen 抛异常）走外层 except，不落标记，保留重试。
-        save_session_topic(cwd, session_id, [])
+        save_session_topic(cwd, session_id, [], state="pending")
+        _LAST_SPAWN = "spawned"
         return True
     except Exception as exc:                     # noqa: BLE001 — fail-open
+        _LAST_SPAWN = "spawn_error"
         print(f"[vault-loader] 主题提炼拉起失败：{exc}", file=sys.stderr)
         return False
 
@@ -677,7 +826,11 @@ def run_extraction_child(argv: list[str], stdin_text: str | None = None) -> int:
     「每个 TTL 窗口最多一次」——即使 `_call_model`/`parse_topic_words` 内部
     抛出了 `_call_model` 自身 fail-open 契约本不该放出的异常，也不例外
     （故取词与落盘分两个独立 try 块，取词失败不得连累落盘）。
+
+    落盘带 `state`（spec 2026-10-12 §3.2）：成功 `ok`，失败 `failed` 加原因（取自 `_LAST_FAIL`，
+    替身不设时记 `error`）。
     """
+    global _LAST_FAIL
     try:
         cwd, session_id = argv[0], argv[1]
     except Exception:                            # noqa: BLE001 — argv 不足，无处可写
@@ -698,6 +851,7 @@ def run_extraction_child(argv: list[str], stdin_text: str | None = None) -> int:
         pass
     words: list[str] = []
     pinned: list[str] | None = None            # None = 提炼失败，落盘时不传（保留占位状态）
+    fail = "error"
     try:
         if stdin_text is None:
             try:
@@ -724,18 +878,23 @@ def run_extraction_child(argv: list[str], stdin_text: str | None = None) -> int:
         if not isinstance(pin_max, int) or isinstance(pin_max, bool):
             pin_max = 1
         pin_max = max(0, min(MAX_PIN_HARD_CAP, pin_max))
+        _LAST_FAIL = None                       # 替身不设它时不能读到上一次的残留
         raw = _call_model(build_topic_prompt(prompt, cands, pin_max=pin_max))
         if raw is not None:
             idx, words = parse_pin_and_words(raw, len(cands), pin_max)
             pinned = [cands[i][0] for i in idx if 0 <= i < len(cands)]
+        else:
+            fail = _LAST_FAIL if _LAST_FAIL in TOPIC_FAILS else "error"
     except Exception:                            # noqa: BLE001 — words 保持 []
         words = []
         pinned = None
+        fail = "error"
     try:
         if pinned is None:
-            save_session_topic(Path(cwd), session_id, words)
+            save_session_topic(Path(cwd), session_id, words, state="failed", fail=fail)
         else:
-            save_session_topic(Path(cwd), session_id, words, pinned=pinned, accounted=False)
+            save_session_topic(Path(cwd), session_id, words, pinned=pinned, accounted=False,
+                               state="ok")
     except Exception:                            # noqa: BLE001
         pass
     return 0

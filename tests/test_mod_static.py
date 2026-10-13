@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CALLS_WHITELIST = {
     "$.fs.read", "$.fs.write", "$.env.get", "$.clock.now", "$.session.surfaces",
     "$.store.get", "$.store.set", "$.store.delete", "$.store.keys",
-    "$.ui.resolve", "$.ui.open", "$.ui.close", "$.ui.toast", "$.ui.invalidate",
+    "$.ui.resolve", "$.ui.open", "$.ui.close", "$.ui.toast", "$.ui.invalidate", "$.ui.focus",
     "$.command.register", "$.state.get", "$.state.set",
 }
 
@@ -76,6 +76,28 @@ def test_validate_calls_are_whitelisted(tmp_path):
     calls = {c.strip() for c in listed.split(",") if c.strip()}
     assert "$.fs.write" in calls, out          # 阳性对照：解析没把整行吃空
     assert calls <= CALLS_WHITELIST, sorted(calls - CALLS_WHITELIST)
+    assert "$.ui.focus" in calls, out          # 面板切换展开后把焦点放回该行（spec 2026-10-12 §4.3）
+
+
+def test_toggle_puts_focus_back_on_the_row():
+    """切换展开后先更新展开态、再把焦点放回该行（节点 1 T3）。
+
+    行为测试做不了：claude plugin test 2.1.296 不实现插件发起的 `$.ui.focus`（实测
+    `HooksError: no implementation for ui.focus`，测试挂的 ui.focus hook 也收不到），
+    所以在这里钉调用形态；真实落位需在交互终端人工验证（尚无运行记录）。
+
+    钉的是语句形态而不是子串：focus 调用必须独占一行、紧跟在 `try {` 之后。只查子串时把它包进
+    永假条件（`if (Date.now() < 0) await ...`）照样通过（full-review T-M6 / JM21）。
+    """
+    src = (ROOT / "hooks" / "vault-mod.js").read_text(encoding="utf-8").replace("\r\n", "\n")
+    m = re.search(r"const toggle = \(id, key\) => async \(\) => \{(.*?)\n    \}\n", src, re.S)
+    assert m, "找不到 toggle"
+    body = m.group(1)
+    upd = re.search(r"^      await update\(\$, UI, ", body, re.M)
+    foc = re.search(r"^      try \{\n        await \$\.ui\.focus\(\{ requestId: PANE, key \}\)\s*(//.*)?$",
+                    body, re.M)
+    assert upd and foc and upd.start() < foc.start(), body
+    assert "onPress: toggle(id, key)" in src             # 行按钮确实接到了 toggle
 
 
 SNAPSHOT_FIXTURE = (ROOT / "skills" / "vault-loader" / "tests" / "fixtures" / "mod_contract"
@@ -98,6 +120,42 @@ def test_mod_reads_only_contract_snapshot_fields():
     assert read <= keys, sorted(read - keys)
     # 阳性对照：同一判据对改了字段名的源码必须报出来
     assert not _snapshot_fields_read(src.replace("snap.prompt_id", "snap.promptId")) <= keys
+
+
+_ITEM_PARSERS = {"injectedItems": ("injected",), "items": ("pins.llm", "pins.user", "excluded"),
+                 "ssItems": ("session_start",)}
+
+
+def _fn_body(src: str, name: str) -> str:
+    m = re.search(rf"^function {name}\(.*?^\}}$", src, re.M | re.S)
+    assert m, f"找不到 function {name}"
+    return m.group(0)
+
+
+def _fixture_item_keys(fixture: dict, dotted: str) -> set:
+    node = fixture
+    for part in dotted.split("."):
+        node = node[part]
+    assert node, f"夹具 {dotted} 没有样例条目，字段守卫会变成空网"
+    return set(node[0])
+
+
+def test_mod_reads_only_contract_item_fields():
+    """条目级与 llm / thresholds 的字段也受夹具约束（节点 1 T2：上一条只抓 snap.X 顶层）。"""
+    src = (ROOT / "hooks" / "vault-mod.js").read_text(encoding="utf-8")
+    fixture = json.loads(SNAPSHOT_FIXTURE.read_text(encoding="utf-8"))
+    for fn, places in _ITEM_PARSERS.items():
+        read = set(re.findall(r"\bx\.([a-z_]+)", _fn_body(src, fn)))
+        assert "path" in read, fn                                  # 正则没失效
+        allowed = set().union(*(_fixture_item_keys(fixture, p) for p in places))
+        assert read <= allowed, (fn, sorted(read - allowed))
+    for fn, key, var in (("parseLlm", "llm", "l"), ("parseThresholds", "thresholds", "t")):
+        read = set(re.findall(rf"\b{var}\.([a-z_]+)", _fn_body(src, fn)))
+        assert read, fn
+        assert read <= set(fixture[key]), (fn, sorted(read - set(fixture[key])))
+    # 阳性对照：改一个字段名必须被抓到
+    bad = _fn_body(src.replace("x.admit_arm", "x.admitArm"), "injectedItems")
+    assert not set(re.findall(r"\bx\.([a-z_]+)", bad)) <= _fixture_item_keys(fixture, "injected")
 
 
 def test_js_suite_passes(tmp_path):

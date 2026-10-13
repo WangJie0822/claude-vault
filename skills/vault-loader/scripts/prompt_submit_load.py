@@ -86,7 +86,7 @@ try:
     from scripts._topic import (
         load_session_topic, spawn_topic_extraction, has_recent_topic_attempt,
         load_session_pinned, load_pinned_accounted, mark_pinned_accounted,
-        effective_pin_max, split_pin_budget,
+        effective_pin_max, split_pin_budget, describe_session_topic, take_spawn_outcome,
     )
     from scripts._candidate_pool import (build_topic_pool, count_project_notes, safe_int,
                                          SUMMARY_CHARS)
@@ -265,6 +265,28 @@ def _take_session_ops(config: dict, home: Path, cfg_fallback=None):
         except Exception as exc:  # noqa: BLE001
             _report_nonfatal("标注写入失败", exc)
     return ops
+
+
+def _report_llm(config: dict, cwd: Path, hook_input: dict, *, in_scoring=None,
+                spawn_outcome=None) -> None:
+    """快照的 `llm`：LLM 精排此刻的状态（spec 2026-10-12 §3.1）。
+
+    只在本轮有 mod 请求时读 topics 文件；出错只打一行 stderr、`rep.llm` 保持调用前的值，绝不连累召回
+    （`main()` 没有 except，异常逃出去本轮注入整体丢失）。第一次调用在停用闸门之后、召回闸门之前
+    （闸门轮也带状态；`disabled` 出口不带），打分轮在 spawn 之后再调一次，带上本轮打分实际用了几个
+    主题词与本轮 spawn 的结果；第二次出错时留下的是第一次的结果（`in_scoring` 为 None）。
+    """
+    rep = _REPORT
+    if rep is None or not rep.request_seen or _session_ops is None:
+        return
+    try:
+        llm = describe_session_topic(cwd, hook_input.get("session_id", "") or "", config,
+                                     spawn_outcome=spawn_outcome)
+        llm["words"] = [w for w in (_session_ops.display_text(x, 40) for x in llm["words"]) if w][:8]
+        llm["in_scoring"] = in_scoring
+        rep.llm = llm
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 精排状态读取失败：{exc}", file=sys.stderr)
 
 # 「未传」哨兵：fulltext_path=None 是有意义的取值（决策层判定本轮**不**注入全文），
 # 故不能用 None 区分"调用方没传"。没传 → 渲染层按 select_fulltext 自行回退计算
@@ -787,8 +809,12 @@ def _finish_with_metrics(config: dict, cwd: Path,
 def _fill_report(*, config: dict, prompt: str, home: Path, active_entries: dict,
                  decision, injected_paths, fulltext_title, hits_by_path,
                  pinned_render, pinned_rendered, user_pins, user_rendered,
-                 excluded_paths) -> None:
-    """把本轮展示所需的数据写进 `_REPORT`。任何异常只降级为「快照内容不全」。"""
+                 excluded_paths, topic_words=frozenset()) -> None:
+    """把本轮展示所需的数据写进 `_REPORT`。任何异常只降级为「快照内容不全」。
+
+    命中词不论 metrics 开关都写（spec 2026-10-12 D2，用户决定）；`prompt_h` 仍只在 metrics 开启时写。
+    `topic_words` 必须是本轮实际参与打分的那份（`signals.session_topic_words`），不重读状态（节点 1 T6）。
+    """
     rep = _REPORT
     if rep is None or not rep.request_seen or _session_ops is None:
         return
@@ -799,13 +825,11 @@ def _fill_report(*, config: dict, prompt: str, home: Path, active_entries: dict,
         items = []
         for p in injected_paths:
             hits = list((hits_by_path or {}).get(p, []))
-            item = {"path": p, "title": _session_ops.note_title(p),
-                    "confidence": _confidence_label(topical.get(p, 0.0), hits, conf_high),
-                    "fulltext": p == fulltext_title,
-                    "kind": "admitted_fulltext" if p == fulltext_title else "admitted_list"}
-            if metrics_on:
-                item["hits"] = [_session_ops.display_text(h, 40) for h in hits[:10]]
-            items.append(item)
+            items.append({"path": p, "title": _session_ops.note_title(p),
+                          "confidence": _confidence_label(topical.get(p, 0.0), hits, conf_high),
+                          "fulltext": p == fulltext_title,
+                          "kind": "admitted_fulltext" if p == fulltext_title else "admitted_list",
+                          "hits": [_session_ops.display_text(h, 40) for h in hits[:10]]})
         rep.injected = items
         rep.pins_llm = [{"path": p, "title": _session_ops.note_title(p),
                          "rendered": p in pinned_rendered} for p in pinned_render]
@@ -818,6 +842,40 @@ def _fill_report(*, config: dict, prompt: str, home: Path, active_entries: dict,
             rep.prompt_h = _metrics.h(prompt, _metrics.get_salt(home)) if prompt else ""
     except Exception as exc:  # noqa: BLE001
         print(f"[vault-loader] 会话快照填充失败：{exc}", file=sys.stderr)
+        return
+    # 来源明细放在独立的 try 里：这里出错只少几个键，不清空上面的注入列表（节点 1 T13）
+    try:
+        _fill_provenance(rep, config, active_entries, decision, pinned_render, topic_words)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 会话快照来源明细填充失败：{exc}", file=sys.stderr)
+
+
+def _fill_provenance(rep, config: dict, active_entries: dict, decision, pinned_render,
+                     topic_words) -> None:
+    """每篇注入的来源明细（spec 2026-10-12 §3.1）：打分方式、topical、命中的 LLM 主题词、名次。"""
+    weight = (config.get("scoring", {}) or {}).get("session_topic_hit", 0) or 0
+    rel = config["relevance"]
+    # 数值一律经 finite_num：配置里的阈值与权重未经校验，非有限值会让整份快照对 mod 失效（full-review S-1）
+    fn = _session_ops.finite_num
+    rep.thresholds = {"min_topical": fn(rel.get("min_topical_score")),
+                      "ft_topical": fn(rel.get("fulltext_topical_threshold")),
+                      "topic_hit_weight": fn(weight)}
+    by_path = {ed.path: ed for ed in decision.admitted}
+    words = set(topic_words or ()) if weight else set()
+    llm_set = set(pinned_render or ())
+    for item in rep.injected:
+        ed = by_path.get(item["path"])
+        entry = active_entries.get(item["path"])
+        item["topical"] = fn(round(ed.topical, 2)) if ed is not None else None
+        item["admit_arm"] = ed.admit_arm if ed is not None else ""
+        hits = _hit_keywords(entry, words) if (entry is not None and words) else []
+        item["topic_hits"] = [h for h in (_session_ops.display_text(x, 40) for x in hits[:10]) if h]
+        item["llm_also_pinned"] = item["path"] in llm_set
+    rank_of = {ed.path: i for i, ed in enumerate(decision.admitted, 1)}
+    dedup_of = {ed.path: ed.dedup for ed in decision.excluded if ed.dedup}
+    for p in rep.pins_llm:
+        p["rank"] = rank_of.get(p["path"])
+        p["dedup"] = None if p["path"] in rank_of else dedup_of.get(p["path"])
 
 
 def main() -> int:
@@ -944,6 +1002,7 @@ def _main_impl() -> int:
 
     _report_status("pending")
     session_ops = _take_session_ops(config, home, cfg_fallback)
+    _report_llm(config, cwd, hook_input)
     # ↓↓↓ 停用闸门到此为止，从这里开始才允许登记诊断 ↓↓↓
     if cfg_fallback == "corrupt":
         notify(config_corrupt(cfg_detail))
@@ -1160,6 +1219,7 @@ def _main_impl() -> int:
     # (候选池篇数, 其中项目笔记片篇数 | None)，只在真正送出提炼的那一轮有值；pin 关着时池回落纯 admitted、
     # 第二项为 None（不落键）——否则报表会把「功能关闭」读成「组件 A 未生效」（post-review A-M1）。
     pool_stats: "tuple[int, int | None] | None" = None
+    spawn_outcome = None
     if (rel_cfg.get("session_topic", False) and not topic_words and not topic_attempted
             and not config.get("dry_run", False)):
         try:
@@ -1185,9 +1245,12 @@ def _main_impl() -> int:
                 spawn_topic_extraction(
                     cwd, hook_input.get("session_id", "") or "",
                     prompt, cands, config)
+                spawn_outcome = take_spawn_outcome()
                 pool_stats = (len(cands), n_proj)     # 只记真正送出去的那一轮，没送的池不算
         except Exception as exc:                 # noqa: BLE001
             print(f"[vault-loader] 主题提炼触发失败：{exc}", file=sys.stderr)
+    _report_llm(config, cwd, hook_input, in_scoring=len(signals.session_topic_words),
+                spawn_outcome=spawn_outcome)
 
     # metrics 落盘：默认关闭（config 无 "metrics" 键时 .get 恒返回 False），仅开发者
     # 手动开启。stage 零 IO，真正写盘延后到 _finish_with_metrics 的 flush；此处任何
@@ -1298,7 +1361,7 @@ def _main_impl() -> int:
                      decision=decision, injected_paths=[], fulltext_title=None, hits_by_path={},
                      pinned_render=pinned_render, pinned_rendered=pinned_rendered,
                      user_pins=user_pins, user_rendered=user_rendered,
-                     excluded_paths=excluded_paths)
+                     excluded_paths=excluded_paths, topic_words=signals.session_topic_words)
 
     if not decision.admitted and pinned_text:
         display_cfg = config.get("display", {})
@@ -1379,7 +1442,8 @@ def _main_impl() -> int:
                  decision=decision, injected_paths=injected_paths, fulltext_title=fulltext_title,
                  hits_by_path=hits_by_path, pinned_render=pinned_render,
                  pinned_rendered=pinned_rendered, user_pins=user_pins,
-                 user_rendered=user_rendered, excluded_paths=excluded_paths)
+                 user_rendered=user_rendered, excluded_paths=excluded_paths,
+                 topic_words=signals.session_topic_words)
     summary_items = scored[: ups_cfg["max_notes"]]
     summary = (build_summary_ups(summary_items, prompt_keywords, fulltext_title,
                                  injection_text, display_cfg, rel_cfg,

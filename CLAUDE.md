@@ -73,7 +73,7 @@ Read 到匹配文件时 rules 会自动注入；上下文里已出现该 rules �
 ### vault-loader 注入、打分、主题词与配置表
 
 - 注入正文恒带 `INJECTION_NOTICE` 隔离声明。SessionStart 注入确定性的项目固定上下文（不打分）；UserPromptSubmit 按 prompt 关键词打分取 Top N。信号 D 已无生产调用方，勿误以为生效。ASCII 关键词走词边界匹配、含 CJK 的走子串匹配；改 `scoring` 权重须同步调阈值。
-- 会话主题词按项目根隔离（`_repo_root` 纯 stat 向上找，判据是「像不像 git 仓库」，不解析 `.git` 文件里的路径），与注入去重分属两个文件；`state_path_for_cwd` 勿顺手对齐成项目根。大小保证在 `TOPIC_TRIM_BYTES` 字节裁剪，守卫必须用宽字符，`_encoded_size` 连行尾一起对齐写端。不做全局单文件或按 session_id 存；不做「读不到就回退旧位置」。
+- 会话主题词按项目根隔离（`_repo_root` 纯 stat 向上找，判据是「像不像 git 仓库」，不解析 `.git` 文件里的路径），与注入去重分属两个文件；`state_path_for_cwd` 勿顺手对齐成项目根。大小保证在 `TOPIC_TRIM_BYTES` 字节裁剪，守卫必须用宽字符，`_encoded_size` 连行尾一起对齐写端。不做全局单文件或按 session_id 存；不做「读不到就回退旧位置」；ts 只经 `_valid_ts` 判有效，淘汰不动本会话。
 - `lease_lock` 在 Windows 上遇 delete-pending 抛的 `PermissionError` 要重试，POSIX 上原样抛出；2s 租约在极端争用下仍可能 `TimeoutError`（未处理）。
 - session pin：点名上限写读两侧共用单点 `_topic.effective_pin_max`；对账标记只在 metrics flush 成功后、且只在 admitted 非空的轮次翻；`_KIND_HIT` / `_KIND_BUCKET` 必须全覆盖 `KINDS`，别写 `else` 或 `not in (...)` 排除法；索引排除判据单点 `is_system_index_name`。
 - slash 跳过闸门必须在信号 J 之前；命令名解析与剥离共用「到第一个空白为止」的切分口径；`<command-name>` 包裹形态用 `match` 锚定开头，不用 `search`；名单的类型归一不能省（配成字符串会逐字符迭代）；只对 UPS 收到 `/cmd` 原文的命令生效。
@@ -84,7 +84,7 @@ Read 到匹配文件时 rules 会自动注入；上下文里已出现该 rules �
 ### mod（注入可见与可控）
 
 - mod 与 Python 只经按轮请求文件和会话快照交换数据（`state/live/`，与命名空间无关），事件 `e` 原样传递；不要改回往 `e` 里加字段，不要把 `live/` 挪进 `state/claude/`。
-- 快照统一由 `TurnReport.finalize` 写；排除在决策层最先判、`user_excluded` 不是「曾注入过」；`PIN_HEADER` 不改，合计上限只走 `split_pin_budget`；标注核对后整批在锁内写，拒收是终局。改 mod 两侧（含入口里的 `_take_session_ops`）前先 Read `.claude/rules/mod.md`。
+- 快照统一由 `TurnReport.finalize` 写；排除在决策层最先判、`user_excluded` 不是「曾注入过」；`PIN_HEADER` 不改，合计上限只走 `split_pin_budget`；标注核对后整批在锁内写，拒收是终局；快照只加 v1 增量键、mod 缺键显示「未知」，面板 key 由 path 派生。改 mod 两侧（含入口与 `_topic.py` 里写快照的部分）前先 Read `.claude/rules/mod.md`。
 
 ### metrics
 

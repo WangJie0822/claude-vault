@@ -206,6 +206,31 @@ def build_injection_text_ss(cwd, git_top, target_tags, project_notes,
     return INJECTION_NOTICE + "\n".join(lines)
 
 
+_REASON_LABELS = {"project_dir": "项目目录", "tag": "标签"}
+
+
+def note_reasons(entry, project_paths, target_tags) -> list:
+    """会话开始注入一篇的原因（spec 2026-10-12 §3.4）：`project_dir`（项目目录，含项目 CLAUDE.md 的
+    extra_paths——`collect_signal_a_project_dir` 已把它们并进 project_paths）、`tag`（标签匹配）。
+    摘要清单与 mod 快照共用这一处判据。"""
+    out = []
+    if entry.path in project_paths:
+        out.append("project_dir")
+    if target_tags & set(entry.tags):
+        out.append("tag")
+    return out
+
+
+def ss_snapshot_item(entry, project_paths, target_tags, include_tag: bool) -> dict:
+    """mod 快照里的一篇会话开始注入：入选原因按 include_tag 过滤，命中标签逐个净化、最多 5 个。"""
+    from scripts import _session_ops
+    return {"path": entry.path, "title": _session_ops.note_title(entry.path),
+            "why": [r for r in note_reasons(entry, project_paths, target_tags)
+                    if r != "tag" or include_tag],
+            "tags": [t for t in (_session_ops.display_text(x, 40)
+                                 for x in sorted(target_tags & set(entry.tags))[:5]) if t]}
+
+
 def build_summary_ss(project_notes, top_worklogs, recent_commits,
                      project_paths, target_tags, injection_text, display_cfg):
     """SessionStart 用户可见清单摘要（systemMessage）。verbosity=off → None。"""
@@ -232,11 +257,8 @@ def build_summary_ss(project_notes, top_worklogs, recent_commits,
         return sanitize_injected_text(last, keep_newlines=False)[:MAX_TITLE_CHARS]
 
     def _why(e):
-        if e.path in project_paths:
-            return "项目目录"
-        if target_tags & set(e.tags):
-            return "标签"
-        return "?"
+        r = note_reasons(e, project_paths, target_tags)
+        return _REASON_LABELS[r[0]] if r else "?"
 
     if verbosity == "compact":
         titles = "·".join(_title(e.path) for e in project_notes[:3])
@@ -503,8 +525,7 @@ def _main_impl() -> int:
     project_notes = project_notes[: ss_cfg["max_notes"]]
     if _REPORT is not None and _REPORT.request_seen:
         try:
-            from scripts import _session_ops
-            _REPORT.session_start = [{"path": e.path, "title": _session_ops.note_title(e.path)}
+            _REPORT.session_start = [ss_snapshot_item(e, project_paths, target_tags, include_tag)
                                      for e in project_notes]
             _REPORT.status = "dry_run" if config.get("dry_run", False) else "scored"
         except Exception as exc:  # noqa: BLE001

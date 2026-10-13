@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -231,8 +232,9 @@ MAX_LIST_ITEMS = 50
 # 互斥）再加一条 over_cap。快照不能截得比它短：截掉的 not_in_index 让 mod 永远收不到
 # 「这条操作已失效」（节点 2 T-M4）。
 MAX_REJECTED = (MAX_EXCLUDE + 1) + (MAX_PIN + 1) + (MAX_UNPIN + 1) + (MAX_ANNOTATIONS + 1)
-# 两个净化函数都不剥的可伪装字符：bidi 控制与零宽字符（spec §5.3、security M1）
-_INVISIBLE_RE = re.compile(r"[​-‏‪-‮⁦-⁩﻿]")
+# 两个净化函数都不剥的可伪装字符：bidi 控制（含 U+061C 阿拉伯字母标记）、零宽与不可见运算符
+# （spec 2026-10-12 §3.5）。mod 侧 STRIP_RE 同步，两侧字符集由 parity 用例钉住。
+_INVISIBLE_RE = re.compile(r"[؜​-‏‪-‮⁠-⁤⁦-⁩﻿]")
 
 
 def display_text(s, limit: int = MAX_TITLE_CHARS) -> str:
@@ -246,6 +248,17 @@ def display_text(s, limit: int = MAX_TITLE_CHARS) -> str:
     from scripts._output import sanitize_for_display, sanitize_injected_text
     t = sanitize_for_display(sanitize_injected_text(s, keep_newlines=False))
     return _INVISIBLE_RE.sub("", t)[:limit]
+
+
+def finite_num(v):
+    """快照里的数值字段：只放有限的 int / float，bool、非数值、NaN、±Infinity 一律 None（mod 显示「未知」）。
+
+    `write_snapshot` 的 `json.dumps` 会把非有限数写成 `Infinity` / `NaN`，mod 的 `JSON.parse` 不认，
+    整份快照作废、面板静默冻结；配置里的阈值与权重不经校验就能是这些值（full-review S-1）。
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return v if math.isfinite(v) else None
 
 
 def note_title(path: str) -> str:
@@ -329,6 +342,10 @@ class TurnReport:
     acked: list = field(default_factory=list)
     metrics_on: bool = False
     prompt_h: str = ""
+    # spec 2026-10-12 §3.1 的增量键：未计算时为 None。mod 遇 None 保留上一次的展示，从未收到过对象时
+    # 才显示「未知」（`vault-mod.js` 的 absorb）
+    llm: Optional[dict] = None
+    thresholds: Optional[dict] = None
 
     @classmethod
     def for_ups(cls, hook_input: dict, home: Optional[Path] = None) -> "TurnReport":
@@ -384,6 +401,9 @@ class TurnReport:
             "rejected": self.rejected[:MAX_REJECTED],
             "acked": self.acked[:MAX_ANNOTATIONS],
             "metrics_on": bool(self.metrics_on),
+            "llm": self.llm,
+            "thresholds": self.thresholds,
+            "ts": int(time.time()),
         }
         if self.metrics_on and self.prompt_h:
             snap["prompt_h"] = self.prompt_h

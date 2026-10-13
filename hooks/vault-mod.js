@@ -6,8 +6,8 @@ import { atom, read, update } from 'claude-code'
 
 const PANE = 'vault-injected'
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
-// C0、DEL、C1、零宽与 bidi 控制字符：快照已由 Python 净化，这里是纵深防御
-const STRIP_RE = /[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g
+// C0、DEL、C1、零宽、bidi（含 U+061C）、不可见运算符与 U+2028/2029：快照已由 Python 净化，这里是纵深防御；字符集与 Python `_session_ops._INVISIBLE_RE` 由 parity 用例钉住
+const STRIP_RE = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g
 const MAX_TEXT = 120
 const MAX_LIST = 50
 const ANN_PREFIX = 'ann:'
@@ -15,25 +15,56 @@ const ANN_TTL_SECONDS = 7 * 24 * 3600
 const ANN_MAX = 200
 const LIMITS = { exclude: 50, pin: 8, unpin: 8, annotations: 50 }
 const DRAWN_STATUSES = new Set(['scored', 'dry_run'])
+// 快照新键的取值白名单（spec 2026-10-12 §4.6），键集合与 Python 侧逐一相同（parity 用例：
+// skills/vault-loader/tests/test_session_ops_snapshot.py）。集合外的值：arm、dedup、llm.state 显示「未知」，
+// why 里的丢弃，llm.fail 当作没有原因。upgrade_candidate 只说明 topical 升到了全文阈值，本轮全文仍只给一篇
+const ARMS = { topical: 'topical 达标', keyword_bypass: '关键词直通', upgrade_candidate: '升级候选（曾以清单注入）' }
+const DEDUPS = { fulltext_injected: '已全文注入过', candidate_injected: '已注入过', user_excluded: '已排除' }
+const REASONS = { project_dir: '项目目录', tag: '标签' }
+const LLM_MARK = { ok: '精排✓', pending: '精排…', failed: '精排✗', unavailable: '精排✗' }
 
 const OPS_INIT = { exclude: [], pin: [], unpin: [], pending: [] }
 const VIEW_INIT = { status: '', last: null, gateNow: false, sessionStart: [], excluded: [],
-  pins: { llm: [], user: [] }, metricsOn: false, promptH: '', session: '', note: '', queued: 0 }
+  pins: { llm: [], user: [] }, llm: null, thresholds: null, ts: 0,
+  metricsOn: false, promptH: '', session: '', note: '', queued: 0 }
 const WARN_INIT = { shown: false, active: false }
 const OPS = atom({ plugin: 'context-vault', key: 'ops' }, OPS_INIT)
 const VIEW = atom({ plugin: 'context-vault', key: 'view' }, VIEW_INIT)
 const WARN = atom({ plugin: 'context-vault', key: 'warn' }, WARN_INIT)
+const UI_INIT = { expanded: '' }
+const UI = atom({ plugin: 'context-vault', key: 'ui' }, UI_INIT)
+const FOOTER = 'Enter 展开/收起 · ↑↓/Tab 移动 · Esc 关闭'
+const MAX_PANE_ROWS = 40
+const LLM_TEXT = { off: '未开启（relevance.session_topic）', idle: '尚未发起（等第一个有召回的提问）',
+  unavailable: '无法发起', pending: '提炼中', ok: '已完成', failed: '失败' }
+const FAIL_TEXT = { no_claude: '找不到 claude 命令', spawn_error: '拉起子进程失败', timeout: '超时',
+  exit_nonzero: '退出码非 0', lost: '结果丢失', error: '出错', dry_run: 'dry_run 下不发起提炼' }
+// 白名单从文案表派生：只往一边加值时，另一边不会悄悄显示 undefined
+const LLM_STATES = new Set(Object.keys(LLM_TEXT))
+const LLM_FAILS = new Set(Object.keys(FAIL_TEXT))
 const LIMIT_TEXT = { exclude: '排除', pin: '手动钉住', unpin: '取消自动点名' }
 
 const clean = (s, limit = MAX_TEXT) => (typeof s === 'string' ? s.replace(STRIP_RE, '').slice(0, limit) : '')
 const uniq = (a) => [...new Set(a)]
 const strings = (v, limit) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string').slice(0, limit) : [])
+const own = (o, k) => typeof k === 'string' && Object.prototype.hasOwnProperty.call(o, k)
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+// 要画出来的字符串列表一律逐项 clean；不是数组时返回 null（= 未知），不得改用 strings()（节点 1 T11）
+const cleanList = (v, n, c) => (Array.isArray(v)
+  ? v.filter((x) => typeof x === 'string').slice(0, n).map((x) => clean(x, c)).filter((x) => x)
+  : null)
 
 function items(v, withRendered) {
   if (!Array.isArray(v)) return []
   return v.filter((x) => x && typeof x.path === 'string').slice(0, MAX_LIST).map((x) => {
     const o = { path: x.path, title: clean(x.title) }
-    if (withRendered) o.rendered = x.rendered === true
+    if (withRendered) {
+      o.rendered = x.rendered === true
+      o.rankKnown = 'rank' in x
+      o.rank = num(x.rank)
+      // '' = 没有去重裁决（未进粗排）；'?' = 有值但本版不认识，显示「未知」而不是一个确定的说法
+      o.dedup = x.dedup == null || x.dedup === '' ? '' : own(DEDUPS, x.dedup) ? x.dedup : '?'
+    }
     return o
   })
 }
@@ -43,7 +74,33 @@ function injectedItems(v) {
   return v.filter((x) => x && typeof x.path === 'string').slice(0, MAX_LIST).map((x) => ({
     path: x.path, title: clean(x.title), confidence: clean(x.confidence, 4),
     fulltext: x.fulltext === true, kind: x.kind === 'admitted_fulltext' ? 'admitted_fulltext' : 'admitted_list',
+    topical: num(x.topical), arm: own(ARMS, x.admit_arm) ? x.admit_arm : '',
+    hits: cleanList(x.hits, 10, 40), topicHits: cleanList(x.topic_hits, 10, 40),
+    alsoPinned: x.llm_also_pinned === true,
   }))
+}
+
+function ssItems(v) {
+  if (!Array.isArray(v)) return []
+  return v.filter((x) => x && typeof x.path === 'string').slice(0, MAX_LIST).map((x) => ({
+    path: x.path, title: clean(x.title),
+    why: Array.isArray(x.why) ? x.why.filter((r) => own(REASONS, r)) : null,
+    tags: cleanList(x.tags, 5, 40),
+  }))
+}
+
+// 不是对象 → null（未知）。是对象但 state 本版不认识 → state 记 ''、显示「未知」，不能当 null：
+// absorb 遇 null 保留上一次，Python 新增一个状态值时 band 会一直停在旧简标上（full-review A2）
+function parseLlm(l) {
+  if (!l || typeof l !== 'object') return null
+  return { state: LLM_STATES.has(l.state) ? l.state : '', fail: LLM_FAILS.has(l.fail) ? l.fail : '',
+    words: cleanList(l.words, 8, 40) || [], inScoring: num(l.in_scoring), nPinned: num(l.n_pinned),
+    ageS: num(l.age_s), pinOn: l.pin_on === true, stalePins: l.stale_pins === true }
+}
+
+function parseThresholds(t) {
+  if (!t || typeof t !== 'object') return null
+  return { min: num(t.min_topical), ft: num(t.ft_topical), weight: num(t.topic_hit_weight) }
 }
 
 async function homeDir($) {
@@ -131,6 +188,7 @@ async function enterSession($, sid) {
   if (v.session === sid) return
   await update($, OPS, () => ({ ...OPS_INIT }))
   await update($, WARN, () => ({ ...WARN_INIT }))
+  await update($, UI, () => ({ ...UI_INIT }))
   await update($, VIEW, () => ({ ...VIEW_INIT, session: sid }))
 }
 
@@ -167,6 +225,10 @@ async function absorb($, e, snap) {
       gateNow: status.startsWith('gate:'),
       excluded: scored ? items(snap.excluded, false) : v.excluded,
       pins: scored ? { llm: items(pins.llm, true), user: items(pins.user, true) } : v.pins,
+      thresholds: scored ? parseThresholds(snap.thresholds) : v.thresholds,
+      // llm 与 ts 对任何有效 UPS 快照都吸收（含闸门轮，spec §4.3）；null 或缺键 = 本轮没算出来，保留上一次
+      llm: snap.llm == null ? v.llm : parseLlm(snap.llm),
+      ts: num(snap.ts) || v.ts,
       // 标注目标是最近一次打分轮（promptH 同理）：闸门轮不改变它，也不收掉按钮
       metricsOn: scored ? snap.metrics_on === true : v.metricsOn,
       promptH: scored && typeof snap.prompt_h === 'string' ? snap.prompt_h : v.promptH,
@@ -176,6 +238,7 @@ async function absorb($, e, snap) {
     }
   })
   await update($, WARN, (w) => ({ ...w, active: false }))
+  await collapseGone($)
 }
 
 async function readSnapshot($, e, sent) {
@@ -202,21 +265,146 @@ async function readSnapshot($, e, sent) {
   if (mismatch) await flagWarn($)
 }
 
+// 来源计数与精排简标放在标题之前：这一行是 truncate-end，标题多时截掉的是末尾（spec §4.5）。
+// 不渲染任何 LLM 主题词或命中词（只在面板展开区出现）。
 function bandLine(view, warn) {
   if (warn.active) return '⚠ vault：操作未送达（快照路径不一致或请求未被读取） · /vault-injected'
+  const head = []
+  if (view.status === 'dry_run') head.push('[DRY-RUN]')
+  if (view.gateNow) head.push('（本轮未召回）')
   const parts = []
   if (view.last) {
     const inj = view.last.injected
-    parts.push(inj.length ? `📚 ${inj.length} 篇：${inj.map((x) => x.title).join(' · ')}` : '📚 无注入')
+    parts.push(inj.length ? `📚 粗排 ${inj.length}` : '📚 无注入')
   } else {
     parts.push(`📚 会话开始注入 ${view.sessionStart.length} 篇`)
   }
-  const nPin = view.pins.llm.length + view.pins.user.length
-  if (nPin) parts.push(`📌${nPin}`)
-  if (view.excluded.length) parts.push(`已排除${view.excluded.length}`)
-  let line = (view.status === 'dry_run' ? '[DRY-RUN] ' : '') + parts.join(' · ')
-  if (view.gateNow) line += '（本轮未召回）'
-  return line + ' · /vault-injected'
+  if (view.pins.llm.length) parts.push(`精排📌${view.pins.llm.length}`)
+  if (view.pins.user.length) parts.push(`手动📌${view.pins.user.length}`)
+  if (view.excluded.length) parts.push(`排除 ${view.excluded.length}`)
+  if (view.llm && own(LLM_MARK, view.llm.state)) parts.push(LLM_MARK[view.llm.state])
+  if (view.last) parts.push(...view.last.injected.map((x) => x.title))
+  return [...head, parts.join(' · ')].join(' ') + ' · /vault-injected'
+}
+
+// path → 8 位十六进制（FNV-1a）。Button 的 key 由 path 派生，不用序号、不由文案派生：新快照换了
+// 顺序时，按序号的 key 会把操作打到另一篇上（节点 1 T3）
+function pathKey(p) {
+  let h = 0x811c9dc5
+  for (const ch of p) {
+    h ^= ch.codePointAt(0)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
+
+function isWide(cp) {
+  return (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3)
+    || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60)
+    || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) || (cp >= 0x20000 && cp <= 0x3fffd)
+}
+
+function cellWidth(s) {
+  let n = 0
+  for (const ch of s) n += isWide(ch.codePointAt(0)) ? 2 : 1
+  return n
+}
+
+// 按显示列宽截断（CJK 与 emoji 记 2 列）；按码点迭代，不会切开代理对
+function fitText(s, cols) {
+  if (cols <= 1) return '…'
+  if (cellWidth(s) <= cols) return s
+  let out = ''
+  let n = 0
+  for (const ch of s) {
+    const w = isWide(ch.codePointAt(0)) ? 2 : 1
+    if (n + w > cols - 1) break
+    out += ch
+    n += w
+  }
+  return out + '…'
+}
+
+function injMeta(it) {
+  return `${it.confidence}置信 · ${it.fulltext ? '全文' : '清单'}${it.topicHits && it.topicHits.length ? ' · +主题词' : ''}`
+}
+
+// 条目字段按「是不是数组 / 数字」判断，不按 === null：热重载后读到的可能是旧版 mod 写进 $.state 的
+// 条目，新字段是 undefined（full-review BP-M1：`undefined.join` 曾让整个面板画不出来）
+function injDetails(it, th) {
+  const arm = own(ARMS, it.arm) ? ARMS[it.arm] : '未知'
+  const score = typeof it.topical === 'number' ? `topical ${it.topical}` : 'topical 未知'
+  const gate = th && th.min !== null && th.ft !== null ? `（注入 ≥${th.min}，全文 ≥${th.ft} 且强证据）` : ''
+  const lines = [`来源  脚本粗排 · ${arm} · ${score}${gate}${it.fulltext ? ' · 已升级为全文' : ''}`]
+  let hit = `命中  提问词：${Array.isArray(it.hits) ? it.hits.join(', ') || '（无）' : '未知'}`
+  if (Array.isArray(it.topicHits) && it.topicHits.length) {
+    hit += ` ｜ LLM 主题词：${it.topicHits.join(', ')}（+${th && th.weight !== null ? th.weight : '?'}）`
+  }
+  lines.push(hit)
+  if (it.alsoPinned) lines.push('LLM 也点名了这篇（不重复注入）')
+  return lines
+}
+
+function pinMeta(it, l) {
+  let where = ''
+  if (it.rankKnown) {
+    where = typeof it.rank === 'number' ? ` · 粗排第 ${it.rank}`
+      : ` · ${!it.dedup ? '未进粗排' : own(DEDUPS, it.dedup) ? DEDUPS[it.dedup] : '未知'}`
+  }
+  return `LLM 点名${where}${l && l.stalePins ? ' · 沿用上一窗口' : ''}`
+}
+
+function ssMeta(it) {
+  if (!it.why) return ''
+  return it.why.map((r) => (r === 'tag' && it.tags && it.tags.length ? `标签 ${it.tags.join(', ')}` : REASONS[r])).join(' / ')
+}
+
+function llmHead(l) {
+  if (!l) return 'LLM 精排 · 未知（快照来自旧版本或读取失败）'
+  if (!own(LLM_TEXT, l.state)) return 'LLM 精排 · 未知（本版不认识的状态）'
+  if (l.state === 'idle' && l.fail === 'dry_run') return `LLM 精排 · ${FAIL_TEXT.dry_run}`
+  let s = `LLM 精排 · ${LLM_TEXT[l.state]}`
+  if (l.fail && own(FAIL_TEXT, l.fail)) s += `：${FAIL_TEXT[l.fail]}`
+  if (l.state === 'pending' && l.ageS !== null) s += `（已 ${l.ageS} 秒，截至上次提问）`
+  if (l.state === 'failed') s += '；本窗口内不再重试（user_prompt_submit.state_ttl_hours）'
+  if (l.state === 'ok' && l.ageS !== null) s += ` · ${l.ageS < 60 ? '刚刚' : `${Math.floor(l.ageS / 60)} 分钟前`}完成`
+  return s
+}
+
+function llmLines(l, th) {
+  if (!l || !['pending', 'ok', 'failed'].includes(l.state)) return []
+  const out = []
+  if (l.words.length) {
+    out.push(`主题词 ${l.words.length} 个（本轮打分已用 ${l.inScoring === null ? '?' : l.inScoring}）：${l.words.join(', ')}`)
+  }
+  if (l.state === 'ok') out.push(`点名 ${l.nPinned === null ? '?' : l.nPinned} 篇${l.pinOn ? '' : '（点名已关闭）'}`)
+  out.push(`作用：主题词给命中的笔记加 ${th && th.weight !== null ? th.weight : '?'} 分（下一轮起生效）；点名的篇以摘要固定注入`)
+  if (l.stalePins) out.push('注入中的点名沿用上一窗口')
+  return out
+}
+
+// 打开面板时按内容请求高度：不传时宿主给三分之一，内容溢出后 ↑↓ 变成滚动（节点 1 T18）
+function paneRows(view, ops) {
+  const n = (view.last ? view.last.injected.length : 0) + view.pins.llm.length + ops.pin.length
+    + uniq([...ops.exclude, ...ops.unpin]).length + view.sessionStart.length
+  // 表头 1 + 五节标题与节间空行 10 + 精排说明 4 + 页脚 4 + 展开一篇的余量 4
+  return Math.min(MAX_PANE_ROWS, n + 23)
+}
+
+// 新快照里展开的那篇已不在时收起（spec §4.3）
+async function collapseGone($) {
+  const u = await read($, UI)
+  if (!u.expanded) return
+  const v = await read($, VIEW)
+  const o = await read($, OPS)
+  const ids = new Set([
+    ...(v.last ? v.last.injected.map((x) => `inj:${x.path}`) : []),
+    ...v.pins.llm.map((x) => `llm:${x.path}`),
+    ...o.pin.map((p) => `user:${p}`),
+    ...uniq([...o.exclude, ...o.unpin]).map((p) => `exc:${p}`),
+    ...v.sessionStart.map((x) => `ss:${x.path}`),
+  ])
+  if (!ids.has(u.expanded)) await update($, UI, () => ({ ...UI_INIT }))
 }
 
 const addTo = (key, path, also = []) => (o) => {
@@ -260,7 +448,8 @@ export function register(on, options) {
   })
 
   on('command.run', { command: 'vault-injected' }, async ($) => {
-    await $.ui.open({ id: PANE, title: 'vault 注入', focus: true, closeOnEscape: true })
+    const rows = paneRows(await read($, VIEW), await read($, OPS))
+    await $.ui.open({ id: PANE, title: 'vault 注入', focus: true, closeOnEscape: true, rows })
     return {}
   })
 
@@ -290,8 +479,9 @@ export function register(on, options) {
       } else if (paths) {
         const snap = JSON.parse(await $.fs.read(paths.snap))
         if (snap && snap.v === 1 && snap.event === 'SessionStart') {
-          await update($, VIEW, (v) => ({ ...v, sessionStart: items(snap.session_start, false),
+          await update($, VIEW, (v) => ({ ...v, sessionStart: ssItems(snap.session_start), ts: num(snap.ts) || v.ts,
             status: typeof snap.status === 'string' ? snap.status : v.status, session: e.session_id }))
+          await collapseGone($)
         }
       }
     } catch {
@@ -325,7 +515,9 @@ export function register(on, options) {
     const nothing = !view.last && !view.sessionStart.length && !warn.active
     if (view.status === 'disabled' || nothing) return theirs
     const { Box, Text } = $.ui.resolve(e)
-    return Box({ flexDirection: 'column', children: [
+    // 与上方会话内容隔一行（D4）；宿主给的高度不足 3 行时不加，免得把内容挤进滚动
+    const marginTop = typeof e.props.maxRows === 'number' && e.props.maxRows >= 3 ? 1 : 0
+    return Box({ flexDirection: 'column', marginTop, children: [
       Text({ wrap: 'truncate-end', children: [bandLine(view, warn)] }),
       theirs,
     ] })
@@ -335,69 +527,122 @@ export function register(on, options) {
     const { Box, Text, Button } = $.ui.resolve(e)
     const view = await read($, VIEW)
     const ops = await read($, OPS)
+    const ui = await read($, UI)
+    const nowS = Math.floor(Number(await $.clock.now()) / 1000)
+    const bodyCols = typeof e.props.bodyColumns === 'number' ? e.props.bodyColumns : 80
+    const cols = Math.max(20, bodyCols - 2)              // 根 Box 左右各 1 格内边距（D4）
     const pend = (p) => (ops.pending.includes(p) ? '（下一轮生效）' : '')
-    const rows = []
-    const row = (children) => rows.push(Box({ flexDirection: 'row', columnGap: 1, children }))
-    const heading = (t) => rows.push(Text({ bold: true, children: [t] }))
+    const dim = (t) => Text({ dimColor: true, wrap: 'truncate-end', children: [t] })
+    let firstRow = true
 
-    rows.push(Box({ flexDirection: 'row', children: [
-      Button({ key: 'close', label: '关闭', autoFocus: true, onPress: () => $.ui.close({ id: PANE }) }),
-    ] }))
-
-    heading('最近一次注入')
-    const inj = view.last ? view.last.injected : []
-    if (!inj.length) rows.push(Text({ dimColor: true, children: ['（无）'] }))
-    const canAnnotate = view.metricsOn && view.status !== 'dry_run' && /^[0-9a-f]{16}$/.test(view.promptH)
-    inj.forEach((it, i) => {
-      const ctrl = [
-        Text({ children: [`${it.title}（${it.confidence}置信 · ${it.fulltext ? '全文' : '清单'}）${pend(it.path)}`] }),
-        Button({ key: `ex:${i}`, label: '排除', onPress: () => addOp($, 'exclude', it.path, ['pin']) }),
-        Button({ key: `pin:${i}`, label: '钉住', onPress: () => addOp($, 'pin', it.path, ['exclude', 'unpin']) }),
-      ]
-      if (canAnnotate) {
-        for (const [verdict, label] of [['relevant', '有用'], ['irrelevant', '无用']]) {
-          ctrl.push(Button({ key: `${verdict}:${i}`, label, onPress: async () => {
-            let n = 0
-            try { n = (await $.store.keys()).filter((k) => k.startsWith(ANN_PREFIX)).length } catch {}
-            if (n >= ANN_MAX) { await $.ui.toast('vault：待写入标注已达 200 条，请先提交一轮提问'); return }
-            const id = await randomId()
-            const ts = Math.floor(Number(await $.clock.now()) / 1000)
-            await $.store.set(ANN_PREFIX + id, { id, path: it.path, kind: it.kind, verdict,
-              session: view.session, prompt_h: view.promptH, ts })
-            await update($, VIEW, (v) => ({ ...v, queued: v.queued + 1 }))
-          } }))
-        }
+    const toggle = (id, key) => async () => {
+      await update($, UI, (u) => ({ expanded: u.expanded === id ? '' : id }))
+      try {
+        await $.ui.focus({ requestId: PANE, key })        // 重绘后把焦点放回这一行（节点 1 T3）
+      } catch {
+        // 焦点落位只影响体验（claude plugin test 2.1.296 不实现插件发起的 ui.focus，在此抛 HooksError）
       }
-      row(ctrl)
-    })
+    }
+    // 一篇 = 一行一个焦点停靠点；展开区放来源详情与该篇的操作（D1）
+    const entry = (sec, path, title, meta, details, actions) => {
+      const id = `${sec}:${path}`
+      const k = pathKey(path)
+      const key = `row:${sec}:${k}`
+      const open = ui.expanded === id
+      const metaW = meta ? cellWidth(meta) + 2 : 0
+      const showMeta = metaW > 0 && cols - metaW >= 16
+      const btn = { key, plain: true, onPress: toggle(id, key),
+        label: (open ? '▾ ' : '▸ ') + fitText(title, cols - 2 - (showMeta ? metaW : 0)) }
+      if (firstRow) {
+        btn.autoFocus = true
+        firstRow = false
+      }
+      const out = [Box({ flexDirection: 'row', children: [
+        Button(btn), Box({ flexGrow: 1 }), ...(showMeta ? [dim(meta)] : []),
+      ] })]
+      if (open) {
+        out.push(Box({ flexDirection: 'column', paddingLeft: 4, children: [
+          ...details.map(dim),
+          Box({ flexDirection: 'row', columnGap: 2, children: actions.map(([name, hotkey, label, fn]) =>
+            Button({ key: `${name}:${k}`, plain: true, hotkey, label, onPress: fn })) }),
+        ] }))
+      }
+      return out
+    }
+    const sections = []
+    const section = (title, rows, lead = [], always = false) => {
+      if (!rows.length && !lead.length && !always) return
+      const body = rows.length || lead.length ? [...lead, ...rows.flat()] : [dim('（无）')]
+      sections.push(Box({ flexDirection: 'column', marginTop: 1, children: [
+        Text({ bold: true, children: [title] }), ...body,
+      ] }))
+    }
 
-    heading('📌 自动点名')
-    view.pins.llm.forEach((it, i) => row([
-      Text({ children: [`${it.title}${pend(it.path)}`] }),
-      Button({ key: `unpin:${i}`, label: '取消', onPress: () => addOp($, 'unpin', it.path, ['pin']) }),
-    ]))
-    heading('📌 手动钉住')
-    ops.pin.forEach((p, i) => {
-      const shown = view.pins.user.find((x) => x.path === p)
-      const tail = shown && !shown.rendered ? '（本轮未渲染）' : ''
-      row([
-        Text({ children: [`${clean(shown ? shown.title : p.split('/').pop())}${tail}${pend(p)}`] }),
-        Button({ key: `unpinuser:${i}`, label: '取消', onPress: () => update($, OPS, removeFrom(['pin'], p)) }),
-      ])
-    })
-    heading('本会话已排除（已注入过的不会撤回；之后不再升级为全文、不再被自动点名或注入）')
-    uniq([...ops.exclude, ...ops.unpin]).forEach((p, i) => row([
-      Text({ children: [`${clean(p.split('/').pop())}${pend(p)}`] }),
-      Button({ key: `restore:${i}`, label: '恢复', onPress: () => update($, OPS, removeFrom(['exclude', 'unpin'], p)) }),
-    ]))
-    heading('会话开始注入')
-    view.sessionStart.forEach((it, i) => row([
-      Text({ children: [it.title] }),
-      Button({ key: `sspin:${i}`, label: '钉住', onPress: () => addOp($, 'pin', it.path, ['exclude', 'unpin']) }),
-    ]))
-    if (!view.metricsOn) rows.push(Text({ dimColor: true, children: ['开启 metrics 后可标注'] }))
-    if (view.queued) rows.push(Text({ dimColor: true, children: [`${view.queued} 条标注待写入（随下一次提问）`] }))
-    if (view.note) rows.push(Text({ dimColor: true, children: [view.note] }))
-    return Box({ flexDirection: 'column', children: rows })
+    const canAnnotate = view.metricsOn && view.status !== 'dry_run' && /^[0-9a-f]{16}$/.test(view.promptH)
+    const annotate = (it, verdict) => async () => {
+      let n = 0
+      try { n = (await $.store.keys()).filter((k) => k.startsWith(ANN_PREFIX)).length } catch {}
+      if (n >= ANN_MAX) { await $.ui.toast('vault：待写入标注已达 200 条，请先提交一轮提问'); return }
+      const id = await randomId()
+      const ts = Math.floor(Number(await $.clock.now()) / 1000)
+      await $.store.set(ANN_PREFIX + id, { id, path: it.path, kind: it.kind, verdict,
+        session: view.session, prompt_h: view.promptH, ts })
+      await update($, VIEW, (v) => ({ ...v, queued: v.queued + 1 }))
+    }
+
+    const inj = view.last ? view.last.injected : []
+    section(`脚本粗排 · ${inj.length} 篇`, inj.map((it) => {
+      const acts = [['ex', 'x', '排除', () => addOp($, 'exclude', it.path, ['pin'])],
+        ['pin', 'p', '钉住', () => addOp($, 'pin', it.path, ['exclude', 'unpin'])]]
+      if (canAnnotate) {
+        acts.push(['relevant', 'y', '有用', annotate(it, 'relevant')],
+          ['irrelevant', 'n', '无用', annotate(it, 'irrelevant')])
+      }
+      return entry('inj', it.path, it.title, injMeta(it) + pend(it.path), injDetails(it, view.thresholds), acts)
+    }), [], true)
+
+    const llmTitle = view.llm || view.last ? llmHead(view.llm) : 'LLM 精排 · 等第一次提问'
+    section(llmTitle, view.pins.llm.map((it) => entry('llm', it.path, it.title, pinMeta(it, view.llm) + pend(it.path),
+      ['来源  LLM 从候选池点名（会话首轮提炼）',
+        it.rendered ? '本轮以摘要固定注入' : '本轮未单独注入（已在粗排里，或已不在索引）'],
+      [['unpin', 'u', '取消点名', () => addOp($, 'unpin', it.path, ['pin'])]])),
+    llmLines(view.llm, view.thresholds).map(dim), true)
+
+    section(`手动钉住 · ${ops.pin.length} 篇`, ops.pin.map((p) => {
+      const got = view.pins.user.find((x) => x.path === p)
+      return entry('user', p, clean(got ? got.title : p.split('/').pop()),
+        (got && !got.rendered ? '本轮未单独注入' : '') + pend(p),
+        ['来源  你在面板里钉住：之后每次打分的提问都以摘要注入'],
+        [['unpinuser', 'u', '取消钉住', () => update($, OPS, removeFrom(['pin'], p))]])
+    }))
+
+    const exc = uniq([...ops.exclude, ...ops.unpin])
+    section(`本会话已排除 · ${exc.length} 篇`, exc.map((p) => {
+      const got = view.excluded.find((x) => x.path === p)
+      return entry('exc', p, clean(got ? got.title : p.split('/').pop()), pend(p),
+        ['已注入过的不会撤回；之后不再升级为全文、不再被自动点名或注入'],
+        [['restore', 'r', '恢复', () => update($, OPS, removeFrom(['exclude', 'unpin'], p))]])
+    }))
+
+    section(`会话开始注入 · ${view.sessionStart.length} 篇`, view.sessionStart.map((it) => entry('ss', it.path, it.title,
+      ssMeta(it), [`来源  会话开始的项目固定上下文，不打分：${ssMeta(it) || '未知'}`],
+      [['sspin', 'p', '钉住', () => addOp($, 'pin', it.path, ['exclude', 'unpin'])]])))
+
+    const ago = view.ts ? Math.max(0, nowS - view.ts) : null
+    const when = ago === null ? '' : ago < 60 ? '刚刚' : `${Math.floor(ago / 60)} 分钟前`
+    const close = { key: 'close', label: '关闭', onPress: () => $.ui.close({ id: PANE }) }
+    if (firstRow) close.autoFocus = true
+    const header = Box({ flexDirection: 'row', children: [
+      Text({ bold: true, children: ['vault 注入'] }),
+      ...(when ? [dim(` · 截至上次提问（${when}）`)] : []),
+      Box({ flexGrow: 1 }), Button(close),
+    ] })
+    const foot = [dim(FOOTER)]
+    if (!view.metricsOn) foot.push(dim('开启 metrics 后可标注'))
+    if (view.queued) foot.push(dim(`${view.queued} 条标注待写入（随下一次提问）`))
+    if (view.note) foot.push(dim(view.note))
+    return Box({ flexDirection: 'column', paddingX: 1, children: [
+      header, ...sections, Box({ flexDirection: 'column', marginTop: 1, children: foot }),
+    ] })
   })
 }
