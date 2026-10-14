@@ -37,6 +37,7 @@ from _path_resolver import (
     is_inside_vault,
 )
 from _sensitive_patterns import is_sensitive_path, is_sensitive_content
+from _summary import sanitize_summary
 
 # UTF-8 BOM (﻿)
 _BOM = '﻿'
@@ -335,10 +336,11 @@ def archive_doc(entry: dict, vault_root: str,
     # tags：YAML inline 风格 [doc_type, archived]，由 _yaml_scalar 处理
     fm_updates['tags'] = [doc_type, 'archived']
 
-    # summary（截 200 字）
-    summary = entry.get('context', '')[:200]
+    # summary：pending-docs 的 context 是归集文档摘要的唯一来源（spec DS3）。先过
+    # sanitize_summary（剥换行 / 引号 / 反斜杠 / 结构 token，杜绝换行注入新键），再截 200 字。
+    summary = sanitize_summary(entry.get('context'), min_len=1, hard_cut=True)
     if summary:
-        fm_updates['summary'] = summary
+        fm_updates['summary'] = summary[:200]
 
     # keywords（vault-loader 的精确召回通路）：走与 summary 完全相同的通路——
     # 由 LLM 写 pending-docs 条目时一并填，归集时透传，零额外模型调用。

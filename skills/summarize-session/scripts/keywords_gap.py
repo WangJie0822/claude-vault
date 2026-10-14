@@ -107,7 +107,7 @@ def _sync_cache_entry(vault: pathlib.Path, rel: str, kws: list[str]) -> bool:
     """把新 keywords 同步进 frontmatter-cache 的对应 entry。返回是否同步成功。
 
     **这一步不是优化，是正确性必需**：rebuild_index 的增量判据是
-    `int(md_file.stat().st_mtime)`（`rebuild_index.py:163`，秒级截断），而本脚本
+    `int(md_file.stat().st_mtime)`（`rebuild_index.scan_vault`，秒级截断），而本脚本
     写完之后通常在同一秒内就跑 rebuild_index —— 它会判定文件未变、跳过重读，
     cache 于是永远停在「无 keywords」。后果是补了等于白补：vault-loader 读的是
     cache，召回拿不到 keywords，而下次会话的报告仍显示缺失、再补一遍。
@@ -187,4 +187,10 @@ def main(argv=None) -> int:
 if __name__ == '__main__':
     from _exe_search import harden_exe_search
     harden_exe_search()
+    # 输出含中文路径与报错：控制台编码不是 UTF-8 时按 UTF-8 读的调用方拿到乱码或空（同 rebuild_index）
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 — 被替换成不支持 reconfigure 的流时保持原样
+            pass
     sys.exit(main())

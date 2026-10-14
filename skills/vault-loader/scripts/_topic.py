@@ -685,7 +685,7 @@ _LAST_FAIL: "str | None" = None
 def _call_model(prompt_text: str) -> str | None:
     """同步调模型。**只在子进程里跑**，父进程永远不碰它。
 
-    刻意不复用 context_vault.model.call_claude（两者 argv 同形，差别在别处）：
+    刻意不复用 context_vault.model.call_claude（2.3.0 起后者多了三个隔离参数，本函数待 2.4.0 精排改造时按其 spec D8 加上；其余差别在别处）：
     - 这里传 `creationflags=_no_window_flags()`：detached 提炼子进程在 Windows 上不得弹控制台；
     - 兜底 `except Exception`：子进程内任何失败都只返回 None；
     - 只依赖同级模块，不把 `context_vault` 包引入提炼子进程的导入面。

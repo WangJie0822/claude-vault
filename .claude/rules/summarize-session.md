@@ -7,6 +7,22 @@ paths:
 
 > 本文件是 CLAUDE.md「硬约束索引 · summarize-session」的正文。「## 迁移原文」小节自 CLAUDE.md（基线 `3ac359f`，该提交只在开发仓库可取）迁出，除少量已失效的指代、路径与行号锚点外逐字保留；小节内「本文件」「本节」「此处」「上一版」凡指文档位置的，均指原 CLAUDE.md，出现的数字是当时的读数。此后新增内容写在「## 现行补充」里，按 CLAUDE.md「写入约定」执行。
 
+## 现行补充
+
+### 摘要缺口的三条防线（2.3.0）
+
+- **写期口径唯一实现**：判据与清洗在 `scripts/_summary.py`（`classify` / `sanitize_summary` / `reject_reason`），写盘只走 `_summary_store.write_with_backup`（备份 → `write_summary` → 同步 cache，三个写入点共用；基于 `_frontmatter_field`：保留原行尾、删除块标量续行、BOM / 未闭合 / 无 frontmatter 一律跳过）。不要改用 `_frontmatter.upsert_fields`：它非原子、会改写整份行尾、会给无 frontmatter 的笔记前插新块。
+- **frontmatter 边界只有一套判据**：`_frontmatter_field.split_frontmatter`（按 LF 切行，首行 `strip() == "---"`，闭合行 `rstrip() == "---"`、不 lstrip），写端、`rebuild_index.parse_frontmatter`、`fm_has_summary`、`body_bytes` 共用。不要再写边界正则：2.3.0 full-review 时写端正则不认 `--- `、读端认，摘要被写进正文；读端把块标量里缩进的 `---` 当闭合、写端不认，人工摘要被判缺失后覆盖。降级解析器（无 PyYAML）须认块标量，否则 `summary: >-` 读成 `>-`、判过短后被覆盖。
+- **净化删到不动点**：引号、反斜杠与结构 token 在同一循环里删，否则 `[x]"(…)` 删引号后重组出链接；入库值不做整体 NFKC，只折叠会落进结构字符集的字符。
+- **cache 区分来源**：`rebuild_index._read_entry` 记 `summary_src`，`h1` 计为缺失；旧 cache 没有该键时 `classify` 读文件头 4 KB 判断。cache-spec 原先写「无 summary 则无该键」与代码相反，已订正。
+- **摘要文本不进命令行**：`summary_gap.py --set-file` 读会话模型用 Write 工具写的 JSON。经 Bash 双引号传参时 shell 会先展开反引号与 `$`（评审 S08 实测）。
+- **写前闸门**：`sanitize_summary` 之后还要过 `reject_reason`（敏感串 / 指令性短语、URL、路径、混合文字 / 套话 / 新值必须分档为 ok）。指令性词表只收明确短语——`assistant`、`instruction` 这类泛词会误杀名字里带 assistant 的项目名，单独的 `system prompt` 是技术名词、只拦「reveal / 输出 … system prompt」这类索取式说法；混写按连续字母分词判，µ（NFKC 后为希腊 μ）不算。依据：对作者 vault 现有 579 篇 ok 档摘要只读扫描（2026-10-13），收窄前拒 13 篇、收窄后 10 篇，剩下 9 篇含绝对路径（S11 有意拒写，摘要含路径的笔记需走 propose 或手写）、1 篇确为文件名复述。
+- **缺口判定复用 `_health_check`**，`summary_gap --list` 的 `total` 与报告同源（守卫 `test_list_total_matches_rebuild_index_summary_gap`）；`--set-file` 写回同步 cache（理由同 keywords：秒级 mtime 判据）。
+- **范围**：工作日志、无 frontmatter、归集文档（tags 含 `archived`）不纳入；归集文档的摘要唯一来源是 pending-docs `context`，`sync_pending_docs` 重归集会重写它。
+- **付费路径**：`enrich_summary.py` 默认只列；`--apply` 只对缺口档，须 `--expect` 等于候选数；优化档只经 `--propose` → `--apply-proposals --only <id>`；每批备份可 `--restore`（只恢复当前值仍等于写入值的篇，坏行逐行跳过）；提交只含本批路径与进度文件里仍存在的遗留路径（`commit_vault(paths=, prefix=)`，路径按字面匹配）。
+- **付费前后的四道比对**：列出时的值、调用前可写性（`unwritable` 不付费）、调用后重读（模型调用最长 60 s，期间的人工修改不得覆盖）、写入。计次只在 `_judge` 一处：内容拒写与写入失败计次，`model_failed` 不计；连续 `MODEL_FAIL_STREAK` 次 `model_failed` 熔断、退出码 4。
+- **单实例锁按持锁进程存活判定**（`_fs._acquire_lock(timeout=0)`）：活的再旧也不抢，死的立即接管——只看 mtime 会让跑超时的批次被抢、被硬杀的锁挡住 `--restore`。`summary_gap --set-file` 遇批次锁跳过 `batch_running`，单篇缺口判定 `gap_kind` 与 `_health_check` 同口径（有对拍用例）、不跑全库。
+
 ## 迁移原文（基线 `3ac359f`）
 
 ### summarize-session
@@ -34,4 +50,4 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 
 > **为什么需要三条**：归集是自动的、补齐原先只有付费手动一条，两者速率不匹配 ⇒ 缺口必然随时间线性增长。作者本机实测：最后一次 backfill（2026-07-27）之后 12 天累积 37 篇，覆盖率 99%→96%，且 37/37 全部是归集进来的 spec/plan。2026-08-10 补齐后为 **100%**（applicable 973）。
 
-> ⚠️ **`--set` 必须同步 cache，这不是优化而是正确性必需**：`rebuild_index` 的增量判据是秒级 `int(st_mtime)`（`rebuild_index.py:163`），而「补全 → rebuild」在流程里必然落在同一秒内 ⇒ rebuild 判定文件未变、跳过重读，cache 永远停在「无 keywords」。后果不是慢一拍而是**补了等于白补**——vault-loader 读的是 cache，召回拿不到 keywords，下次会话还会把同一篇再列一遍。实测：mtime `…860.0094`→`…860.1227`，`int()` 同为 `1786345860`。故 `set_keywords` 写完文件后直接改 cache 对应 entry（fail-open，结果在返回值 `cache_synced` 里如实报出）。同一根因也影响 `enrich_keywords.py`，只是它每篇要调一次 haiku、跨秒概率大，不易触发。
+> ⚠️ **`--set` 必须同步 cache，这不是优化而是正确性必需**：`rebuild_index` 的增量判据是秒级 `int(st_mtime)`（`rebuild_index.scan_vault`），而「补全 → rebuild」在流程里必然落在同一秒内 ⇒ rebuild 判定文件未变、跳过重读，cache 永远停在「无 keywords」。后果不是慢一拍而是**补了等于白补**——vault-loader 读的是 cache，召回拿不到 keywords，下次会话还会把同一篇再列一遍。实测：mtime `…860.0094`→`…860.1227`，`int()` 同为 `1786345860`。故 `set_keywords` 写完文件后直接改 cache 对应 entry（fail-open，结果在返回值 `cache_synced` 里如实报出）。同一根因也影响 `enrich_keywords.py`，只是它每篇要调一次 haiku、跨秒概率大，不易触发。

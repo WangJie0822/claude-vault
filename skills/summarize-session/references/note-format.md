@@ -125,13 +125,13 @@ python3 "$SS/rebuild_index.py" \
 
 ## 存量笔记 frontmatter 兼容
 
-更新已有笔记时，**仅追加缺失字段**，不修改或删除已有字段：
+更新已有笔记时，**仅追加缺失字段**，不修改或删除已有字段。例外：`summary` 的补全与优化经 `summary_gap.py` / `enrich_summary.py` 写入（带备份，可回滚）。工作日志不需要摘要。
 
 | 场景 | 处理 |
 |------|------|
 | 旧字段 `date` 存在，无 `created` | 新增 `created`（值同 `date`），保留 `date` 不动 |
 | 缺少 `category` | 从文件所在文件夹名推断并新增 |
-| 缺少 `summary` | 从笔记标题或首段文本提取并新增 |
+| 缺少 `summary` | 由会话模型读正文写一句（20–240 字），收尾时经 `summary_gap.py --set-file` 写入；不要拿标题顶替（cache 会把标题兜底标为 `summary_src: h1` 并计入缺口） |
 | 已有自定义字段（`parent` 等） | 保留不动 |
 
 ## 追加到已有笔记

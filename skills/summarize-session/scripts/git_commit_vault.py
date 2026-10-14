@@ -22,11 +22,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # 一次覆盖，不再逐个枚举——枚举法正是上面那个缺陷的成因。
 
 
-def _git(vault, args):
+def _clean_env():
+    """剥离继承来的 GIT_*（大小写不敏感）：GIT_DIR 等会把提交重定向到别的仓库。"""
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+
+
+def _git(vault, args, literal=False):
     # encoding='utf-8'：git 输出 UTF-8，Windows subprocess text=True 默认用 cp936(GBK)
     # 解码中文路径会崩 UnicodeDecodeError；errors='replace' 兜底任何非 UTF-8 字节。
-    return subprocess.run(['git', '-C', vault] + args, capture_output=True,
-                          text=True, encoding='utf-8', errors='replace')
+    # literal：路径按字面匹配，文件名里的 [ ] * ? 不当 glob（GIT_LITERAL_PATHSPECS 会被 _clean_env 剥掉，故用选项）
+    head = ['git', '--literal-pathspecs'] if literal else ['git']
+    return subprocess.run(head + ['-C', vault] + args, capture_output=True,
+                          text=True, encoding='utf-8', errors='replace', env=_clean_env())
 
 
 def is_git_repo(vault):
@@ -134,13 +141,21 @@ def baseline_preview(vault):
     return {'status': 'preview', 'files': files}
 
 
-def commit_vault(vault, title, no_commit=False, baseline=False):
+def commit_vault(vault, title, no_commit=False, baseline=False, *, paths=None, prefix=None):
     if no_commit:
         return {'status': 'skipped', 'reason': 'no_commit_flag'}
     if not is_git_repo(vault):
         return {'status': 'skipped', 'reason': 'not_git'}
-    msg = '[docs|vault|会话总结][公共]' + (sanitize_title(title) or '知识库更新')
-    if baseline:
+    head = '[docs|vault|会话总结][公共]' if prefix is None else prefix
+    msg = head + (sanitize_title(title) or '知识库更新')
+    only = None
+    if paths is not None:
+        only = [p.replace('\\', '/') for p in paths if _is_knowledge_md(p)]
+        if not only:
+            return {'status': 'nothing', 'reason': 'no_paths'}
+        add = _git(vault, ['add', '--'] + only, literal=True)
+        files = len(only)
+    elif baseline:
         add = _git(vault, ['add', '-A'])  # 全量（已由 skill 经 preview+确认放行）
         files = -1
     else:
@@ -151,10 +166,12 @@ def commit_vault(vault, title, no_commit=False, baseline=False):
         files = len(changes)
     if add.returncode != 0:
         return {'status': 'failed', 'reason': 'git_add: ' + add.stderr.strip()}
-    staged = _git(vault, ['diff', '--cached', '--name-only'])
+    staged = _git(vault, ['diff', '--cached', '--name-only'] + (['--'] + only if only else []),
+                  literal=bool(only))
     if not staged.stdout.strip():
         return {'status': 'nothing', 'reason': 'nothing_staged'}
-    c = _git(vault, ['commit', '-m', msg])  # argv 形式，禁 shell 拼接（finding C）
+    cmd = ['commit', '-m', msg] + (['--only', '--'] + only if only else [])
+    c = _git(vault, cmd, literal=bool(only))  # argv 形式，禁 shell 拼接（finding C）
     if c.returncode != 0:
         return {'status': 'failed', 'reason': 'git_commit: ' + c.stderr.strip()}
     out = {'status': 'committed', 'message': msg, 'files': files}

@@ -24,6 +24,52 @@ except ImportError:
 
 # 文件锁实现已提取到 _fs.py 公共模块（沿用与 _frontmatter/_fs 一致的同目录 import 风格）
 from _fs import _acquire_lock, _release_lock, LOCK_TIMEOUT, atomic_write_text, atomic_write_json  # noqa: F401
+from _summary import GAP_KINDS, OPTIMIZE_KINDS, applicable, classify, is_worklog  # noqa: E402
+from _frontmatter_field import split_frontmatter  # noqa: E402
+
+
+_BLOCK_SCALAR_RE = re.compile(r'^[|>](?:[1-9][+-]?|[+-][1-9]?)?$')
+
+
+def _take_block(lines, i):
+    """块标量的续行:缩进行;块内空行仅当其后还有缩进行时计入(与 _frontmatter_field.field_span 同口径)。"""
+    out, pending = [], []
+    while i < len(lines):
+        s = lines[i].rstrip('\r')
+        if not s.strip():
+            pending.append('')
+        elif s[:1] in (' ', '\t'):
+            out.extend(pending)
+            pending = []
+            out.append(s)
+        else:
+            break
+        i += 1
+    return out, i
+
+
+def _fold_block(indicator, block):
+    """按 YAML 块标量语义取值:| 保留换行,> 折叠为空格;- 去尾换行,+ 保留,缺省留一个。"""
+    if not block:
+        return ''
+    indent = min(len(s) - len(s.lstrip(' \t')) for s in block if s.strip())
+    lines = [s[indent:] if s.strip() else '' for s in block]
+    if indicator[0] == '|':
+        text = '\n'.join(lines)
+    else:
+        text = ''
+        for s in lines:
+            if not s:
+                text += '\n'
+            elif text and not text.endswith('\n'):
+                text += ' ' + s
+            else:
+                text += s
+    if '-' in indicator:
+        return text.rstrip('\n')
+    if '+' in indicator:
+        return text + '\n'
+    return text.rstrip('\n') + '\n'
 
 
 def parse_frontmatter(text):
@@ -31,17 +77,10 @@ def parse_frontmatter(text):
 
     优先使用 PyYAML 完整解析；未安装时降级到仅支持标量和内联数组的手写解析器。
     """
-    lines = text.split('\n')
-    if not lines or lines[0].strip() != '---':
-        return {}
-
-    fm_lines = []
-    for line in lines[1:]:
-        if line.strip() == '---':
-            break
-        fm_lines.append(line)
-    else:
-        return {}  # 没找到结束标记
+    parts = split_frontmatter(text)
+    if parts is None:
+        return {}  # 无 frontmatter / 未闭合 / BOM——边界判据与写端共用 _frontmatter_field
+    fm_lines = parts[1]
 
     # 优先用 PyYAML(支持块标量、多行数组、嵌套等完整 YAML)
     if _HAS_YAML:
@@ -61,10 +100,12 @@ def parse_frontmatter(text):
         except yaml.YAMLError:
             pass  # 降级到手写解析器
 
-    # 手写降级解析器:仅处理标量和内联数组
+    # 手写降级解析器:处理标量、内联数组与块标量(| / > 及其修饰符)
     result = {}
-    for line in fm_lines:
-        line = line.strip()
+    i, n = 0, len(fm_lines)
+    while i < n:
+        line = fm_lines[i].strip()
+        i += 1
         if not line or line.startswith('#'):
             continue
 
@@ -74,6 +115,14 @@ def parse_frontmatter(text):
 
         key = match.group(1)
         value = match.group(2).strip()
+
+        # 块标量:不认时会读成 '>-'、判为过短，再被摘要补全覆盖(2.3.0 full-review H-3)
+        if _BLOCK_SCALAR_RE.match(value):
+            block, i = _take_block(fm_lines, i)
+            folded = _fold_block(value, block)
+            if folded:
+                result[key] = folded
+            continue
 
         if not value:
             continue
@@ -373,7 +422,9 @@ def _read_entry(vault: Path, rel: str, mtime: int):
         if field in fm:
             entry[field] = fm[field]
     entry['_has_frontmatter'] = bool(fm)
-    if 'summary' not in entry:
+    if 'summary' in entry:
+        entry['summary_src'] = 'fm'
+    else:
         has_fm = head.lstrip().startswith('---')
         past_fm = False
         dash_count = 0
@@ -385,6 +436,7 @@ def _read_entry(vault: Path, rel: str, mtime: int):
                 continue
             if (past_fm or not has_fm) and line.startswith('# '):
                 entry['summary'] = line[2:].strip()
+                entry['summary_src'] = 'h1'
                 break
     return entry
 
@@ -402,6 +454,10 @@ def _health_check(entries: dict, vault: Path, indexes_written: list):
         'stale_indexes': [],         # 磁盘上有但本次未写入的 INDEX
         'keywords_missing': [],      # 缺 keywords 的知识笔记（工作日志豁免）
         'keywords_applicable': [],   # keywords 统计口径的分母:与 keywords_missing 同豁免规则
+        'summary_applicable': [],    # 摘要统计口径的分母（_summary.applicable）
+        'summary_gap': [],           # {'path','kind'}：kind ∈ GAP_KINDS
+        'summary_optimizable': [],   # {'path','kind'}：kind ∈ OPTIMIZE_KINDS
+        'summary_no_frontmatter': [],# 无 frontmatter 的非工作日志笔记（DS1：不纳入、单列）
     }
 
     for rel, entry in entries.items():
@@ -413,17 +469,26 @@ def _health_check(entries: dict, vault: Path, indexes_written: list):
 
         if not has_fm:
             issues['no_frontmatter'].append(rel)
+            if not is_worklog(rel, entry):
+                issues['summary_no_frontmatter'].append(rel)
             continue
         # keywords 覆盖率：keywords 是 vault-loader 的精确召回信号通路，
         # 缺失即该篇在提问时召不回来。工作日志是流水账非知识笔记，豁免。
-        # keywords_applicable 与 keywords_missing 用同一豁免条件(cat != '工作日志'),
-        # 保证覆盖率分子分母同口径——分母不豁免会被工作日志的天然存在持续稀释、掩盖真实缺口。
+        # keywords_applicable 与 keywords_missing 用同一豁免条件(_summary.is_worklog：顶层目录
+        # 或 category 为工作日志),保证覆盖率分子分母同口径——分母不豁免会被工作日志的天然存在持续稀释、掩盖真实缺口。
         # 注：无 frontmatter 笔记已在上方 `if not has_fm: continue` 跳过，不进本分母
         # （另计 no_frontmatter，避免双重计），故覆盖率分母 = 有 frontmatter 且非工作日志的知识笔记。
-        if cat != '工作日志':
+        if not is_worklog(rel, entry):
             issues['keywords_applicable'].append(rel)
             if not (entry.get('keywords') or []):
                 issues['keywords_missing'].append(rel)
+        if applicable(rel, entry):
+            issues['summary_applicable'].append(rel)
+            kind = classify(rel, entry, vault=vault)
+            if kind in GAP_KINDS:
+                issues['summary_gap'].append({'path': rel, 'kind': kind})
+            elif kind in OPTIMIZE_KINDS:
+                issues['summary_optimizable'].append({'path': rel, 'kind': kind})
         if cat and '/' in cat:
             issues['category_with_slash'].append({'path': rel, 'category': cat})
         if proj:
@@ -826,6 +891,9 @@ def main():
         (_kw_applicable - _kw_missing) * 100 // _kw_applicable
         if _kw_applicable else None
     )
+    _sm_gap = final_issues.get('summary_gap', [])
+    _sm_app = len(final_issues.get('summary_applicable', []))
+    _sm_coverage = (_sm_app - len(_sm_gap)) * 100 // _sm_app if _sm_app else None
 
     # 9. 输出报告
     report = {
@@ -848,6 +916,11 @@ def main():
             'keywords_missing': len(final_issues.get('keywords_missing', [])),
             'keywords_missing_samples': final_issues.get('keywords_missing', [])[:10],
             'keywords_coverage': _kw_coverage,
+            'summary_gap': len(_sm_gap),
+            'summary_gap_samples': [g['path'] for g in _sm_gap[:10]],
+            'summary_optimizable': len(final_issues.get('summary_optimizable', [])),
+            'summary_no_frontmatter': len(final_issues.get('summary_no_frontmatter', [])),
+            'summary_coverage': _sm_coverage,
         },
     }
     if fix_report:
@@ -871,4 +944,11 @@ def main():
 if __name__ == '__main__':
     from _exe_search import harden_exe_search
     harden_exe_search()
+    # 报告与警告含中文路径：输出跟随控制台编码（中文 Windows 默认 GBK）时，按 UTF-8 读的调用方
+    # （Claude Code、enrich_summary、测试）拿到的是乱码或空——固定 UTF-8（同 vault-loader migrate_config）
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 — 被替换成不支持 reconfigure 的流时保持原样
+            pass
     main()

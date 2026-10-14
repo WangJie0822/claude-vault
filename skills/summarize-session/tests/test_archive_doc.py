@@ -524,3 +524,39 @@ def test_T30_non_list_keywords_ignored(tmp_path):
     for i, bad in enumerate(('召回, 打分', {'a': 1}, None, 42)):
         text, fm = _archive_with_keywords(tmp_path / f'case{i}', bad)
         assert 'keywords' not in fm, f'非 list 输入 {bad!r} 不应写入 keywords'
+
+
+def test_archive_long_context_without_sentence_end_still_gets_summary(tmp_path):
+    """超长且前 240 字没有句末标点的 context 仍要写摘要（截前 200 字，同 2.2.0），
+    归集文档不在任何补全通道里，这里不写就永久缺失（2.3.0 full-review P1-M7）。"""
+    repo = tmp_path / "project"
+    repo.mkdir()
+    _make_git_repo(repo)
+    src = repo / "docs" / "spec.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("# Body\n", encoding="utf-8")
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    result = archive_doc(_make_pending_entry(str(src), context="长" * 300), vault_root=str(vault))
+    assert _read_frontmatter_kv(result["vault_path"]).get("summary") == "长" * 200
+
+
+@pytest.mark.parametrize("context,expected", [
+    ("一行描述\n注入: true", "一行描述 注入: true"),
+    ('带"引号"与\\反斜杠的描述', "带引号与反斜杠的描述"),
+    (["不是", "字符串"], None),
+    ("", None),
+])
+def test_archive_summary_is_sanitized(tmp_path, context, expected):
+    repo = tmp_path / "project"
+    repo.mkdir()
+    _make_git_repo(repo)
+    src = repo / "docs" / "spec.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("# Body\n", encoding="utf-8")
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    result = archive_doc(_make_pending_entry(str(src), context=context), vault_root=str(vault))
+    fm = _read_frontmatter_kv(result["vault_path"])
+    assert fm.get("summary") == expected
+    assert "注入" not in fm or fm["注入"] is None

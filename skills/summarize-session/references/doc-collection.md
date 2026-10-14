@@ -28,7 +28,7 @@ python3 .../sync_pending_docs.py --vault "$VAULT" --mode backfill --output-json 
 |---|---|---|
 | `path` | 生产方 | 文档的**绝对路径**。相对路径会被判 `path_invalid` 永久跳过、不归集 |
 | `type` | 生产方 | `spec` / `plan` / `memory` / `note` / `other`，决定 Vault 内的落点子目录 |
-| `context` | 生产方 | 一行描述。归集时截 200 字写进 frontmatter 的 `summary` |
+| `context` | 生产方 | 一行描述，20–200 字为宜——它是归集文档摘要的唯一来源，归集文档不在摘要补全范围内。归集时经 `sanitize_summary` 清洗（删除 markdown 符号、引号、反斜杠，换行折成空格）后截 200 字写进 frontmatter 的 `summary`；超过 240 字且前 240 字内没有句末标点时直接截断，不会因此缺摘要 |
 | `keywords` | 生产方（可选，强烈建议填） | 字符串数组，3-8 个检索扩展词。归集时经 sanitize 写进 frontmatter |
 | `created` | 生产方 | ISO 时间 |
 | 其余全部 | `sync_pending_docs.py` | `vault_path` / `*_hash` / `*_mtime` / `archived_at` / `wikilink_form` / `path_invalid` / `denied_sensitive` … **禁止手填** |

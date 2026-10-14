@@ -87,14 +87,14 @@ def test_commit_failed_does_not_raise(tmp_path, monkeypatch):
     (tmp_path / 'Claude Code' / 'n.md').write_text('x', encoding='utf-8')
     orig = gcv._git
 
-    def fake(vault, args):
+    def fake(vault, args, **kw):
         if args and args[0] == 'commit':
             class R:
                 returncode = 1
                 stdout = ''
                 stderr = 'simulated failure'
             return R()
-        return orig(vault, args)
+        return orig(vault, args, **kw)
 
     monkeypatch.setattr(gcv, '_git', fake)
     res = gcv.commit_vault(str(tmp_path), '标题')
@@ -204,3 +204,90 @@ def test_system_index_form_inside_tool_dirs_is_still_excluded():
 def test_is_knowledge_md_path_traversal_still_blocked():
     assert _is_knowledge_md('../外部 索引.md') is False
     assert _is_knowledge_md('/abs/x 索引.md') is False
+
+
+def test_commit_only_given_paths_leaves_unrelated_dirty(tmp_path):
+    v = tmp_path / "vault"
+    v.mkdir()
+    _init_repo(v)
+    (v / "技术笔记").mkdir()
+    (v / "技术笔记" / "a.md").write_text("a\n", encoding="utf-8")
+    (v / "技术笔记" / "b.md").write_text("b\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(v), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(v), "commit", "-qm", "init"], check=True)
+    (v / "技术笔记" / "a.md").write_text("a2\n", encoding="utf-8")
+    (v / "技术笔记" / "b.md").write_text("b2 用户草稿\n", encoding="utf-8")
+    res = gcv.commit_vault(str(v), "补全 1 篇摘要", paths=["技术笔记/a.md"], prefix="[docs|vault|摘要][公共]")
+    assert res["status"] == "committed" and res["files"] == 1
+    assert res["message"] == "[docs|vault|摘要][公共]补全 1 篇摘要"
+    names = subprocess.run(["git", "-c", "core.quotepath=false", "-C", str(v), "show", "--name-only",
+                            "--format=", "HEAD"], capture_output=True, text=True, encoding="utf-8").stdout.split()
+    assert names == ["技术笔记/a.md"]
+    st = subprocess.run(["git", "-c", "core.quotepath=false", "-C", str(v), "status", "--porcelain"],
+                        capture_output=True, text=True, encoding="utf-8").stdout
+    assert "技术笔记/b.md" in st
+
+
+def test_commit_ignores_inherited_git_dir(tmp_path, monkeypatch):
+    v = tmp_path / "vault"
+    other = tmp_path / "other"
+    for d in (v, other):
+        d.mkdir()
+        _init_repo(d)
+    (v / "x.md").write_text("x\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    res = gcv.commit_vault(str(v), "t", paths=["x.md"])
+    monkeypatch.delenv("GIT_DIR")
+    assert res["status"] == "committed"
+    log = subprocess.run(["git", "-C", str(other), "log", "--oneline"], capture_output=True, text=True)
+    assert log.stdout.strip() == ""
+
+
+def test_commit_paths_filters_non_knowledge(tmp_path):
+    v = tmp_path / "vault"
+    v.mkdir()
+    _init_repo(v)
+    res = gcv.commit_vault(str(v), "t", paths=[".meta/x.md", "../evil.md"])
+    assert res == {"status": "nothing", "reason": "no_paths"}
+
+
+def test_commit_paths_are_literal_not_glob(tmp_path):
+    """文件名含 [ ] 时不得被当成 glob，把同目录的用户草稿带进本批提交（SEC-L1）。"""
+    v = tmp_path / "vault"
+    v.mkdir()
+    _init_repo(v)
+    (v / "技术笔记").mkdir()
+    (v / "技术笔记" / "a[1].md").write_text("a\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(v), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(v), "commit", "-qm", "init"], check=True)
+    (v / "技术笔记" / "a[1].md").write_text("a2\n", encoding="utf-8")
+    (v / "技术笔记" / "a1.md").write_text("用户草稿\n", encoding="utf-8")
+    res = gcv.commit_vault(str(v), "t", paths=["技术笔记/a[1].md"])
+    assert res["status"] == "committed"
+    names = subprocess.run(["git", "-c", "core.quotepath=false", "-C", str(v), "show", "--name-only",
+                            "--format=", "HEAD"], capture_output=True, text=True, encoding="utf-8").stdout.split()
+    assert names == ["技术笔记/a[1].md"]
+
+
+def test_commit_paths_does_not_sweep_in_user_staged_files(tmp_path):
+    """用户事先暂存的改动不得被本批提交带走：这正是 commit --only 防的那一层。"""
+    v = tmp_path / "vault"
+    v.mkdir()
+    _init_repo(v)
+    (v / "技术笔记").mkdir()
+    for n in ("a", "b"):
+        (v / "技术笔记" / f"{n}.md").write_text(n + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(v), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(v), "commit", "-qm", "init"], check=True)
+    (v / "技术笔记" / "a.md").write_text("a2\n", encoding="utf-8")
+    (v / "技术笔记" / "b.md").write_text("b2 用户已暂存\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(v), "add", "--", "技术笔记/b.md"], check=True)
+    res = gcv.commit_vault(str(v), "补全 1 篇摘要", paths=["技术笔记/a.md"])
+    assert res["status"] == "committed"
+    q = ["git", "-c", "core.quotepath=false", "-C", str(v)]
+    names = subprocess.run(q + ["show", "--name-only", "--format=", "HEAD"],
+                           capture_output=True, text=True, encoding="utf-8").stdout.split()
+    assert names == ["技术笔记/a.md"]
+    staged = subprocess.run(q + ["diff", "--cached", "--name-only"],
+                            capture_output=True, text=True, encoding="utf-8").stdout.split()
+    assert staged == ["技术笔记/b.md"]

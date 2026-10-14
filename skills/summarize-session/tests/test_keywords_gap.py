@@ -125,7 +125,7 @@ def test_set_writes_keywords_and_rebuild_sees_it(tmp_path):
 def test_set_syncs_cache_entry_immediately(tmp_path):
     """写入后 cache 必须**立刻**带上新 keywords，不能指望下一次 rebuild 去读。
 
-    rebuild_index 的增量判据是秒级 `int(st_mtime)`（rebuild_index.py:163），而
+    rebuild_index 的增量判据是秒级 `int(st_mtime)`（rebuild_index.scan_vault），而
     「补全 → rebuild」在流程里通常发生在同一秒内 —— 它会判定文件未变、跳过重读。
     cache 不同步的后果不是慢一拍，而是**补了等于白补**：vault-loader 读的是
     cache，召回永远拿不到 keywords，下次会话的报告还会把它再列一遍。
@@ -233,3 +233,27 @@ def test_list_and_set_are_mutually_exclusive(tmp_path):
     vault = _build_vault(tmp_path)
     with pytest.raises(SystemExit):
         main(["--vault", str(vault), "--list", "--set", "a.md"])
+
+
+def _run_ascii_console(script: str, *args):
+    """强制非 UTF-8 控制台（与中文 Windows 默认 GBK 同类）跑 CLI，按字节取输出、由调用方按 UTF-8 解码。"""
+    import os
+    env = dict(os.environ, PYTHONIOENCODING="ascii")
+    env.pop("PYTHONUTF8", None)
+    return subprocess.run([sys.executable, str(SCRIPTS / script), *args], capture_output=True, env=env)
+
+
+def test_rebuild_index_cli_writes_utf8_regardless_of_console_encoding(tmp_path):
+    """报告含中文路径：输出跟随控制台编码时，按 UTF-8 读的调用方（含 Claude Code）拿到的是乱码或空。"""
+    vault = _build_vault(tmp_path)
+    r = _run_ascii_console("rebuild_index.py", "--vault", str(vault))
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    assert "health_check" in json.loads(r.stdout.decode("utf-8").strip().splitlines()[-1])
+
+
+def test_keywords_gap_cli_writes_utf8_regardless_of_console_encoding(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    r = _run_ascii_console("keywords_gap.py", "--vault", str(vault), "--list")
+    out = json.loads(r.stdout.decode("utf-8"))
+    assert out["status"] == "error" and "rebuild_index" in out["reason"]

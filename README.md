@@ -281,6 +281,18 @@ vault-loader 内置一套**可选**的效果评估机制：记录每轮召回的
 
 ---
 
+## 摘要补全（`/vault-summary`）
+
+笔记的 `summary` 决定 vault-loader 注入时你和模型看到什么。2.3.0 起：
+
+- 每次 `/summarize-session` 收尾会列出至多 10 篇摘要缺口（缺失、不足 20 字、等于文件名），由会话模型补写，**不额外调用模型**。
+- `/vault-summary` 付费补存量：默认只列候选与估算成本，确认后逐篇调用一次 haiku，每批默认至多 20 篇（`--limit` 可调，上限 100），剩下的下次再跑；连续 3 次调用失败（模型不可用 / 超时）会熔断整批。`/vault-summary rewrite` 为超过 240 字的摘要出对照，按 id 选定后才写入。
+- 每次写入前备份到 `<vault>/.meta/summary-backups/`，可按字段回滚：在会话里让 Claude 执行 `/vault-summary` 的回滚步骤，或运行 `SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1); python3 "$SS/enrich_summary.py" --vault <vault 路径> --restore <备份文件>`。只恢复当前值仍等于当时写入值的篇；回滚本身也会提交一笔。会话收尾补缺的备份是 `gap-<日期>.jsonl`，一天一份。写入后只提交本批改动的笔记与索引，不 push。
+- 外发范围：笔记文件名、tags、keywords 与正文（不含 frontmatter；≤ 12 KB 原样，更长取开头 8 KB 与结尾 4 KB）。发送前按内置规则检测疑似凭据，命中即跳过该篇；检测只覆盖常见格式，不能替代你自己的脱敏。
+- 每篇最多尝试 3 次（被闸门拒写或写不回去各计一次，模型不可用不计），满了不再列出；`enrich_summary.py --vault <vault 路径> --reset-attempts [--paths <路径...>]` 重置。
+- 工作日志、没有 frontmatter 的笔记、归集进来的 spec/plan 不在范围内。
+- 降级到 2.2.0：先用 `--restore` 回滚不想保留的摘要（2.2.0 没有回滚命令）；插件 cache 会同时保留多个版本，而 skill 按最高版本定位脚本，降级时要删掉 2.3.0 的版本目录。`.meta/` 下新增的 `summary-backups/`、`summary-proposals/`、`summary-attempts.json`、`enrich-summary.lock`、`enrich-summary.progress.jsonl` 2.2.0 不读取，可留可删；cache 新增的 `summary_src` 降级后被忽略。
+
 ## 已知限制
 
 - **针对中文笔记工作流调优。** 目录名、frontmatter 字段和分类匹配都按中文优化。英文及其他语言用户的自动匹配准确度会下降（关键词提取、标签推断、分类路由可能漏掉很多笔记）。

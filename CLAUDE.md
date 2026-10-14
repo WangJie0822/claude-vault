@@ -97,10 +97,10 @@ Read 到匹配文件时 rules 会自动注入；上下文里已出现该 rules �
 
 ### summarize-session
 
-skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模式：正常 / `-f`（强制，跳确认）/ `--catch-up` / `--quick`。Vault 内资源优先经 `scripts/obsidian_cli.py` 封装，Obsidian CLI 不可用时降级文件 I/O。
+skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模式：正常 / `-f`（强制，跳确认）/ `--catch-up` / `--quick` / `--summaries`。Vault 内资源优先经 `scripts/obsidian_cli.py` 封装，Obsidian CLI 不可用时降级文件 I/O。
 
 - 勿恢复 `git_commit_vault` 里的 `is_system_index` 放行分支（2026-09-07 已移除；它会在点目录排除之前抢先放行工具目录里的同名文件）；纳入判据是排除法、只看顶层段；只 commit 不 push。
-- keywords 写期口径的唯一实现是 `_keywords.sanitize_keywords`；`keywords_gap.py --set` 必须同步 cache（秒级 mtime 判据会让 rebuild 跳过重读）；缺口判定复用 `rebuild_index._health_check`，不另写判据；`enrich_keywords.py` 付费、手动 opt-in，不接自动管线。
+- keywords / 摘要写期唯一实现：`sanitize_keywords` / `sanitize_summary`；`--set`、`--set-file` 须同步 cache；缺口复用 `_health_check`；`enrich_*` 付费 opt-in。
 - 改 `skills/summarize-session/` 前先 Read `.claude/rules/summarize-session.md`。
 
 ### 测试
@@ -163,7 +163,7 @@ python -m pytest packaging/
 
 - 任何改动必须保持 **macOS / Linux / Windows 三平台兼容**（wrapper 的 sh 段在三个平台上执行）。
 - hook 必须 fail-open，永不阻断会话。
-- vault-loader 对 Vault 只读；summarize-session 是唯一写入方（且只追加/新建，不删除已有笔记）。
+- vault-loader 对 Vault 只读；summarize-session 是唯一写入方（且只追加/新建，不删除已有笔记；`summary` 可在备份后替换）。
 - git 跟踪文件中不写 Obsidian `[[...]]` wikilink（vault 是个人知识库层、不随仓库分发）。
 - 文档以中文为主；但分发内容必须通过 `build_plugin.py` 脱敏扫描（零私人标识）。
 - 分发的 SKILL.md / references 必须优先按当前加载的 `SKILL.md` 绝对路径定位同级 scripts；仅 Claude Bash 无法取得该路径时允许搜索 `~/.claude/plugins/cache/`，同时识别 `context-vault` 与旧 `claude-vault`。不得跨到 `~/.codex` 取脚本（那里只可能是停止更新的 1.x 副本），也不得使用 `~/.claude/skills/.../scripts/` 源目录形式。skill shell 不得假设注入 `CLAUDE_PLUGIN_ROOT`；PowerShell 必须使用当前 skill 的绝对 scripts 路径。

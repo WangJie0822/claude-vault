@@ -2,6 +2,34 @@
 
 本文件记录 Context Vault（原 claude-vault）的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.0] - 2026-10-14
+
+### 新增
+
+- **摘要缺口的三条防线**：归集透传净化、`/summarize-session` 收尾零调用补缺（`summary_gap.py`）、付费补存量与优化（`enrich_summary.py`，入口 `/vault-summary` 与 `--summaries` 模式）。
+- `frontmatter-cache.json` 的 entry 新增可选键 `summary_src`（`fm` / `h1`），区分 frontmatter 写的摘要与标题兜底；读端忽略该键，不变更 `_version`。
+- `rebuild_index` 报告新增 `summary_gap`、`summary_optimizable`、`summary_no_frontmatter`、`summary_coverage`。
+- 摘要写入的安全网：每篇写前备份到 `.meta/summary-backups/`，`enrich_summary.py --restore` 按字段回滚；每篇最多尝试 3 次（`.meta/summary-attempts.json`，模型不可用不计），`--reset-attempts` 重置；付费批次单实例锁（`.meta/enrich-summary.lock`，持锁进程已退出时自动接管）、连续 3 次模型调用失败即熔断（退出码 4）；`--propose` 的对照写在 `.meta/summary-proposals/`。
+
+### 变更
+
+- `enrich_keywords.py` 与新的 `enrich_summary.py` 调用 `claude -p` 时加 `--setting-sources ""`、`--strict-mcp-config`、`--disable-slash-commands`，并在空临时目录运行：不加载你的 CLAUDE.md、hooks、MCP 与 skill（单样本实测输入 token 约降到四分之一）。
+- `git_commit_vault.commit_vault` 新增关键字参数 `paths=`、`prefix=`；git 子进程剥离继承的 `GIT_*`。
+- keywords 覆盖率的工作日志豁免改为「路径首段或 category 为工作日志」。
+- frontmatter 边界判据写端与读端统一：闭合行允许尾随空白；块标量里缩进的 `---` 不再被当作闭合。未安装 PyYAML 时的降级解析器支持块标量（`>` / `|` 及修饰符），此前这类字段读出来是 `>-`。
+- `commit_vault(paths=)` 的路径按字面匹配，文件名里的 `[ ]` 不再被当成通配符。
+- 归集文档的摘要先清洗再截 200 字（删除 markdown 符号、引号、反斜杠，换行折成空格）。
+
+### 修复
+
+- 归集 spec/plan 时 pending-docs 的 `context` 含换行会在 frontmatter 注入新键。
+- `enrich_keywords.py` 经 npm 的 `claude.CMD` 垫片调用时，超时只杀直接子进程，真正干活的孙进程照常跑完并计费；现在超时杀整棵进程树。
+- `rebuild_index.py`、`keywords_gap.py` 的输出跟随控制台编码，中文 Windows 未设 `PYTHONIOENCODING` 时是 GBK，按 UTF-8 读的调用方（含 Claude Code）拿到乱码；现在固定 UTF-8。
+
+### 已知
+
+- 2.3.0 单独发布期间，工作日志的模板摘要仍会被 vault-loader 注入；2.4.0 起工作日志不进粗排与精排。
+
 ## [2.2.0] - 2026-10-13
 
 ### 行为变更
