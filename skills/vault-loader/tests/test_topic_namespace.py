@@ -16,23 +16,45 @@ in-flight 空占位 ⇒ `session_topic_hit` 一次都没加过分，LLM 额度�
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
+from scripts import _fine_state, _topic
+from scripts._config_loader import DEFAULT_CONFIG
+from scripts._frontmatter_reader import CACHE_VERSION
 from scripts._state import (adopt_runtime, configure_context, current_runtime,
                             state_path_for_cwd)
-from scripts._topic import load_session_topic, spawn_topic_extraction
+from scripts._topic import load_session_topic, spawn_fine
 
 ROOT = Path(__file__).resolve().parents[1]
 STUB_WORDS = ["召回", "打分", "闸门"]
+STUB_RAW = "PINNED: NONE\nWORDS: " + ", ".join(STUB_WORDS)
+GEN = "0123456789abcdef"
+
+
+def _payload_text(home: Path) -> str:
+    """真实形状的 v1 payload：子进程要读 cache，所以在临时 HOME 里放一个最小 vault。"""
+    vault = home / "Vault"
+    (vault / ".meta").mkdir(parents=True, exist_ok=True)
+    (vault / ".meta" / "frontmatter-cache.json").write_text(json.dumps(
+        {"_version": CACHE_VERSION,
+         "entries": {"笔记/召回.md": {"tags": ["召回"], "summary": "召回与打分的闸门", "mtime": 1,
+                                     "keywords": []}}}, ensure_ascii=False), encoding="utf-8")
+    cfg = deepcopy(DEFAULT_CONFIG)
+    cfg["vault_path"] = str(vault)
+    return json.dumps(_topic.build_fine_payload(
+        "pin", prompt="召回 打分", config=cfg, gen_id=GEN, src_seq=1, slot=None, transcript_path="",
+        injected=[], excluded=[], prev_words=[], extra_paths=[]), ensure_ascii=False)
 
 
 def _run_child(cwd: Path, sid: str, runtime: str, home: Path):
-    """真起一个新进程跑 `run_extraction_child`，`_call_model` 打桩不触网。
+    """真起一个新进程跑 `run_extraction_child`，`_call_model` 打桩不触网，payload 经 stdin 给。
 
     桩只替换模型调用，**不替换写盘路径解析**——被测的正是后者。
     """
@@ -40,14 +62,14 @@ def _run_child(cwd: Path, sid: str, runtime: str, home: Path):
         "import sys\n"
         f"sys.path.insert(0, {str(ROOT)!r})\n"
         "from scripts import _topic\n"
-        f"_topic._call_model = lambda _p: {', '.join(STUB_WORDS)!r}\n"
+        f"_topic._call_model = lambda _p: {STUB_RAW!r}\n"
         f"sys.exit(_topic.run_extraction_child({[str(cwd), sid, runtime]!r}))\n"
     )
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["HOME"] = str(home)
     env["USERPROFILE"] = str(home)
-    return subprocess.run([sys.executable, "-c", code], capture_output=True,
+    return subprocess.run([sys.executable, "-c", code], input=_payload_text(home), capture_output=True,
                           text=True, encoding="utf-8", errors="replace",
                           env=env, cwd=str(ROOT), timeout=60)
 
@@ -103,10 +125,10 @@ def test_runtime_travels_through_argv_not_stdin(tmp_home: Path, tmp_path: Path,
                                                 runtime: str) -> None:
     """runtime 必须经 argv 传给子进程，不能塞进 stdin payload。
 
-    stdin 是 **best-effort** 通道：`spawn_topic_extraction` 里 `proc.stdin.write`
-    的异常被显式吞掉，且**不影响 spawn 的成功判定**（其注释写明「子进程已 detach，
-    父进程写 stdin 失败不影响子进程本身」）。把决定写盘落点的参数放在这条通道上，
-    一次管道回收就会让子进程静默回落 legacy —— 即本文件要守的那个缺陷换个成因复发。
+    payload 由子进程自己解析，读坏时按空 payload 记一次失败；把决定写盘落点的参数放进 payload，
+    它会跟着一起丢，失败记录与后续写回静默回落 legacy —— 即本文件要守的那个缺陷换个成因复发。
+    （2.4.0 full-review P-H1 之前 stdin 还是 best-effort 的管道：写入异常被吞、不影响 spawn 判定，
+    那是当时的主要理由；现在 payload 先写进临时文件，写失败即 spawn 失败，上面这条理由仍然成立。）
 
     两档参数化同时钉住第二件事：**spawn 取的必须是父进程实际生效的那个 runtime**
     （`current_runtime()`），不是自己按 payload/config 重新推导一次。重新推导等于
@@ -126,7 +148,7 @@ def test_runtime_travels_through_argv_not_stdin(tmp_home: Path, tmp_path: Path,
     monkeypatch.setattr("scripts._topic.subprocess.Popen", _fake_popen)
     configure_context(runtime, "sess-X")
 
-    spawn_topic_extraction(tmp_path, "sess-X", "prompt", [("a.md", "s")], {})
+    spawn_fine(tmp_path, "sess-X", {"v": 1})
 
     argv = captured["argv"]
     assert argv[3:] == [str(tmp_path), "sess-X", runtime], (
@@ -229,41 +251,79 @@ def test_runtime_is_reset_before_each_test() -> None:
         "写进真实主目录 ~/.context-vault/state/<runtime>/")
 
 
-def test_stdin_is_closed_even_when_write_fails(tmp_home: Path, tmp_path: Path,
-                                               monkeypatch: pytest.MonkeyPatch) -> None:
-    """`proc.stdin.write` 抛异常时，`close()` 仍必须执行。
+def test_payload_handoff_failure_is_spawn_error(tmp_home: Path, tmp_path: Path,
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    """payload 交不出去（临时文件建不了、写不进）时判 `spawn_error`、不拉起子进程，句柄照样关掉。
 
     子进程是 `DETACHED_PROCESS` + stdout/stderr 全 `DEVNULL`，而 `run_extraction_child`
-    做的第一件事就是 `sys.stdin.buffer.read()`。stdin 不关 ⇒ 它永久阻塞在读一个不会
-    EOF 的管道上 ⇒ 一个**永不退出、永不被发现**的孤儿进程（没有超时，没有输出）。
+    做的第一件事就是 `sys.stdin.buffer.read()`。2.4.0 full-review P-H1 之前 stdin 是管道：
+    原实现把 `write` 与 `close` 放在同一个 `try` 里、`except` 直接 `pass`，write 一抛异常 close
+    就被跳过，子进程永久阻塞在读一个不会 EOF 的管道上（2026-09-10 实证过同机制的进程链挂了 13 小时）；
+    修好之后的契约是「写失败也算 spawned、但 close 必须执行」。
 
-    原实现把 `write` 与 `close` 放在同一个 `try` 里、`except` 直接 `pass`，于是 write
-    一抛异常 close 就被跳过。那段注释写的是「父进程写 stdin 失败不影响子进程本身」——
-    从「不影响 spawn 判定」看是对的，但代价没写全：子进程不是继续跑，是**永远卡住**。
+    现在 payload 先整份写进临时文件再交给子进程作 stdin，子进程读的是普通文件、读到 EOF 就结束，
+    不存在那种阻塞；写失败时干脆不拉起子进程、判 `spawn_error`，调用方据此回滚在飞标记与槽位
+    （`_maybe_spawn`）。本用例因此改钉新契约：失败、不 Popen、临时文件句柄已关闭。
 
-    2026-09-10 实证过这个形态：一条同机制的进程链挂了 13 小时才被发现（成因是一个 PoC
-    用 `capture_output=True` 起子进程、stdin 被继承而非关闭，阻塞点与后果完全相同）。
-
-    **`tmp_home` 不是摆设**：`spawn_topic_extraction` 末尾会落 in-flight 标记，
-    没有它这条用例自己就会往真实主目录写 state。
+    **`tmp_home` 不是摆设**：2.4.0 之前的提炼发起入口（已删除）末尾会落 in-flight 标记，
+    没有它这条用例自己就会往真实主目录写 state；`spawn_fine` 不再写，tmp_home 留着防同类回归。
     """
-    closed: list = []
+    import tempfile
 
-    class _BadStdin:
-        def write(self, _b):
-            raise OSError("pipe broken")
+    popen_calls: list = []
+    handles: list = []
+    real_tmp = tempfile.TemporaryFile
 
-        def close(self):
-            closed.append(True)
+    class _FullDisk:
+        """写不进去的临时文件：其余行为委托给真实的临时文件，关闭时记一笔。"""
 
-    class _FakeProc:
         def __init__(self) -> None:
-            self.stdin = _BadStdin()
+            self.f = real_tmp()
+            self.closed = False
+            handles.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            self.f.close()
+            self.closed = True
+
+        def write(self, _b):
+            raise OSError(28, "No space left on device")
+
+        def __getattr__(self, name):
+            return getattr(self.f, name)
+
+    def _no_temp(*_a, **_k):
+        raise OSError(13, "TEMP not writable")
 
     monkeypatch.setattr("scripts._topic.shutil.which", lambda _n: "claude")
-    monkeypatch.setattr("scripts._topic.subprocess.Popen", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr("scripts._topic.subprocess.Popen",
+                        lambda *a, **_k: popen_calls.append(a) or object())
+    monkeypatch.setattr("scripts._topic.tempfile.TemporaryFile", _no_temp)
+    assert spawn_fine(tmp_path, "sess-notemp", {"v": 1}) == "spawn_error"
+    assert _topic.take_spawn_outcome() == "spawn_error"
 
-    ok = spawn_topic_extraction(tmp_path, "sess-badpipe", "p", [("a.md", "s")], {})
+    monkeypatch.setattr("scripts._topic.tempfile.TemporaryFile", _FullDisk)
+    assert spawn_fine(tmp_path, "sess-badwrite", {"v": 1}) == "spawn_error"
+    assert _topic.take_spawn_outcome() == "spawn_error"
 
-    assert ok is True, "写 stdin 失败不应把 spawn 判成失败（既有契约，不要顺手改掉）"
-    assert closed == [True], "write 抛异常后 stdin 没被关闭 —— 子进程会永久阻塞在读 stdin"
+    assert popen_calls == [], "payload 没交出去就不得拉起子进程"
+    assert len(handles) == 1 and handles[0].closed, "写失败后临时文件句柄没被关闭"
+
+
+def test_child_fine_state_lands_where_parent_reads(tmp_home: Path, tmp_path: Path) -> None:
+    """fine 状态与 topics 走同一条落点链：子进程 adopt_runtime 后写，父进程按同一 runtime 读得到。
+    同进程用例对「落点分裂」结构性不可见，必须真起子进程（见本文件模块 docstring）。"""
+    cwd = tmp_path / "proj-fine"
+    cwd.mkdir()
+    sid = "sess-fine"
+    configure_context("claude", sid)
+    assert current_runtime() == "claude", "前提：干净 tmp_home 上应归一化为 claude"
+    r = _run_child(cwd, sid, "claude", tmp_home)
+    assert r.returncode == 0, f"子进程异常退出：{r.stderr}"
+    p = _fine_state.fine_path(sid)
+    assert p is not None and p.exists(), f"父进程读不到子进程写的 fine 状态：{p}"
+    assert p.parent == tmp_home / ".context-vault" / "state" / "claude" / "fine"
+    assert _fine_state.load_fine(sid).stats_q[-1]["ok"] is True

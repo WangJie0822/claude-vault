@@ -47,6 +47,16 @@ EXCLUDED_KEYS = {
     "session_topic_top_n",
     "session_topic_project_top_k",
     "session_topic_pool_max",
+    # 2.4.0（spec fine-rank-per-turn §5.1 / F33）：`session_pin_max` 已被 `fine_pin_max` 取代、仍兼容读取，
+    # 用户显式写的 1（等于默认）是一次选择，删掉后有效值改由新键默认决定——与开关同一例外理由。
+    "session_pin_max",
+    # 精排的三个数值型隐私旋钮：显式写过的值是一次「外发多少」的决定，恒不判残留。
+    "fine_catalog_max_chars",
+    "fine_recent_prompts",
+    "fine_session_max_bytes",
+    # `fine_pin_max` 同理（F33 的镜像，角色互换）：显式写的 1（等于默认）压过旧键 `session_pin_max: 3`，
+    # 删掉它旧键就补位、有效点名上限无声地由 1 变 3。不入 HISTORICAL_DEFAULTS，故须排除出 allowlist。
+    "fine_pin_max",
 }
 
 # 值为「该键曾经当过的默认值集合」（history，非当前唯一默认）；表覆盖 ALLOWLIST
@@ -99,6 +109,10 @@ HISTORICAL_DEFAULTS: dict[str, list] = {
     # 注：relevance.session_topic 是布尔开关；relevance.session_topic_top_n /
     # session_topic_project_top_k / session_topic_pool_max 三个「送出去多少篇」旋钮已进
     # EXCLUDED_KEYS，均不入本表（iter_leaf_segments 显式排除 bool，见模块 docstring「收敛范围」一节）。
-    # spec 2026-09-15 Phase 1 新增，只一个历史值。
-    "relevance.session_pin_max": [1],
+    # relevance.session_pin_max（spec 2026-09-15 新增，历史值 [1]）2.4.0 起移入 EXCLUDED_KEYS，不再登记（F33）。
+    # 2.4.0 精排数值调参键，各只一个历史值。`fine_pin_max` 不在此列：同 `session_pin_max`，
+    # 显式写的值恒不判残留（F33，见 EXCLUDED_KEYS）。
+    "relevance.fine_max_notes": [3],
+    "relevance.fine_timeout_sec": [120],
+    "relevance.fine_max_calls": [20],
 }

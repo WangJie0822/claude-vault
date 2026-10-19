@@ -6,7 +6,28 @@ import json
 
 import pytest
 
-from scripts._output import emit, sanitize_for_display, approx_size_str
+import unicodedata
+
+from scripts._output import _CF_RE, emit, sanitize_for_display, approx_size_str, sanitize_injected_text
+
+
+def test_sanitize_injected_strips_cf():
+    """S39：注入正文剥 Unicode Cf（零宽、bidi、tag 字符、软连字符等），保留 tab 与换行。"""
+    cf = [0x00AD, 0x061C, 0x200B, 0x200D, 0x202E, 0x2066, 0xFEFF, 0xE0001, 0xE0041]
+    text = "a" + "".join(chr(c) for c in cf) + "中文" + chr(9) + "b" + chr(10) + "c"
+    assert sanitize_injected_text(text) == "a中文" + chr(9) + "b" + chr(10) + "c"
+    assert sanitize_injected_text(text, keep_newlines=False) == "a中文" + chr(9) + "b c"
+
+
+def test_cf_ranges_cover_running_unicode():
+    """`_CF_RE` 是按码点区间硬编码的（不在导入时扫全码表，那要约 110 万次 category 调用、吃 hook 预算）。
+    拿运行时 unicodedata 对账：新版本 Unicode 增补的 Cf 漏了即红；反向只允许 Cf 或（旧版 Python 里尚未分配的）Cn。"""
+    missing = [hex(c) for c in range(0x110000)
+               if unicodedata.category(chr(c)) == "Cf" and not _CF_RE.match(chr(c))]
+    assert not missing, f"_CF_RANGES 漏了这些 Cf：{missing[:20]}"
+    extra = [hex(c) for c in range(0x110000)
+             if _CF_RE.match(chr(c)) and unicodedata.category(chr(c)) not in ("Cf", "Cn")]
+    assert not extra, f"_CF_RANGES 多了非 Cf 字符：{extra[:20]}"
 
 
 def _capture(monkeypatch, additional, sysmsg, event="SessionStart"):

@@ -7,6 +7,7 @@
 ```json
 {
   "_version": 1,
+  "_parser": 3,
   "entries": {
     "相对路径/笔记.md": {
       "mtime": 1711267200,
@@ -22,11 +23,14 @@
 }
 ```
 
+- `_parser`（可选）为写端解析器修订号（`rebuild_index.PARSER_REV`），只有 `rebuild_index` 写它；读端（vault-loader）不读，**不触发 `_version` 变更**。解析口径改变、同一篇笔记会解析出不同结果时 +1（2 = 未装 PyYAML 时的降级解析器认 YAML 块序列；3 = frontmatter 读到闭合行为止，见下方「读取窗口」）。`keywords_gap --set` 与摘要同步两个出口只改单条 entry、整份写回，原样保留该键，不补写
+- **读取窗口**：每篇先读前 2000 个字符；首行是 `---` 而这段里没有闭合行时继续往下读，直到读到闭合行、文件结束或 65536 个字符（`rebuild_index.FM_SCAN_CHARS`）。读到文件结束仍没有闭合行的，按没有 frontmatter 处理（与 `_parser` 3 之前相同）；读满 65536 个字符仍没有闭合行的，entry 不记 tags 等 frontmatter 字段，另记 `"fm_truncated": true`。`_parser` 3 之前只读前 2000 个字符：frontmatter 的闭合行落在这之外时整段读不到，tags 为空
+- `fm_truncated`（可选）只在上述「读满仍未闭合」时写入、值恒为 `true`，纯增量字段，**不触发 `_version` 变更**。读端（vault-loader）见到它就把这一篇的 tag 判为读不全：排除 tag 非空时不送给精排；粗排不受影响。旧 cache 没有它，读端当作没有
 - key 为相对于 `$VAULT` 的路径
 - `mtime` 为整数秒 Unix 时间戳（通过 Python `os.path.getmtime()` 获取，无跨平台问题）
 - 其余字段为 frontmatter **原始值**（不做降级推断）
 - `keywords`（可选）为 frontmatter 的检索扩展词数组，纯增量字段，**不触发 `_version` 变更**；旧 cache 无此字段时读端默认空、平滑降级
-- 缺失的字段不写入；例外：文件无 `summary` 时以正文首个 `# ` 标题兜底写入 `summary`，并记 `summary_src: "h1"`（frontmatter 自带的记 `"fm"`）。`summary_src` 是可选增量键，不触发 `_version` 变更
+- 缺失的字段不写入（不在 frontmatter 里的字段、`fm_truncated` 为假时都不写）；例外：文件无 `summary` 时以正文首个 `# ` 标题兜底写入 `summary`，并记 `summary_src: "h1"`（frontmatter 自带的记 `"fm"`）。`summary_src` 是可选增量键，不触发 `_version` 变更
 
 ## 失效与重建
 
@@ -34,6 +38,7 @@
 |------|------|
 | 缓存文件不存在 | 全量读取，创建缓存 |
 | `_version` ≠ 1 | 丢弃，全量重建 |
+| `_parser` 缺失、类型不对或小于当前修订号 | 保留 entries，忽略 mtime 全量重解析一次，写回当前修订号 |
 | JSON 解析失败 | 丢弃，全量重建 |
 | 文件已删除 | 从 entries 移除 |
 | 文件 mtime 变化 | 重新读取该文件 frontmatter |

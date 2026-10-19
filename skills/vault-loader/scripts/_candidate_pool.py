@@ -64,6 +64,28 @@ def is_system_index(path: str) -> bool:
     return is_system_index_name(name, parent)
 
 
+WORKLOG_CATEGORY = "工作日志"
+
+
+def is_worklog(path: str, entry) -> bool:
+    """工作日志判据（spec 2.4.0 W1）：路径首段为 `工作日志`，或 category 含它。
+
+    与 summarize-session `_summary.is_worklog(rel, entry_dict)` 同一判据、两份实现（写端判 cache 原始
+    dict，读端判 Entry；两个 skill 不互相导入），由仓库根 `tests/test_worklog_parity.py` 对同一批样本
+    对跑钉住一致（先例：`_signal_collect.is_system_index_name`）。首段按 `/` 切、不归一反斜杠，与写端
+    逐字一致（cache 键恒为 `/` 分隔）。`entry.category` 判等是给直接构造、没填 `categories` 的 Entry 兜底。
+    fail-open：异常判「不是工作日志」——多召回一篇日志，比误排除一篇知识笔记代价小。
+    """
+    try:
+        if isinstance(path, str) and path.split("/", 1)[0] == WORKLOG_CATEGORY:
+            return True
+        if WORKLOG_CATEGORY in (getattr(entry, "categories", ()) or ()):
+            return True
+        return getattr(entry, "category", "") == WORKLOG_CATEGORY
+    except Exception:                              # noqa: BLE001
+        return False
+
+
 def project_note_prefixes(basename: str, extra_paths) -> list[str]:
     out: list[str] = []
     if basename:

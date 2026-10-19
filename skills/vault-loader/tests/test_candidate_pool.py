@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scripts._candidate_pool import (build_topic_pool, is_system_index,
-                                     main_repo_basename, project_note_prefixes,
+from scripts._candidate_pool import (WORKLOG_CATEGORY, build_topic_pool, is_system_index,
+                                     is_worklog, main_repo_basename, project_note_prefixes,
                                      safe_int)
 from scripts._frontmatter_reader import Entry
 from scripts._signal_collect import collect_signal_a_project_dir
@@ -13,6 +13,23 @@ from scripts._signal_collect import collect_signal_a_project_dir
 
 def _e(path, mtime=0, summary="s"):
     return Entry(path=path, tags=(), category="", summary=summary, mtime=mtime, updated="", keywords=())
+
+
+def test_is_worklog_by_path_or_category():
+    """spec 2.4.0 W1：路径首段为工作日志，或 category 含它（含列表形态）。"""
+    assert WORKLOG_CATEGORY == "工作日志"
+    assert is_worklog("工作日志/2026年/10月/2026-10-14.md", Entry(path="x"))
+    assert is_worklog("项目笔记/a.md", Entry(path="x", category="工作日志"))
+    assert is_worklog("项目笔记/a.md", Entry(path="x", categories=("技术笔记", "工作日志")))
+    assert not is_worklog("项目笔记/a.md", Entry(path="x", category="技术笔记"))
+    assert not is_worklog("项目笔记/工作日志.md", Entry(path="x"))
+    assert not is_worklog("工作日志.md", Entry(path="x"))
+    assert not is_worklog("技术笔记/工作日志/a.md", Entry(path="x"))
+
+
+def test_is_worklog_fail_open():
+    assert is_worklog("项目笔记/a.md", None) is False
+    assert is_worklog(None, Entry(path="x")) is False
 
 
 def test_main_repo_basename_plain_checkout(tmp_path):

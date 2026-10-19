@@ -18,12 +18,17 @@
 3. **隐私旋钮需显式确认**：三个 `session_topic_*` 是 int 型「送出去多少篇」的开关，
    类型校验对它们完全无效。
 4. **写后回读核验**，核验不过报错而非静默成功。
+
+2.4.0 起另有四条（spec 2026-10-13 §5.3、§11）：被取代的旧键拒写、写新键时一并删掉旧键；
+文件在但读不出时拒写（此前当成空 dict 写回，整份配置被一个键替换）；读改写全程持 `lease_lock`
+（面板的「设为默认」与 /config 可能同时写）；入参可以是 bool / int / list，统一转文本再解析。
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
+import re
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -34,6 +39,13 @@ _VL = _HERE.parents[2] / "vault-loader"
 
 sys.path.insert(0, str(_HERE.parent))
 import config_inventory as inv  # noqa: E402  （同目录，读端与写端共用判据）
+
+# 备份目录（与 migrate_config 共用）只留最近这么多份 `config-*.json`【初值】
+BACKUP_KEEP = 20
+# 等配置写锁的上限（秒）；用例会调小
+_LOCK_TIMEOUT = 2.0
+# 新键 → 被它取代的旧键
+_OLD_OF = {new: old for old, new in inv.SUPERSEDED.items()}
 
 
 def _migrate_config():
@@ -117,13 +129,68 @@ def _get_path(d: dict, segments: list[str]) -> tuple[bool, Any]:
     return True, cur
 
 
-def set_key(key: str, raw_value: str, *, home: Path | None = None,
+def _del_path(d: dict, segments: list[str]) -> None:
+    cur: Any = d
+    for seg in segments[:-1]:
+        cur = cur.get(seg) if isinstance(cur, dict) else None
+    if isinstance(cur, dict):
+        cur.pop(segments[-1], None)
+
+
+def _as_text(raw_value: Any) -> str:
+    """入参统一成文本再交 `_parse_value`：CLI 传 str，hook 里面板的「设为默认」传 bool / int。
+    列表与对象用 JSON 写法——`str(["a"])` 是 Python 写法，`_parse_value` 解析不了。"""
+    if isinstance(raw_value, str):
+        return raw_value
+    if isinstance(raw_value, bool):
+        return "true" if raw_value else "false"
+    if isinstance(raw_value, (list, dict)):
+        return json.dumps(raw_value, ensure_ascii=False)
+    return str(raw_value)
+
+
+def _prune_backups(mc) -> None:
+    """备份目录只留最近 BACKUP_KEEP 份备份（按名排序即按时间）。目录与 migrate_config 共用，它的备份
+    也按同一规则淘汰。**只认备份生产者的文件名形态** `config-<UTC 时间戳>.json`
+    （`migrate_config.write_backup` 的 `%Y%m%dT%H%M%S%fZ`：8 位日期、T、12 位时分秒微秒、Z）：
+    用户手工放进来的 `config-*.json` 副本、别的文件、链接一概不碰（淘汰是不可逆的删除）。"""
+    try:
+        files = sorted(
+            p for p in mc.backup_dir_path().glob("config-*.json")
+            if re.fullmatch(r"config-\d{8}T\d{12}Z\.json", p.name)
+            and p.is_file() and not p.is_symlink())
+    except OSError:
+        return
+    for p in files[:-BACKUP_KEEP]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _config_lock(path: Path):
+    """配置文件的写锁。插件根已由 `inv._config_path` 放进 sys.path；拿不到实现时由调用方拒写
+    （fail-closed：少一道互斥可能静默覆盖另一处的写入，拒写只是这次没改成）。"""
+    from context_vault.atomic import lease_lock
+    return lease_lock(path, timeout=_LOCK_TIMEOUT)
+
+
+def set_key(key: str, raw_value: Any, *, home: Path | None = None,
             assume_yes: bool = False, privacy_ack: bool = False) -> dict:
-    """改一个配置项。返回 {"ok", "error", "backup", "old", "new"}。"""
+    """改一个配置项。返回 {"ok", "error", "backup", "old", "new", "path", "removed"}。
+
+    `raw_value` 可以是 str（CLI）或 bool / int / list / dict（hook 里面板的「设为默认」），先转文本。
+    `removed`：写新键时一并删掉的被取代旧键（全路径）。
+    """
     defaults = inv.load_default_config()
     flat_default = inv.flatten(defaults)
 
     # —— 写入白名单 ——
+    if key in inv.SUPERSEDED:
+        new = inv.SUPERSEDED[key]
+        return {"ok": False, "error":
+                f"`{key}` 已由 `{new}` 取代（旧键仍被兼容读取）。请改写 `{new}`："
+                f"写入新键时会一并删除旧键。"}
     if key in inv.DEPRECATED:
         return {"ok": False, "error":
                 f"`{key}` 已废弃、运行时不读，改它不会有任何效果。{inv.DEPRECATED[key]}"}
@@ -134,13 +201,17 @@ def set_key(key: str, raw_value: str, *, home: Path | None = None,
         return {"ok": False, "error":
                 f"`{key}` 不是可配键。用 `config_inventory.py {key.split('.')[-1]}` 查找正确键名。"}
 
+    if raw_value is None:
+        # `_as_text(None)` 会得到字面量 "None"，str 型键（如 relevance.fine_model）会照写并返回 ok
+        return {"ok": False, "error": f"缺少值：`{key}` 没有给出要写入的新值。"}
+
     # —— 隐私旋钮 ——
     if key in inv.PRIVACY_KNOBS and not privacy_ack:
         return {"ok": False, "error":
                 f"`{key}` 是隐私旋钮：它控制**每会话有多少篇笔记被发往外部模型端点**。"
                 f"确认要改请显式加 --i-understand-privacy。"}
 
-    ok, value, err = _parse_value(raw_value, flat_default[key])
+    ok, value, err = _parse_value(_as_text(raw_value), flat_default[key])
     if not ok:
         return {"ok": False, "error": err}
 
@@ -156,12 +227,39 @@ def set_key(key: str, raw_value: str, *, home: Path | None = None,
     except Exception:
         pass  # 守卫自身异常不应变成写入失败以外的行为，交由下面的核验兜底
 
-    # —— 写入源是**原始 JSON**，不是合并后的配置 ——
-    raw, _p, existed = inv.read_raw_config(home)
+    try:
+        lock = _config_lock(path)
+    except ImportError as exc:
+        return {"ok": False, "error":
+                f"无法加载配置写锁（context_vault.atomic）：{exc}。为免与另一处写入互相覆盖，未写入。"}
+    try:
+        with lock:
+            return _write_locked(mc, path, key, value, home)
+    except TimeoutError:                       # 必须排在 OSError 之前：TimeoutError 是它的子类
+        return {"ok": False, "error":
+                f"配置文件正被另一处写入（等锁 {_LOCK_TIMEOUT} 秒超时），未写入，请稍后再试。"}
+    except OSError as exc:
+        # lease_lock 在 POSIX 上遇 PermissionError（配置目录只读等）原样抛出，不转成超时。
+        # `_write_locked` 内部的 OSError 都已就地处理（备份/写入/淘汰各自返回 dict），到这里的只会是取锁失败。
+        return {"ok": False, "error": f"无法创建配置写锁文件：{exc}。未写入。"}
+
+
+def _write_locked(mc, path: Path, key: str, value: Any, home: Path | None) -> dict:
+    """持锁时的读改写。写入源是**原始 JSON**，不是合并后的配置（见模块 docstring 第 1 条）。"""
+    raw, _p, existed, readable = inv.read_raw_config_strict(home)
+    if existed and not readable:
+        return {"ok": False, "error":
+                f"配置文件存在但读不出（不是合法的 JSON 对象）：{path}。为免覆盖你的内容，未写入；"
+                f"请先修好它，或用 --restore 从备份还原。"}
     new_data = deepcopy(raw)
     segments = key.split(".")
     _, old = _get_path(new_data, segments)
     _set_path(new_data, segments, value)
+    removed: list[str] = []
+    old_key = _OLD_OF.get(key)
+    if old_key is not None and _get_path(new_data, old_key.split("."))[0]:
+        _del_path(new_data, old_key.split("."))
+        removed.append(old_key)
 
     backup_path = ""
     if existed and raw:
@@ -169,26 +267,34 @@ def set_key(key: str, raw_value: str, *, home: Path | None = None,
             backup_path = str(mc.write_backup(raw))
         except Exception as exc:
             return {"ok": False, "error": f"备份失败，已中止写入：{exc}"}
+        _prune_backups(mc)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write(path, new_data)
     except Exception as exc:
         return {"ok": False, "error": f"写入失败：{exc}", "backup": backup_path}
 
-    # —— 回读核验 ——
+    # —— 回读核验：新值落盘、被取代的旧键已删 ——
     verify, _p2, _e = inv.read_raw_config(home)
     found, got = _get_path(verify, segments)
     if not found or got != value:
         return {"ok": False, "backup": backup_path, "error":
                 f"写后回读核验失败：期望 {value!r}，实际 {got!r}。配置可能未真正落盘。"}
+    left_over = [k for k in removed if _get_path(verify, k.split("."))[0]]
+    if left_over:
+        return {"ok": False, "backup": backup_path, "error":
+                f"写后回读核验失败：被取代的旧键 `{left_over[0]}` 仍在盘上。配置可能未真正落盘。"}
 
     return {"ok": True, "error": "", "backup": backup_path, "old": old, "new": value,
-            "path": str(path)}
+            "path": str(path), "removed": removed}
 
 
 def restore(backup: str, *, home: Path | None = None, assume_yes: bool = False) -> dict:
-    """从备份还原。还原前同样先备份当前值（继承 migrate_config 的做法）。"""
+    """从备份还原。还原前同样先备份当前值（继承 migrate_config 的做法）。
+
+    备份必须是 JSON 对象（2.4.0 full-review DO-M2）：数组、标量写进去后 loader 判 config 读坏、整份回落默认值，
+    精排、目录层等隐私旋钮随之回到默认的「开」。不是对象就拒绝，不写盘（不备份当前值、不动目标文件）。"""
     src = Path(backup)
     if not src.is_file():
         return {"ok": False, "error": f"备份文件不存在：{backup}"}
@@ -196,6 +302,9 @@ def restore(backup: str, *, home: Path | None = None, assume_yes: bool = False) 
         data = json.loads(src.read_text(encoding="utf-8"))
     except ValueError as exc:
         return {"ok": False, "error": f"备份文件不是合法 JSON：{exc}"}
+    if not isinstance(data, dict):
+        return {"ok": False, "error":
+                f"备份文件的顶层不是 JSON 对象（是 {type(data).__name__}），不是配置备份，未还原。"}
 
     mc = _migrate_config()
     path = inv._config_path(home)
@@ -228,6 +337,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"已写入 {res.get('path', '')}")
         if "old" in res:
             print(f"  {args.key}: {res['old']!r} -> {res['new']!r}")
+        for old_key in res.get("removed") or []:
+            print(f"  已删除被取代的旧键：{old_key}")
         if res.get("backup"):
             print(f"  备份：{res['backup']}")
         return 0
@@ -236,4 +347,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # 输出含配置路径与键值：控制台编码不是 UTF-8 时，GBK 之外的字符会让 print 崩（同 vault-loader migrate_config）
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 — 被替换成不支持 reconfigure 的流时保持原样
+            pass
     sys.exit(main())

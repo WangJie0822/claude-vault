@@ -42,7 +42,7 @@ def _no_topic_spawn(monkeypatch):
     1.5s vs 49 条耗时 61s」这种与预期严重不符的波动。autouse 覆盖全文件，纯单元
     用例不受影响（它们根本不走 `main()`）。
     """
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: False)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawn_error")
 
 
 def _is_skipped(prompt, names):
@@ -284,7 +284,7 @@ def test_wiring_records_its_own_gate_value(monkeypatch, tmp_path, vault_for_slas
     """gate 值要能把本闸门与其它早退区分开，否则报表上看不出「拦了多少」。"""
     seen = []
     monkeypatch.setattr(psl, "_stage_gate_record",
-                        lambda cfg, hi, gate: seen.append(gate))
+                        lambda turn, cfg, hi, gate: seen.append(gate))
     _run_main(monkeypatch, tmp_path, PROMPT, ["bug-batch"], session="s-slash-4")
     assert seen == ["skipped_slash_command"]
 
@@ -402,7 +402,7 @@ def test_gate_attribution_wins_over_later_gates(monkeypatch, tmp_path, vault_for
     行为测试对这种归因漂移天生无感。文档主打的例子恰好落在这一格。
     """
     seen = []
-    monkeypatch.setattr(psl, "_stage_gate_record", lambda c, h, g: seen.append(g))
+    monkeypatch.setattr(psl, "_stage_gate_record", lambda t, c, h, g: seen.append(g))
     _run_main(monkeypatch, tmp_path, "/bug-batch", ["bug-batch"], session="s-order")
     assert seen == ["skipped_slash_command"]
 

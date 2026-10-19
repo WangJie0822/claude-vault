@@ -106,15 +106,16 @@ def test_session_start_under_500ms(tmp_home: Path, large_vault: Path) -> None:
 def test_prompt_submit_under_300ms(tmp_home: Path, large_vault: Path) -> None:
     cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(large_vault)}))
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(large_vault),
+                               "relevance": {"fine_rank": False}}))
 
     _UPS_PROMPT = "召回 扩展词 相关性打分 回归测试 语义检索 关键词匹配 怎么优化实现"
-    # 必须传 session_id：生产的 hook payload 一定带它，而 `has_recent_topic_attempt`
-    # 里 `if not session_id: return False` 使空值下负缓存**恒失效** —— 不传就变成每轮都
-    # 拉起一次 session_topic 提炼子进程，测的是生产中不存在的最坏情况。
-    # session_topic 默认关时这条路径恒不执行，所以此前不传也测不出差别；1.1.0 默认开
-    # 之后它就成了形态偏差。首轮那一次 spawn 的开销由下面的
-    # test_first_turn_topic_spawn_overhead_bounded 单独守，不是被这里放过。
+    # 必须传 session_id：生产的 hook payload 一定带它。
+    # 2.4.0 起精排逐轮化，默认配置下每个通过闸门的提问都会发起一次精排。本用例显式关掉精排
+    # （`relevance.fine_rank: false`），测的是「只有粗排」的热路径，与 2.3.0 及之前的口径可比，
+    # 也不会拉起真实 claude。精排开着的新稳态（每轮 spawn + fine 状态读写 + 会话设置）由
+    # test_prompt_submit_steady_state_with_fine_under_300ms 守，会话首轮那一次 spawn 由
+    # test_first_turn_topic_spawn_overhead_bounded 守。
     _SID = "sess-perf-ups"
     for _ in range(WARMUP):
         _run_script("prompt_submit_load.py", NEUTRAL_CWD, prompt=_UPS_PROMPT,
@@ -175,7 +176,10 @@ def test_prompt_submit_with_mod_request_under_300ms(tmp_home: Path, large_vault:
 
     cfg = tmp_home / ".context-vault" / "config.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(large_vault)}))
+    # 2.4.0：关掉逐轮补充。预置的 topics 已是首轮成功（state=ok），于是本会话不再发起精排、
+    # `llm.state` 稳定为 ok；精排开着的新稳态另有 test_prompt_submit_steady_state_with_fine_under_300ms
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(large_vault),
+                               "relevance": {"fine_supplement": False}}))
     # 占位 UUID 拆开拼接：发布闸门按 8-4-4-4-12 hex 拦截疑似真实 session id
     sid = "-".join(("11111111", "2222", "3333", "4444", "555555555555"))
     _state.configure_context("claude")
@@ -232,6 +236,8 @@ def test_prompt_submit_with_metrics_enabled_stays_within_budget(
     cfg.write_text(json.dumps({
         "dry_run": False,
         "vault_path": str(large_vault),
+        # 2.4.0：关掉精排，只测 metrics 落盘的增量；PATH 上的真实 claude 也因此不会被拉起
+        "relevance": {"fine_rank": False},
         "metrics": {"enabled": True, "near_miss_k": 10, "admitted_k": 20,
                     "retention_days": 90, "nudge_threshold": 10,
                     "nudge_ttl_hours": 168},
@@ -268,3 +274,187 @@ def test_prompt_submit_with_metrics_enabled_stays_within_budget(
         f"metrics 开启态 UserPromptSubmit 性能超标: median {observed:.3f}s"
         f"（{SAMPLES} 样本，500 笔记 fixture，关闭态预算 0.3s）\n"
         f"全部样本: {[f'{s:.3f}' for s in sorted(samples)]}")
+
+
+# ---------------------------------------------------------------------------
+# 2.4.0 精排逐轮化后的新稳态（spec §14「性能」）
+
+_FAKE_CLAUDE_LINES = [
+    "import sys",
+    "sys.stdin.buffer.read()",
+    "for line in ('PINNED: NONE', 'SUPPLEMENT: NONE', 'WORDS: recall, ranking'):",
+    "    print(line)",
+]
+
+
+def _fake_claude_bin(root: Path) -> Path:
+    """PATH 上的替身 `claude`：读完 stdin、回一份合法的精排输出（两段都是 NONE），不联网、不计费。
+    Windows 上 `shutil.which` 按 PATHEXT 找到 `claude.cmd`，POSIX 上找到可执行的 `claude`。"""
+    d = root / "fakebin"
+    d.mkdir(exist_ok=True)
+    py = d / "fake_claude.py"
+    py.write_text("\n".join(_FAKE_CLAUDE_LINES) + "\n", encoding="utf-8")
+    if os.name == "nt":
+        # 字节写入：write_text 在 Windows 上会把 \r\n 再转成 \r\r\n，落盘多一个游离 CR
+        (d / "claude.cmd").write_bytes(f'@"{sys.executable}" "{py}" %*\r\n'.encode("utf-8"))
+    else:
+        sh = d / "claude"
+        sh.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{py}" "$@"\n', encoding="utf-8")
+        sh.chmod(0o755)
+    return d
+
+
+def _uuid(tail: int) -> str:
+    # 占位 UUID 拆开拼接：发布闸门按 8-4-4-4-12 hex 拦截疑似真实 session id
+    return "-".join(("11111111", "2222", "3333", "4444", f"{tail:012d}"))
+
+
+def _wait_fine_idle(sid: str, timeout: float = 60.0) -> bool:
+    """等本会话的精排子进程跑完（在飞标记消失）。不计入耗时样本：真实使用里两次提问的间隔
+    通常长于一次精排，「上一个还在跑」时的并发负载不是这条守卫要测的。"""
+    from scripts import _fine_state, _state
+    deadline = time.time() + timeout
+    _state.configure_context("claude")
+    try:
+        while time.time() < deadline:
+            if _fine_state.inflight_active(sid, time.time()) is None:
+                return True
+            time.sleep(0.2)
+        return False
+    finally:
+        _state.configure_context("unknown")
+
+
+def _fine_steady_state(tmp_home: Path, large_vault: Path, sid: str, seed_injected=()) -> tuple:
+    """精排开着的稳态：mod 在场（每轮带会话设置）、首轮点名已成功，每轮发起一次逐轮补充，子进程用替身
+    claude 真起、真跑完。`seed_injected` 预置进本会话 fine 状态的「已注入」（它们原样进每轮的 payload）。
+    返回 (样本耗时列表, 跑完后的 fine 状态)。"""
+    import dataclasses
+    import hashlib
+    from scripts import _fine_state, _state, _topic
+
+    cfg = tmp_home / ".context-vault" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    # 外发上限调大：500 篇 fixture 的目录层每次可达数十 KB，8 轮可能顶到默认 1,000,000 字节，
+    # 顶到后本会话停用逐轮补充、后几轮不再 spawn，测的就不是新稳态了
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(large_vault),
+                               "relevance": {"fine_session_max_bytes": 20000000}}))
+    _state.configure_context("claude")
+    try:
+        _topic.save_session_topic(NEUTRAL_CWD, sid, ["相关性打分"], pinned=[], accounted=False,
+                                  state="ok")
+        if seed_injected:
+            seeded = _fine_state.update_fine(
+                sid, lambda st: dataclasses.replace(st, injected=list(seed_injected)))
+            assert seeded is not None and seeded.injected == list(seed_injected)
+    finally:
+        _state.configure_context("unknown")
+    live = tmp_home / ".context-vault" / "state" / "live"
+    live.mkdir(parents=True, exist_ok=True)
+    sid_h = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:24]
+    path_env = str(_fake_claude_bin(tmp_home)) + os.pathsep + os.environ.get("PATH", "")
+    prompt = "召回 扩展词 相关性打分 回归测试 语义检索 关键词匹配 怎么优化实现"
+    samples = []
+    for i in range(WARMUP + SAMPLES):
+        pid = "-".join(("aaaaaaaa", "bbbb", "cccc", "dddd", f"{i:012d}"))
+        (live / f"{sid_h}-{pid}.req.json").write_text(
+            json.dumps({"v": 1, "settings": {"fine_max_notes": 2}}), encoding="utf-8")
+        elapsed, _ = _run_script(
+            "prompt_submit_load.py", NEUTRAL_CWD, prompt=prompt,
+            extra={"session_id": sid, "prompt_id": pid, "hook_event_name": "UserPromptSubmit"},
+            env_extra={"PATH": path_env})
+        snap = json.loads((live / f"{sid_h}.json").read_text(encoding="utf-8"))
+        assert (snap["prompt_id"], snap["status"]) == (pid, "scored"), snap.get("status")
+        if i >= WARMUP:
+            samples.append(elapsed)
+        assert _wait_fine_idle(sid), f"第 {i} 轮的精排子进程 60 s 内没有结束"
+    _state.configure_context("claude")
+    try:
+        st = _fine_state.load_fine(sid)
+    finally:
+        _state.configure_context("unknown")
+    return samples, st
+
+
+def test_prompt_submit_steady_state_with_fine_under_300ms(tmp_home: Path, large_vault: Path) -> None:
+    """新稳态：mod 在场（每轮带会话设置）、首轮点名已成功，每轮都发起一次逐轮补充并读写一次 fine
+    状态。子进程真起、真跑完（替身 claude），不联网不计费。
+
+    先证明测的是这条路径——每轮快照 status 为 scored、本会话调用次数等于轮数、会话设置已落进
+    fine 状态、子进程没有失败、最后一次子进程回报的模式是 supp 且成功——再谈耗时。调用次数、失败计数
+    与会话设置三项在 pin 与 supp 两种模式下完全一样，认不出「逐轮补充」，认模式的只有 stats_q：
+    最后一轮之后没有下一轮来并账，所以最后一条统计还留在队列里。"""
+    samples, st = _fine_steady_state(tmp_home, large_vault, _uuid(7))
+    assert st.calls == WARMUP + SAMPLES, f"不是每轮都发起了精排：calls={st.calls}"
+    assert (st.fail_streak, st.disabled_reason) == (0, None), (st.fail_streak, st.disabled_reason,
+                                                               st.last_fail)
+    assert st.session_settings.get("fine_max_notes") == 2, st.session_settings
+    assert st.stats_q and st.stats_q[-1]["mode"] == "supp" and st.stats_q[-1]["ok"] is True, st.stats_q
+    observed = statistics.median(samples)
+    assert observed < 0.3, (
+        f"精排新稳态 UserPromptSubmit 性能超标: median {observed:.3f}s（{SAMPLES} 样本，"
+        f"500 笔记 fixture）\n全部样本: {[f'{s:.3f}' for s in sorted(samples)]}")
+
+
+def test_prompt_submit_steady_state_with_large_fine_payload_under_300ms(
+        tmp_home: Path, large_vault: Path) -> None:
+    """同上的稳态，但交给精排子进程的 payload 超过 4096 B（2.4.0 full-review P-H1）。
+
+    上一条用例的 payload 远小于 4096 B（短 prompt、fixture 短路径），而 Windows 匿名管道缓冲恰是 4096 B：
+    交接若是「管道 + 同步写」，越过它的那一轮 UPS 要在 emit 之前等子进程启动并导入完 `_topic`（实测约 92 ms，
+    会话中后期本会话已注入约 28 条中文长路径就会越过）。这里预置 60 条中文长路径进本会话的「已注入」，
+    它们原样进每一轮的 payload；先证明 payload 确实越过 4096 B、这 60 条到最后一轮仍在状态里（每轮都带着），
+    再谈耗时。判别「交接是否同步」的是 `test_session_topic.py` 里的替身子进程用例，这条守的是预算。"""
+    seed = [f"项目笔记/车载语音/语音助手交互链路排查记录与根因分析第{i:02d}篇.md" for i in range(60)]
+    seed_bytes = len(json.dumps(seed, ensure_ascii=False).encode("utf-8"))
+    assert seed_bytes > 4096, seed_bytes        # payload 的 injected 字段整份含它们，payload 只会更大
+    samples, st = _fine_steady_state(tmp_home, large_vault, _uuid(8), seed_injected=seed)
+    # injected 只增不减（clear / compact 之外），超过 300 条时先截最旧的：最旧的这 60 条到最后还在，
+    # 说明每一轮读到的状态里都有它们，每一轮的 payload 都带着
+    assert set(seed) <= set(st.injected), "预置的已注入路径中途丢了，后几轮的 payload 可能已不足 4096 B"
+    assert st.calls == WARMUP + SAMPLES, f"不是每轮都发起了精排：calls={st.calls}"
+    assert (st.fail_streak, st.disabled_reason) == (0, None), (st.fail_streak, st.disabled_reason,
+                                                               st.last_fail)
+    assert st.stats_q and st.stats_q[-1]["mode"] == "supp" and st.stats_q[-1]["ok"] is True, st.stats_q
+    observed = statistics.median(samples)
+    assert observed < 0.3, (
+        f"payload 超过 4096 B 的精排稳态 UserPromptSubmit 性能超标: median {observed:.3f}s"
+        f"（{SAMPLES} 样本，500 笔记 fixture）\n全部样本: {[f'{s:.3f}' for s in sorted(samples)]}")
+
+
+def test_first_turn_topic_spawn_overhead_bounded(tmp_home: Path, large_vault: Path) -> None:
+    """会话首轮那一次 spawn（F51：此前上方注释引用了这条用例，它却不存在）。每个样本换一个新会话，
+    所以每一轮都是会话首轮、都走首轮模式发起一次精排。先证明每个会话都真的发起并跑完了
+    （topics 写回了替身给的主题词、调用计数为 1），再谈耗时。"""
+    from scripts import _fine_state, _state, _topic
+
+    cfg = tmp_home / ".context-vault" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(large_vault)}))
+    path_env = str(_fake_claude_bin(tmp_home)) + os.pathsep + os.environ.get("PATH", "")
+    prompt = "召回 扩展词 相关性打分 回归测试 语义检索 关键词匹配 怎么优化实现"
+    samples = []
+    for i in range(WARMUP + SAMPLES):
+        sid = _uuid(100 + i)
+        elapsed, _ = _run_script(
+            "prompt_submit_load.py", NEUTRAL_CWD, prompt=prompt,
+            extra={"session_id": sid, "prompt_id": f"pid-first-{i}",
+                   "hook_event_name": "UserPromptSubmit"},
+            env_extra={"PATH": path_env})
+        assert _wait_fine_idle(sid), f"第 {i} 个会话的首轮精排 60 s 内没有结束"
+        _state.configure_context("claude")
+        try:
+            words = _topic.load_session_topic(NEUTRAL_CWD, sid, 24)
+            fine = _fine_state.load_fine(sid)
+        finally:
+            _state.configure_context("unknown")
+        assert (words, fine.calls) == (["recall", "ranking"], 1), (words, fine.calls)
+        # 首轮必须走首轮模式（pin）：supp 模式同样会写回主题词、同样计一次调用，上面两项认不出区别
+        assert fine.stats_q and fine.stats_q[-1]["mode"] == "pin" and fine.stats_q[-1]["ok"] is True, \
+            fine.stats_q
+        if i >= WARMUP:
+            samples.append(elapsed)
+    observed = statistics.median(samples)
+    assert observed < 0.3, (
+        f"会话首轮（含一次精排 spawn）UserPromptSubmit 性能超标: median {observed:.3f}s"
+        f"（{SAMPLES} 样本，500 笔记 fixture）\n全部样本: {[f'{s:.3f}' for s in sorted(samples)]}")

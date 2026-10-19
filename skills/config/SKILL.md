@@ -34,6 +34,7 @@ python3 "$CFG/config_inventory.py" --json       # 需要精确取值时用
 |---|---|
 | `已显式设置` | 用户自己写进 config.json 的；其余都在吃默认值 |
 | `⚠️ 已废弃` | 运行时**不读**这个键，改它不会有任何效果 |
+| `↪ 已被取代（仍生效）` | 旧键：新键没有显式写时仍取它的值；本工具拒写它，改写说明里点名的新键（写新键时会一并删掉它） |
 | `🔒 隐私旋钮（控制外发篇数）` | 改大等于每会话把更多笔记发往外部模型端点 |
 | `外部键·只读` / `只读` | 本工具不写它，原因在说明里 |
 
@@ -56,8 +57,11 @@ python3 "$CFG/config_set.py" <键> <值> --yes
 几类会被脚本直接拒绝，拒绝理由照实转述、不要绕过：
 
 - **废弃键**——改了不生效，脚本会指出该用哪个键替代；
+- **被取代的旧键**（`relevance.session_topic`、`relevance.session_pin_max`）——仍然生效，但要改请写新键 `relevance.fine_rank` / `relevance.fine_pin_max`，写入时旧键会被一并删掉；
+- **配置文件存在但读不出**（不是合法 JSON 对象）——拒绝写入，免得把整份配置替换成一个键；先修好或用 `--restore` 还原；
+- **配置文件正被另一处写入**（面板的「设为默认」与本工具可能同时写）——等锁超时即拒绝，稍后再试；
 - **只读键**（`work_log_dir`、`obsidian_cli.*`）——它们不在 `DEFAULT_CONFIG` 里，没有默认值与类型判据可依；且 `obsidian_cli` 只认 canonical 配置文件，与本工具的路径解析可能分叉，写了会出现「读端显示已改、运行时不生效」；
-- **隐私旋钮**（`relevance.session_topic_top_n` / `session_topic_project_top_k` / `session_topic_pool_max`）——控制每会话有多少篇笔记被发往外部模型端点。要改必须显式加 `--i-understand-privacy`，**并且先把这个含义告诉用户**；
+- **隐私旋钮**（`relevance.session_topic_top_n` / `session_topic_project_top_k` / `session_topic_pool_max`，以及 2.4.0 起的 `fine_catalog` / `fine_catalog_max_chars` / `fine_recent_prompts` / `fine_session_max_bytes` / `fine_exclude_tags`）——控制每会话有多少笔记、哪些内容被发往外部模型端点。要改必须显式加 `--i-understand-privacy`，**并且先把这个含义告诉用户**；
 - **类型不符**——按同键默认值的类型校验；注意布尔与整数不互通。
 
 ## 改错了怎么退回
@@ -68,7 +72,7 @@ python3 "$CFG/config_set.py" <键> <值> --yes
 python3 "$CFG/config_set.py" --restore <备份路径>
 ```
 
-还原本身也会先备份当前值。
+还原本身也会先备份当前值。备份文件的顶层不是 JSON 对象（数组、数字、字符串、`null`）时拒绝还原，什么都不写：那样的文件写进去，hook 会判配置读不出、整份回落默认值。每次经本工具改写一个键之后，备份目录里的时间戳备份只保留最近 20 份（迁移脚本的备份在同一目录，一并计入）；还原与迁移脚本只新增备份、不淘汰，文件名不是 `config-<UTC 时间戳>.json` 的文件一概不碰。
 
 ## 已知边界
 

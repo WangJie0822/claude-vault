@@ -14,9 +14,10 @@ from pathlib import Path
 from scripts import _metrics
 
 VERDICTS = ("relevant", "irrelevant", "unsure")
-# 四类标注：near_miss 问「该不该被召回」；两个 admitted_* 问「机械打分打得对不对」；
-# llm_pinned 问「LLM 点名点得对不对」。新增一类时同步 analyze_metrics 的 _KIND_HIT / _KIND_BUCKET。
-KINDS = ("near_miss", "admitted_fulltext", "admitted_list", "llm_pinned")
+# 五类标注：near_miss 问「该不该被召回」；两个 admitted_* 问「机械打分打得对不对」；
+# llm_pinned 问「LLM 点名点得对不对」；llm_supplement 问「逐轮精排补充得对不对」（2.4.0）。
+# 新增一类时同步 analyze_metrics 的 _KIND_HIT / _KIND_BUCKET 与 _session_ops.ANN_KINDS。
+KINDS = ("near_miss", "admitted_fulltext", "admitted_list", "llm_pinned", "llm_supplement")
 DEFAULT_KIND = "near_miss"   # 旧记录（写于加字段之前）一律归此类
 
 
@@ -196,6 +197,7 @@ def _session_index(home: Path, session: str):
     found = False
     by_ph: dict = {}
     llm: set = set()
+    supp: set = set()
     for d in reversed(_metrics.event_month_dirs(home)):
         f = d / f"{stem}.jsonl"
         if not f.is_file():
@@ -215,10 +217,13 @@ def _session_index(home: Path, session: str):
             lp = r.get("llm_pinned")
             if isinstance(lp, list):
                 llm.update(x for x in lp if isinstance(x, str))
+            ss = r.get("supp_shown")
+            if isinstance(ss, list):
+                supp.update(x for x in ss if isinstance(x, str))
             ph = r.get("prompt_h")
             if isinstance(ph, str):
                 by_ph.setdefault(ph, []).append(r)
-    return {"by_ph": by_ph, "llm": llm} if found else None
+    return {"by_ph": by_ph, "llm": llm, "supp": supp} if found else None
 
 
 def _verify(index: dict, a: dict) -> bool:
@@ -230,6 +235,10 @@ def _verify(index: dict, a: dict) -> bool:
     path, kind = a["path"], a["kind"]
     if kind == "llm_pinned":
         return path in index["llm"]
+    if kind == "llm_supplement":
+        # 补充只在投递那一轮出现，而 2.4.0 开发期的旧 supp_only 记录可能没有 prompt_h：与 llm_pinned 同口径，
+        # 按「该会话任一条记录的 supp_shown 含此篇」核对，prompt_h 取自请求体、不核对
+        return path in index["supp"]
     for r in index["by_ph"].get(a["prompt_h"], ()):
         shown = r.get("shown")
         if not (isinstance(shown, list) and path in shown):
@@ -267,8 +276,9 @@ def apply_annotations(home: Path, anns) -> "tuple[list, list]":
         verified.append(a)
     if not verified:
         return [], rejected
-    # 两个 admitted_* 的 (session, prompt_h) 与核对上的记录逐字相同；llm_pinned 只核对了 path，
-    # 它的 prompt_h 取自请求体、没有核对（mod 不产出这类标注，节点 2 S-L1）
+    # 两个 admitted_* 的 (session, prompt_h) 与核对上的记录逐字相同；llm_pinned 与 llm_supplement 只
+    # 核对了 path 在该会话出现过，prompt_h 取自请求体、没有核对（llm_pinned 由 mod 以外的入口产出，节点 2
+    # S-L1；llm_supplement 由 mod 面板产出，context_ids 可能指向投递之外的那一轮）
     recs = [_record(a["path"], a["verdict"], a["kind"], [(a["session"], a["prompt_h"])],
                     a["id"], a.get("ts")) for a in verified]
     p = annotations_path(home)

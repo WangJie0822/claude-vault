@@ -95,7 +95,11 @@ def test_build_injection_text_ups_list_golden() -> None:
         vault_path=Path("/nonexistent"))
     assert ft is None
     assert "📚 vault-loader 候选（按本轮提问关键词粗筛：hook）" in text
-    assert f"- [[技术笔记/hook.md]]（中置信，命中：hook）— {long_summary}" in text
+    from scripts._inject_format import PATH_NOTE, coarse_annot, note_line
+    expected = note_line("技术笔记/hook.md", scored_mid[0][2], Path("/nonexistent"),
+                         short_chars=20, annot=coarse_annot("中", ["hook"]))
+    assert expected in text and PATH_NOTE in text
+    assert "[[技术笔记/hook.md]]" not in text
     assert "流程词" in text   # 自选指令
     assert paths == ["技术笔记/hook.md"]
     # 负向：未命中任何展示笔记的词（skill/无关词）不得出现在注入头任何位置
@@ -143,16 +147,20 @@ def test_build_injection_text_ups_fulltext_rest_hits_not_merged_into_header() ->
     kw_line = next(line for line in text.split("\n") if line.startswith("topical="))
     assert kw_line == "topical=8, 关键词命中：alpha, beta"   # 只含 ft_hits，精确整行比对
     assert "gamma" not in kw_line   # 负向：rest 独有的词不得出现在描述 ft_entry 的行上
-    rest_line = next(line for line in text.split("\n") if "other.md" in line)
+    rest_line = next(line for line in text.split("\n") if "「other」" in line)
     assert "命中：gamma" in rest_line   # rest 候选行展示自己的命中词
     assert "alpha" not in rest_line and "beta" not in rest_line
 
 
-def test_candidate_title_falls_back_for_empty_summary() -> None:
-    from scripts.prompt_submit_load import _candidate_title
-    e = Entry(path="技术笔记/无摘要.md", summary="")
-    out = _candidate_title(e, 20)
-    assert "无摘要" in out and "summary 缺失" in out
+def test_empty_summary_line_marks_missing() -> None:
+    """摘要缺失的篇：标题照常、附注写明缺失（行格式由 _inject_format.note_line 负责，spec §8.1）。"""
+    ups_cfg = {"max_notes": 3, "fulltext_max_bytes": 8192}
+    rel_cfg = {"confidence_bands": {"high": 6}, "fulltext_topical_threshold": 6,
+               "short_summary_chars": 20}
+    e = Entry(path="技术笔记/无摘要.md", summary="", mtime=1900000000)
+    text, _, _ = build_injection_text_ups([(6.0, 4.0, e)], "kw", {"kw"}, ups_cfg, rel_cfg,
+                                          vault_path=Path("/nonexistent"))
+    assert "「无摘要」" in text and "摘要缺失" in text
 
 
 def test_fulltext_picks_topical_max_not_total_top() -> None:
@@ -225,7 +233,8 @@ def test_fulltext_mode_triggered(tmp_home: Path, tmp_vault: Path,
 
     cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(tmp_vault)}))
+    cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(tmp_vault),
+                               "relevance": {"auto_fulltext": True}}))   # 2.4.0 起自动全文默认关
 
     # prompt 命中多个 tag → 触发 prompt_tag_hit + prompt_summary_hit
     prompt = "vault-loader hook skill spec automated"
@@ -359,7 +368,7 @@ def test_fulltext_upgrade_from_candidate(tmp_home: Path, tmp_vault: Path,
     })
     (tmp_vault / "技术笔记").mkdir()
     (tmp_vault / "技术笔记" / "up.md").write_text("# up\n\n这是升级全文内容", encoding="utf-8")
-    _write_cfg(tmp_home, tmp_vault)
+    _write_cfg(tmp_home, tmp_vault, relevance={"auto_fulltext": True})   # 2.4.0 起自动全文默认关
     # 预填：该篇曾以弱候选注入（在 paths、不在 fulltext_paths）
     save_injected(NEUTRAL_CWD, ["技术笔记/up.md"])
 
@@ -396,7 +405,7 @@ def test_upgrade_candidate_not_primary_stays_visible(tmp_home: Path, tmp_vault: 
     (tmp_vault / "技术笔记").mkdir()
     (tmp_vault / "技术笔记" / "a.md").write_text("# a\n\nA 全文内容", encoding="utf-8")
     (tmp_vault / "技术笔记" / "b.md").write_text("# b\n\nB 全文内容", encoding="utf-8")
-    _write_cfg(tmp_home, tmp_vault)
+    _write_cfg(tmp_home, tmp_vault, relevance={"auto_fulltext": True})   # 2.4.0 起自动全文默认关
     # 两篇都曾以弱候选注入
     save_injected(NEUTRAL_CWD, ["技术笔记/a.md", "技术笔记/b.md"])
 
@@ -404,7 +413,7 @@ def test_upgrade_candidate_not_primary_stays_visible(tmp_home: Path, tmp_vault: 
     d = _parse(r); assert d is not None
     ac = d["hookSpecificOutput"]["additionalContext"]
     assert "A 全文内容" in ac                         # a 升全文主候选
-    assert "[[技术笔记/b.md]]" in ac                  # b 仍在候选清单可见（非主候选不消失）
+    assert "「b」" in ac                              # b 仍在候选清单可见（非主候选不消失）
     ft = load_fulltext_injected(NEUTRAL_CWD, 24)
     assert "技术笔记/a.md" in ft                       # a 入 fulltext_paths
     assert "技术笔记/b.md" not in ft                   # b 未入 → 保留下轮升级机会
@@ -605,7 +614,7 @@ def test_keyword_only_note_injected_as_candidate_not_fulltext(
     assert data is not None, r.stderr
     ctx = data["hookSpecificOutput"]["additionalContext"]
     assert "vault-loader 候选" in ctx            # 清单模式（非全文）
-    assert "技术笔记/kw.md" in ctx                # keyword-only 笔记进了候选
+    assert "「kw」" in ctx                        # keyword-only 笔记进了候选（统一行只出标题）
     assert "自动加载全文" not in ctx              # 未触发自动全文
 
 
@@ -648,7 +657,7 @@ def test_b_two_distinct_keywords_trigger_fulltext(tmp_home: Path, tmp_vault: Pat
         "技术笔记/two.md": {"tags": ["hook", "skill"],
                            "summary": "hook 的设计实现说明详述文档", "mtime": 1900000000}
     })
-    _write_cfg(tmp_home, tmp_vault)
+    _write_cfg(tmp_home, tmp_vault, relevance={"auto_fulltext": True})   # 2.4.0 起自动全文默认关
     # hook 命中 tag+summary、skill 命中 tag → 2 个不同关键词 → topical 6 且 dist≥2
     r = _run(NEUTRAL_CWD, "explain the hook skill implementation")
     d = _parse(r); assert d is not None
@@ -698,7 +707,7 @@ def test_relaxed_pure_cjk_single_token_injects(tmp_home: Path, tmp_vault: Path,
     _write_cfg(tmp_home, tmp_vault)
     r = _run(NEUTRAL_CWD, "崩溃")
     d = _parse(r); assert d is not None
-    assert "crash.md" in d["hookSpecificOutput"]["additionalContext"]
+    assert "「crash」" in d["hookSpecificOutput"]["additionalContext"]
 
 
 def test_relaxed_zero_candidates_stays_silent(tmp_home: Path, tmp_vault: Path,
@@ -764,10 +773,15 @@ def test_list_mode_summary_newlines_collapsed(tmp_home: Path, tmp_vault: Path,
 def test_wikilink_path_control_chars_sanitized(tmp_home: Path, tmp_vault: Path,
                                                write_frontmatter_cache) -> None:
     """[Important] path 是不可信 frontmatter 内容，wikilink `[[path]]` 嵌入点须净化控制字符，
-    不得让 \\x1b 等原样进入 additionalContext（同 summary/title 一致对待，F5 补漏）。
+    不得让控制字节原样进入 additionalContext（同 summary/title 一致对待，F5 补漏）。
     沿用 test_list_mode_injection_has_notice 的 tag-only 命中口径，稳定落在清单分支
-    （非全文分支）以覆盖 build_injection_text_ups 清单模式的 wikilink 净化点。"""
-    evil_path = "技术笔记/evil\x1b[31m构建笔记.md"
+    （非全文分支）以覆盖 build_injection_text_ups 清单模式的 wikilink 净化点。
+
+    2.4.0（spec §8.3）变更：此前用例的 path 含 ESC(\\x1b)，现在 C0 控制字符的 cache 键在
+    `load_cache_status` 入口就被 `safe_rel_note_path` 拒收（整条不进索引、不会走到 wikilink 净化点），
+    原写法 `_parse(r)` 为 None。wikilink 净化点现在能碰到的是通过字符串判据的键：DEL(0x7f，
+    不在 C0 区间) 与 Unicode Cf（S39，如 U+202E bidi 覆盖），故改用这两类字符继续守这个净化点。"""
+    evil_path = "技术笔记/evil" + chr(0x7F) + chr(0x202E) + "构建笔记.md"
     write_frontmatter_cache({
         evil_path: {"tags": ["gradle", "构建"],
                     "summary": "内存不足问题的排查记录，用于验证 path 净化，不复述 tag 字面词",
@@ -777,8 +791,9 @@ def test_wikilink_path_control_chars_sanitized(tmp_home: Path, tmp_vault: Path,
     r = _run(NEUTRAL_CWD, "gradle 构建配置调优")
     d = _parse(r); assert d is not None
     ctx = d["hookSpecificOutput"]["additionalContext"]
-    assert "\x1b" not in ctx                 # 控制字节已剥离
-    assert "构建笔记.md" in ctx              # 正常字符不误伤，路径仍可读
+    assert chr(0x7F) not in ctx              # 控制字节（DEL）已剥离
+    assert chr(0x202E) not in ctx            # Cf（bidi 覆盖）已剥离
+    assert "构建笔记" in ctx                 # 正常字符不误伤，标题仍可读（标题去掉 .md）
 
 
 # ---------------------------------------------------------------------------
@@ -842,7 +857,7 @@ def test_fulltext_fence_not_forgeable_by_note_body(tmp_home: Path, tmp_vault: Pa
         "技术笔记/evil.md": {"tags": ["hook", "skill"],
                             "summary": "hook 的设计实现说明详述文档", "mtime": 1900000000}
     })
-    _write_cfg(tmp_home, tmp_vault)
+    _write_cfg(tmp_home, tmp_vault, relevance={"auto_fulltext": True})   # 2.4.0 起自动全文默认关
     r = _run(NEUTRAL_CWD, "explain the hook skill implementation")
     d = _parse(r); assert d is not None, r.stderr
     ac = d["hookSpecificOutput"]["additionalContext"]
@@ -887,8 +902,8 @@ def test_archived_tag_excluded_from_recall(tmp_home: Path, tmp_vault: Path,
     r = _run(NEUTRAL_CWD, "gradle 构建配置调优")
     d = _parse(r); assert d is not None
     ctx = d["hookSpecificOutput"]["additionalContext"]
-    assert "live.md" in ctx
-    assert "spec-x.md" not in ctx
+    assert "「live」" in ctx
+    assert "「spec-x」" not in ctx           # 统一行只出标题：按 .md 判否定会恒真
 
 
 def test_exclude_note_tags_empty_disables_filter(tmp_home: Path, tmp_vault: Path,
@@ -902,7 +917,7 @@ def test_exclude_note_tags_empty_disables_filter(tmp_home: Path, tmp_vault: Path
     _write_cfg(tmp_home, tmp_vault, relevance={"exclude_note_tags": []})
     r = _run(NEUTRAL_CWD, "gradle 构建配置调优")
     d = _parse(r); assert d is not None
-    assert "spec-x.md" in d["hookSpecificOutput"]["additionalContext"]
+    assert "「spec-x」" in d["hookSpecificOutput"]["additionalContext"]
 
 
 # ---------------------------------------------------------------------------
@@ -939,7 +954,7 @@ def test_use_tag_idf_false_restores_legacy_weight_end_to_end(
     d = _parse(r_off)
     assert d is not None, f"tag-IDF 关闭后应恢复满权重过闸注入，实际无输出（stderr={r_off.stderr}）"
     ac = d["hookSpecificOutput"]["additionalContext"]
-    assert any(f"broad{i}.md" in ac for i in range(100)), ac
+    assert any(f"「broad{i}」" in ac for i in range(100)), ac
 
 
 def test_fallback_cooldown_suppresses_second_hint(tmp_home: Path, tmp_vault: Path,

@@ -7,5 +7,8 @@
     {"id": "ann-00000001", "path": "项目笔记/demo/c.md", "kind": "admitted_list",
      "verdict": "relevant", "session": "<SESSION_UUID>",
      "prompt_h": "0123456789abcdef", "ts": 1791550000}
-  ]
+  ],
+  "settings": {"fine_max_notes": 2},
+  "persist": ["fine_max_notes"],
+  "reads": ["项目笔记/demo/c.md"]
 }

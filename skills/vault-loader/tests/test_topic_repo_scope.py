@@ -106,20 +106,22 @@ def test_topic_saved_at_root_is_readable_from_subdir(tmp_path: Path) -> None:
 
 
 def test_attempt_marker_also_crosses_cwd(tmp_path: Path) -> None:
-    """spawn 门禁也必须跨 cwd 生效，否则换目录会重复拉起付费子进程。
+    """topics entry 也必须跨 cwd 读到，否则换目录会让首轮点名重走一遍、重复拉起付费子进程。
 
-    这是缺陷的**成本面**：`has_recent_topic_attempt` 的 docstring 承诺
+    这是缺陷的**成本面**：1.x 里 `has_recent_topic_attempt` 的 docstring 承诺
     「每个 TTL 窗口最多一次」，按 cwd 隔离时实际粒度是「每个 (cwd, session)
-    窗口最多一次」，该承诺兑现不了。
+    窗口最多一次」，该承诺兑现不了。（2.4.0 起 spawn 门禁不再看本函数、该承诺已退役，
+    这条守卫只钉住 topics entry 按项目根而非 cwd 读取；首轮是否完成走同一条读取路径的
+    `first_round_done`。）
     """
     repo = _mkrepo(tmp_path / "proj")
     sub = repo / "sub"
     sub.mkdir()
 
-    save_session_topic(repo, "sess-1", [])          # 落 in-flight 占位
+    save_session_topic(repo, "sess-1", [])          # 落一条空词表的 entry
 
     assert has_recent_topic_attempt(sub, "sess-1", 24) is True, \
-        "换到子目录后不得再次 spawn（否则每换一个目录就多付一次 haiku）"
+        "换到子目录后必须读到同一条 entry（否则每换一个目录就当首轮没完成、多付一次 haiku）"
 
 
 # --------------- 反方向：跨项目必须隔离 ---------------
@@ -204,8 +206,8 @@ def test_session_capacity_survives_a_day_of_sessions_in_one_repo(
     full-review 抓出的 High：`MAX_TOPIC_SESSIONS = 5` 是按 **per-cwd 文件**定的，
     落点改成按项目根后，同一仓库**一天内**（TTL 默认 24h）跑过的全部会话共享这些
     槽位 —— 不是"同时活跃"的数量，是"24h 内出现过"的数量。实测第 6 个会话把最旧的
-    挤掉，其 `has_recent_topic_attempt` 随之转 False → 重新 spawn 一次付费 haiku，
-    复现的正是本次修复要解决的症状。
+    挤掉，其 `has_recent_topic_attempt` 随之转 False → 重新 spawn 一次付费 haiku（2.4.0 起是
+    `first_round_done` 转 False，下一个过闸轮重新走首轮点名），复现的正是本次修复要解决的症状。
 
     **12 是刻意写死的字面量，不从 MAX_TOPIC_SESSIONS 反算** —— 从常量反算会让
     fixture 随常量同步漂移，那个常量的取值本身就再也测不出来了。12 代表「一天在

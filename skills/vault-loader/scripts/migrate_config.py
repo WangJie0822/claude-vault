@@ -13,6 +13,8 @@
     python migrate_config.py --apply          # 真正执行：备份 + 原子写回清理后的 config
     python migrate_config.py --restore <备份文件路径>   # 从备份还原 config.json（同样先备份当前值）
 
+不带 `--path` 时各动作（含 `--doctor`）操作的都是 hook 实际读取的那份 config，见 `default_config_path`。
+
 安全约束（对应安全评审 S-4/S-5/R11 逐条落实）：
     - 仅 `_config_history.ALLOWLIST_PREFIXES` 四段前缀下的非布尔数值叶子键可能被判定为
       残留；`_config_history.EXCLUDED_KEYS` 命中的 leaf 名任何情况下不删
@@ -53,7 +55,7 @@ from typing import Iterator, Sequence
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts._config_history import ALLOWLIST_PREFIXES, EXCLUDED_KEYS, HISTORICAL_DEFAULTS
-from scripts._config_loader import DEFAULT_CONFIG, _CONFIG_META_KEYS
+from scripts._config_loader import DEFAULT_CONFIG, _CONFIG_META_KEYS, resolve_config_path
 
 # `--restore` 源文件的顶层键白名单：只认 vault-loader 自己的 schema（DEFAULT_CONFIG 顶层键
 # ∪ 内部标记键）。防止把任意 JSON 当备份还原到任意路径。
@@ -63,8 +65,18 @@ ALLOWED_TOP_LEVEL_KEYS = frozenset(DEFAULT_CONFIG) | frozenset(_CONFIG_META_KEYS
 # ── 路径解析 ──────────────────────────────────────────────────────────────
 
 def default_config_path() -> Path:
-    """未显式传 --path 时的默认 config.json 路径（与 _config_loader.load_config 一致）。"""
-    return Path.home() / ".claude" / "skills" / "vault-loader" / "config.json"
+    """未显式传 --path 时操作的 config.json：hook 实际读取的那一份。
+
+    判据只有 `_config_loader.resolve_config_path` 一处（`load_config_ex` 与 config skill 的
+    `config_inventory._config_path` 用的也是它）：canonical `~/.context-vault/config.json` 存在时用它，
+    否则用 legacy `~/.claude/skills/vault-loader/config.json`，两者都没有时为 canonical。
+    1.0 起此前一直固定返回 legacy 路径（2.4.0 full-review DO-H1）：canonical 用户照文档跑 `--restore`
+    会写出一份 hook 不读的 legacy config，工具报「已还原」而实际没有生效；新建的 legacy 文件又让
+    `context_vault.paths.has_legacy_data()` 成立，没有 committed 迁移标记的机器上
+    `use_canonical_namespace()` 随之翻成 False，state 与 metrics 一起切到 legacy 目录；`--doctor`
+    对 canonical 用户报「config 不存在」。
+    """
+    return resolve_config_path()[0]
 
 
 def backup_dir_path() -> Path:
@@ -471,6 +483,14 @@ def _do_doctor(config_path: Path) -> int:
         print(f"  display.user_visible: {display.get('user_visible', True)}")
     print(f"  metrics.enabled      = {merged['metrics']['enabled']}")
     print(f"  metrics.retention_days = {merged['metrics']['retention_days']}")
+    # 2.4.0 起默认不自动注入全文，主模型按注入行里的路径按需 Read。这里只给写法、不打印路径原文
+    #（同上：doctor 的输出会被贴进 issue）
+    print("  按需读取笔记     : 想免确认读取，在 settings.json 的 permissions.allow 加")
+    print("                     Read(//<vault 绝对路径>/**/*.md)；不建议用 additionalDirectories（会放开整个目录）。")
+    print("                     deny 再加同前缀的 Read(//<vault 绝对路径>/.git/**) 与 Read(//<vault 绝对路径>/.obsidian/**)。")
+    print("                     `//` 之后是去掉开头 `/` 的绝对路径：POSIX 例（vault 在 /srv/notes/vault）Read(//srv/notes/vault/**/*.md)，")
+    print("                     Windows 例 Read(//d/Notes/Vault/**/*.md)（盘符小写、去冒号）。")
+    print("                     写法见 README「按需全文与读取权限」。")
 
     return 0
 
@@ -482,7 +502,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--path", type=Path, default=None,
-        help="config.json 路径（默认 ~/.claude/skills/vault-loader/config.json）",
+        help="config.json 路径（默认取 hook 实际读取的那份：~/.context-vault/config.json 存在时用它，"
+             "否则 ~/.claude/skills/vault-loader/config.json）",
     )
     # --apply 与 --restore 语义互斥（一个清残留、一个整份覆盖回滚），此前 --restore
     # 静默胜出、同时传两个不会有任何提示；交给 argparse 直接报 usage 错误。

@@ -59,6 +59,7 @@ try:
     from scripts._config_loader import load_config_ex, compare_vault_paths
     from scripts._frontmatter_reader import load_cache_status
     from scripts._output import emit, approx_size_str, sanitize_injected_text, INJECTION_NOTICE
+    from scripts._inject_format import PATH_NOTE, note_line
     from scripts._scorer import is_archived
     from scripts._vault_init import ensure_vault_if_default
     from scripts._signal_collect import (
@@ -106,6 +107,9 @@ except Exception as _diag_exc:  # noqa: BLE001
 # 摘要清单里单个标题的字符上限。标题来自 cache 的 path 键（不可信），除净化外还需
 # 截断——否则一个超长标题就能把 systemMessage 撑满、把真实信息挤出视野。
 MAX_TITLE_CHARS = 120
+# 拿不到 vault 路径时的占位：一个必然不存在的目录，`resolve_note_path` 对它恒返回 None，统一行于是省略
+# 路径字段（与 prompt_submit_load 同一做法；不能用空路径代替，那会按当前目录解析）。
+_NO_VAULT = Path(__file__).resolve().parent / "__no_vault__"
 
 
 def _is_runtime_disabled(home: Path) -> bool:
@@ -167,8 +171,13 @@ def _get_git_toplevel(cwd: Path) -> Path | None:
 
 
 def build_injection_text_ss(cwd, git_top, target_tags, project_notes,
-                            top_worklogs, recent_commits, recent_worklog_days):
-    """组装 SessionStart 注入正文（= 今日非-dry-run stdout 正文，不含尾 \\n）。"""
+                            top_worklogs, recent_commits, recent_worklog_days,
+                            vault_path=None, short_chars: int = 20):
+    """组装 SessionStart 注入正文（= 今日非-dry-run stdout 正文，不含尾 \\n）。
+
+    项目笔记行走统一格式（spec 2026-10-13 §8.1：标题 + 摘要 + 插件生成的绝对路径），小节头后加
+    `PATH_NOTE`；`vault_path` 缺省时省略路径字段。近期工作日志保持裸链接（W1：近期日志照旧）。
+    """
     lines = ["📚 知识库（vault-loader）· 项目固定上下文", ""]
     lines.append(f"当前 cwd: {cwd}")
     if git_top:
@@ -178,14 +187,15 @@ def build_injection_text_ss(cwd, git_top, target_tags, project_notes,
     lines.append("")
     if project_notes:
         lines.append(f"## 项目相关笔记（近期 {len(project_notes)} 篇）")
+        lines.append(PATH_NOTE)
         lines.append("")
+        vp = vault_path if vault_path is not None else _NO_VAULT
         for e in project_notes:
-            summary = sanitize_injected_text(e.summary or "(无摘要)", keep_newlines=False)
-            updated_clean = sanitize_injected_text(e.updated, keep_newlines=False) if e.updated else ""
-            mtime_str = f", {updated_clean}" if updated_clean else ""
-            # F5：path 与 summary 一样源自不可信笔记 frontmatter，wikilink 嵌入点净化控制字符
-            path_clean = sanitize_injected_text(e.path, keep_newlines=False)
-            lines.append(f"- [[{path_clean}]] — {summary}{mtime_str}")
+            # FIX-2：updated 是不可信 frontmatter 字段，折成单行再放进附注；`‖` 换掉，免得伪造路径字段
+            updated_clean = (sanitize_injected_text(e.updated, keep_newlines=False).replace("‖", "|")
+                             if e.updated else "")
+            annot = f"（更新于 {updated_clean}）" if updated_clean else ""
+            lines.append(note_line(e.path, e, vp, short_chars=short_chars, annot=annot))
         lines.append("")
     if top_worklogs:
         lines.append(f"## 近 {recent_worklog_days} 天工作日志")
@@ -271,6 +281,45 @@ def build_summary_ss(project_notes, top_worklogs, recent_commits,
     return "\n".join([head, *body, tail, "💡 /vault <关键词> 展开全文"])
 
 
+def _fine_session_start(session_id: str, source, paths: list) -> None:
+    """spec 2026-10-13 §7（F24）：clear / compact 清空本会话已注入集合与补充队列；会话开始注入的项目笔记
+    写进已注入集合，精排不再把它们当候选。一次条件写，fail-open（锁超时只少记几篇，下一轮照常）。"""
+    if not session_id:
+        return
+    reset = source in ("clear", "compact")
+    if not reset and not paths:
+        return
+    try:
+        from scripts import _fine_state
+
+        def mutate(st):
+            if reset:
+                st.injected = []
+                st.supp = None
+            inj = [p for p in (st.injected or []) if isinstance(p, str)]
+            for p in paths:
+                if isinstance(p, str) and p and p not in inj:
+                    inj.append(p)
+            st.injected = inj[-_fine_state.MAX_INJECTED:]
+            return st
+
+        _fine_state.update_fine(session_id, mutate)
+    except Exception as exc:  # noqa: BLE001
+        _report_nonfatal("精排状态写入失败", exc)
+
+
+def _cleanup_fine(config: dict) -> None:
+    """清理过期的 fine 状态、在飞标记与机器槽位（spec §7）。与 `cleanup_live` 同属会话开始的无条件
+    清理，但落点依赖命名空间，所以由调用方放在 configure_context 之后。fail-open。"""
+    try:
+        from scripts import _fine_state
+        ttl = (config.get("user_prompt_submit", {}) or {}).get("state_ttl_hours", 24)
+        ok = isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl > 0
+        _fine_state.cleanup_fine(float(ttl) if ok else 24.0)
+    except Exception as exc:  # noqa: BLE001
+        _report_nonfatal("精排状态清理失败", exc)
+
+
 def _check_vault_path_mismatch(config: dict, home: Path, config_fell_back: bool) -> None:
     """跨 skill vault 路径一致性自检 → 诊断通道。全程 fail-open。"""
     try:
@@ -345,11 +394,23 @@ def main() -> int:
                 _report_nonfatal("会话快照写入失败", exc)
 
 
+def _read_hook_stdin() -> str:
+    """hook 输入按字节读、按 UTF-8 解码，与 `prompt_submit_load._read_hook_stdin` 相同（2.4.0 BP-H1）。
+
+    文本模式的 `sys.stdin` 按 locale 解码：中文 Windows 默认是 GBK，含中文的 `cwd` 会被解成乱码，项目目录信号
+    随之失效。没有字节层的流（测试换上的 `io.StringIO`）本来就是文本，原样读。
+    """
+    buf = getattr(sys.stdin, "buffer", None)
+    if buf is None:
+        return sys.stdin.read()
+    return buf.read().decode("utf-8", errors="replace")
+
+
 def _main_impl() -> int:
     home = Path.home()
 
     try:
-        hook_input = json.loads(sys.stdin.read() or "{}")
+        hook_input = json.loads(_read_hook_stdin() or "{}")
     except json.JSONDecodeError:
         hook_input = {}
 
@@ -400,14 +461,16 @@ def _main_impl() -> int:
             configure_context(hook_context.runtime.value, hook_context.session_id)
         except Exception as exc:
             print(f"[vault-loader] state namespace 配置失败：{exc}", file=sys.stderr)
+    _cleanup_fine(config)
     if not config.get("enabled", True):
         return 0
     if hook_context is not None and not config.get("runtimes", {}).get(
         hook_context.runtime.value, {}
     ).get("enabled", True):
         return 0
-    if not config.get("session_start", {}).get("enabled", True):
-        return 0
+    # 只关了会话开始的注入：不在这里早退，照常走下面 opt_out、项目 CLAUDE.md disable 两道停用闸门
+    # （命中就 return 0、什么都不写），闸门之后再处理 ss_off。
+    ss_off = not config.get("session_start", {}).get("enabled", True)
     if _is_opt_out_path(cwd, config.get("opt_out_paths", [])):
         return 0
 
@@ -419,6 +482,18 @@ def _main_impl() -> int:
     project_root = git_top or cwd
     i_result = collect_signal_i_project_claude_md(project_root)
     if i_result.disabled:
+        return 0
+
+    if ss_off:
+        # UPS 仍在工作：clear / compact 后对话上下文已清空，已注入集合与补充队列也要清，否则之前注入过的篇
+        # 会被永远当成「已注入」。只重置、不写路径；dry_run「预览、不落盘」不调；旧插件仍启用时本入口让路，
+        # 同样不写。位置的两条约束：① 在三道停用闸门（opt_out、项目 CLAUDE.md disable、legacy_enabled）
+        # 之后——停用闸门先于一切副作用，早于它们会在停用目录里写出状态文件；② 在 claim_event 之前——
+        # ss 关的用户一直不走事件去重（不落事件 marker），保持原行为。重复事件在这里重置两次是幂等的：
+        # paths=[] 且本分支不注入，没有开场注入篇可清。先于下面的 legacy 暂停提示 return，
+        # ss 关的用户不会多出那条提示。
+        if not legacy_enabled and not config.get("dry_run", False):
+            _fine_session_start(hook_input.get("session_id", "") or "", hook_input.get("source"), [])
         return 0
 
     if legacy_enabled and hook_context is not None:
@@ -531,6 +606,11 @@ def _main_impl() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"[vault-loader] 会话快照填充失败：{exc}", file=sys.stderr)
 
+    # 本会话精排状态（F24）：dry_run「预览、不落盘」，不写
+    if not config.get("dry_run", False):
+        _fine_session_start(hook_input.get("session_id", "") or "", hook_input.get("source"),
+                            [e.path for e in project_notes])
+
     top_worklogs = worklog_result.paths[: ss_cfg["max_recent_worklogs"]]
 
     # 三组全空才静默
@@ -549,6 +629,8 @@ def _main_impl() -> int:
     injection_text = build_injection_text_ss(
         cwd, git_top, target_tags, project_notes,
         top_worklogs, recent_commits, ss_cfg["recent_worklog_days"],
+        vault_path=vault_path,
+        short_chars=config.get("relevance", {}).get("short_summary_chars", 20),
     )
     summary = (build_summary_ss(project_notes, top_worklogs, recent_commits,
                                 project_paths, target_tags, injection_text, display_cfg)

@@ -13,6 +13,7 @@ This file is the resident project guidance for Claude Code; detailed rule bodies
 |---|---|
 | Hook 管线与 runtime | `.claude/rules/hooks-runtime.md` |
 | vault-loader 注入、打分、主题词与配置表 | `.claude/rules/vault-loader.md` |
+| 精排（逐轮补充） | `.claude/rules/fine-rank.md` |
 | mod（注入可见与可控） | `.claude/rules/mod.md` |
 | metrics | `.claude/rules/metrics.md` |
 | summarize-session | `.claude/rules/summarize-session.md` |
@@ -47,7 +48,7 @@ This file is the resident project guidance for Claude Code; detailed rule bodies
 - **vault-loader**（读端，只读）——通过 hook 把相关笔记自动注入会话上下文。
 - **vault**（手动检索）——会话中按关键词 / 分类 / 标签调取笔记。
 
-第四个 skill **config** 不在这个闭环里，是**运维入口**：把全部可配项连同「当前值 / 默认值 / 是否被显式设置 / 这一项干什么」列出来，并在确认后安全改写 `config.json`。读端**只读**（`load_config()` 在文件缺失时会写占位，读端因此只 `json.loads` 原始文件）；写端的安全边界**继承自 `migrate_config.py`**（重定向守卫、独立目录备份、原子写、restore），不重新发明。首版三处只读：`work_log_dir` / `obsidian_cli.*`（不在 `DEFAULT_CONFIG`、无类型判据，且后者只认 canonical 会与路径解析分叉）、三处逃生阀（用户开它们时往往正因插件出了问题，让插件自己去改失败方向不对称）。三个 `session_topic_*` 是**隐私旋钮**（控制每会话外发多少篇给外部模型），类型校验对它们全放行，故改动需显式确认。
+第四个 skill **config** 不在这个闭环里，是**运维入口**：列出全部可配项（当前值 / 默认值 / 是否显式设置 / 作用），确认后安全改写 `config.json`；读端只 `json.loads` 原始文件（`load_config()` 缺文件时会写占位），写端的安全边界继承自 `migrate_config.py`、不重新发明。只读项（`work_log_dir`、`obsidian_cli.*`、三处逃生阀）与需显式确认的隐私旋钮（`PRIVACY_KNOBS`，类型校验对它们全放行）的理由见 `skills/config/SKILL.md`。
 
 **核心数据契约**：`<vault>/.meta/frontmatter-cache.json` 是写端（summarize-session 的 `rebuild_index.py`）与读端（vault-loader 的 `load_cache`）之间的唯一接口。读端 `load_cache` 校验 `_version`，不匹配返回空索引——改一端的 cache schema 必须同步另一端。笔记 frontmatter 的 `keywords`（检索扩展词）经此 cache 流到读端 scorer，是**可选增量字段**——新增它**不**触发 `_version` 变更（读端缺失默认空、双向兼容）。
 
@@ -73,13 +74,17 @@ Read 到匹配文件时 rules 会自动注入；上下文里已出现该 rules �
 ### vault-loader 注入、打分、主题词与配置表
 
 - 注入正文恒带 `INJECTION_NOTICE` 隔离声明。SessionStart 注入确定性的项目固定上下文（不打分）；UserPromptSubmit 按 prompt 关键词打分取 Top N。信号 D 已无生产调用方，勿误以为生效。ASCII 关键词走词边界匹配、含 CJK 的走子串匹配；改 `scoring` 权重须同步调阈值。
-- 会话主题词按项目根隔离（`_repo_root` 纯 stat 向上找，判据是「像不像 git 仓库」，不解析 `.git` 文件里的路径），与注入去重分属两个文件；`state_path_for_cwd` 勿顺手对齐成项目根。大小保证在 `TOPIC_TRIM_BYTES` 字节裁剪，守卫必须用宽字符，`_encoded_size` 连行尾一起对齐写端。不做全局单文件或按 session_id 存；不做「读不到就回退旧位置」；ts 只经 `_valid_ts` 判有效，淘汰不动本会话。
+- 会话主题词按项目根隔离（`_repo_root` 纯 stat，判「像不像 git 仓库」，不解析 `.git` 文件里的路径），与注入去重分属两个文件，`state_path_for_cwd` 勿对齐成项目根；大小保证在 `TOPIC_TRIM_BYTES` 字节裁剪（守卫用宽字符，`_encoded_size` 连行尾对齐写端）；不做全局单文件或按 session_id 存，不做读不到就回退旧位置；ts 只经 `_valid_ts` 判有效，淘汰不动本会话。
 - `lease_lock` 在 Windows 上遇 delete-pending 抛的 `PermissionError` 要重试，POSIX 上原样抛出；2s 租约在极端争用下仍可能 `TimeoutError`（未处理）。
 - session pin：点名上限写读两侧共用单点 `_topic.effective_pin_max`；对账标记只在 metrics flush 成功后、且只在 admitted 非空的轮次翻；`_KIND_HIT` / `_KIND_BUCKET` 必须全覆盖 `KINDS`，别写 `else` 或 `not in (...)` 排除法；索引排除判据单点 `is_system_index_name`。
 - slash 跳过闸门必须在信号 J 之前；命令名解析与剥离共用「到第一个空白为止」的切分口径；`<command-name>` 包裹形态用 `match` 锚定开头，不用 `search`；名单的类型归一不能省（配成字符串会逐字符迭代）；只对 UPS 收到 `/cmd` 原文的命令生效。
 - 停用逃生阀有四种：环境变量、文件、config、项目 CLAUDE.md 注释。
 - 配置表是机器契约：`skills/vault-loader/SKILL.md` 锚点内，每个 `DEFAULT_CONFIG` 叶子键必须有一行表格；锚点缺失时守卫抛错，不回落全文；废弃键走显式豁免清单 `_EXEMPT`。
 - 改 `_signal_collect.py`、`_scorer.py`、`_decision.py`、`_state.py`、`_topic.py`、`_candidate_pool.py`、`context_vault/atomic.py`、配置项或配置表前先 Read `.claude/rules/vault-loader.md`；pin 与 slash 的接线在 `prompt_submit_load.py`，读它时自动加载的是 hooks-runtime 与 metrics，改那部分也要先 Read 本组正文。
+
+### 精排（逐轮补充）
+
+- fine 状态只存计数、序号、路径与会话设置，不存 prompt 与目录；UPS 每轮的写回只在 `_fine_flow.finish_turn` 一处（子进程写结局与补充、SessionStart 写重置，各有字段）；spawn 门禁不读 topics 的 `state`；精排配置只经 `_fine_config` 读。改 `_fine_*.py`、`_inject_format.py`、`_session_ops.py` 或精排接线前先 Read `.claude/rules/fine-rank.md`。
 
 ### mod（注入可见与可控）
 
@@ -97,7 +102,7 @@ Read 到匹配文件时 rules 会自动注入；上下文里已出现该 rules �
 
 ### summarize-session
 
-skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模式：正常 / `-f`（强制，跳确认）/ `--catch-up` / `--quick` / `--summaries`。Vault 内资源优先经 `scripts/obsidian_cli.py` 封装，Obsidian CLI 不可用时降级文件 I/O。
+skill 驱动（`SKILL.md` 即编排逻辑，模式见其参数表），辅以 `scripts/` 下脚本；Vault 内资源优先经 `scripts/obsidian_cli.py`，不可用时降级文件 I/O。
 
 - 勿恢复 `git_commit_vault` 里的 `is_system_index` 放行分支（2026-09-07 已移除；它会在点目录排除之前抢先放行工具目录里的同名文件）；纳入判据是排除法、只看顶层段；只 commit 不 push。
 - keywords / 摘要写期唯一实现：`sanitize_keywords` / `sanitize_summary`；`--set`、`--set-file` 须同步 cache；缺口复用 `_health_check`；`enrich_*` 付费 opt-in。
@@ -105,10 +110,9 @@ skill 驱动（`SKILL.md` 即编排逻辑），辅以 `scripts/` 下脚本。模
 
 ### 测试
 
-- 测试不得继承 `GIT_*`：四个 pytest 根的 conftest 在 `pytest_configure` 剥离（大小写不敏感），由 git 派生的子进程（如 `rebase -x`）里跑测试也要先剥离。
+- 测试不得继承 `GIT_*`：各 pytest 根 conftest 在 `pytest_configure` 剥离（大小写不敏感），git 派生子进程（如 `rebase -x`）里也要剥离；编码守卫子进程删 `PYTHONUTF8`、设 `PYTHONIOENCODING=gbk`。
 - 测试不得写真实 HOME：vault-loader 与 config 两个根由 conftest 的 autouse fixture 无条件隔离；`tests/` 与 summarize-session 根没有该 fixture，需在用例内 monkeypatch HOME 与 `USERPROFILE`（Windows 上 `Path.home()` 取后者）。
-- 判定性能回归或「有无回归」须 median-of-N 加 A/B 交替，不靠单次 pass/fail；把失败归为「环境性」必须逐条拿到该条自己的报错原文；修法不是让用例跳过，而是显式声明测哪个平台分支。
-- 变异不转红先查方法（结果解析、用例是否绕过被测层、对照组形态），再做阳性对照；变异转红也要核对原因（不合法的变异会以 `NameError` 假转红）；手工构造被测对象的用例，要补一条从真实产出喂入的端到端用例；容量类守卫要锁绝对下界。
+- 性能与「有无回归」用 median-of-N 加 A/B 交替判；「环境性失败」逐条拿该条报错原文，用例显式声明平台分支而不是跳过；变异不转红先查方法再做阳性对照，转红也核原因；手工构造被测对象的用例补一条真实产出的端到端用例；容量守卫锁绝对下界。
 - 本仓库 Python 代码最低兼容 **3.9**（README「跨平台」节），由 `tests/test_python_floor.py` 做 best-effort 静态检查；标注之外的 `X | Y` 有 future import 也不可用；新写法过不了守卫时改写法，不要放宽守卫。
 - 写测试或排查失败前先 Read `.claude/rules/testing.md`。
 

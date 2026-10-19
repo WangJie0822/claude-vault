@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+from ._note_paths import safe_rel_note_path
 
 MAX_CACHE_BYTES = 10 * 1024 * 1024  # 10 MB 上限，超出视为异常膨胀
 CACHE_VERSION = 1  # 与写端（rebuild_index）保持对称；版本不符时静默丢弃旧 cache
@@ -22,6 +25,50 @@ MAX_TAG_CHARS = 128
 # 一两句话、path 是 Vault 内相对路径，这两个值是宽松余量而非贴身裁剪。
 MAX_SUMMARY_CHARS = 4096
 MAX_PATH_CHARS = 1024
+# 标量 tags（`tags: a, b` / `tags: a b`）的切分口径：逗号或空白
+_TAG_SPLIT_RE = re.compile(r"[,\s]+")
+# 写端（rebuild_index.FM_TRUNCATED_KEY）读满上限仍没见到 frontmatter 闭合行时在 entry 上记的可选键。
+# 那篇的 tags 可能在读取窗口之外，按 tag 判不全处理（2.4.0 full-review D-M1）。键缺失等于没有，
+# 不动 `_version`；两端同名由仓库根 `tests/test_private_tag_outbound_e2e.py` 从真实写端跑起钉住。
+FM_TRUNCATED_KEY = "fm_truncated"
+
+
+def normalize_tags(raw: object) -> "tuple[tuple[str, ...], bool]":
+    """cache 里的原始 tags → (归一后的 tags, 这篇的 tag 集合是否判不全)。
+
+    归一：str 按逗号或空白切开（写端把 `tags: private` / `tags: a, b` 存成字符串）；list 逐项取 str；
+    每个 tag 去首尾空白、去前导 `#`（`#private` 与 `private` 是同一个 tag），丢弃空串。归一在条数与
+    长度上限**之前**做——先截断后归一会让 `#` 前缀、空项把有效 tag 挤出窗口。
+
+    第二个返回值为 True 的三种情形：原始值存在但既不是 str 也不是 list（dict、数字、bool）；list 里
+    有非 str 项；有项因 `MAX_TAG_CHARS`（按原始项判）或 `MAX_TAGS_PER_ENTRY` 被丢掉。调用方
+    `load_cache_status` 另在 entry 带 `FM_TRUNCATED_KEY` 时置真（写端没读全 frontmatter）。这几种情形下排除判定
+    看到的 tag 不完整（被丢掉的可能正是 `private`），精排的外发通路据此 fail-closed（`_fine_input`）；
+    粗排不看它，行为与此前相同（2.4.0 full-review S-H1）。原始值缺失或为 null 算「没有 tag」，不算判不全。
+    """
+    if raw is None:
+        return (), False
+    unknown = False
+    if isinstance(raw, str):
+        items = _TAG_SPLIT_RE.split(raw)
+    elif isinstance(raw, list):
+        items = [t for t in raw if isinstance(t, str)]
+        unknown = len(items) != len(raw)
+    else:
+        return (), True
+    out = []
+    for t in items:
+        # 长度按原始项判（与 2.4.0 之前同口径）：按归一后判时，一个超长但大半是 `#` / 空白的项会挤进条数
+        # 窗口、把此前留在窗口内的 tag（如 archived）推出去，粗排的排除反而放宽
+        if len(t) > MAX_TAG_CHARS:
+            unknown = True
+            continue
+        t = t.strip().lstrip("#").strip()
+        if t:
+            out.append(t)
+    if len(out) > MAX_TAGS_PER_ENTRY:
+        unknown = True
+    return tuple(out[:MAX_TAGS_PER_ENTRY]), unknown
 
 
 @dataclass(frozen=True)
@@ -34,6 +81,12 @@ class Entry:
     mtime: int = 0
     updated: str = ""
     keywords: tuple[str, ...] = field(default_factory=tuple)
+    # cache 的 category 可以是列表；这里按写端 `_summary._as_list` 的口径展开（列表逐项 str()、
+    # 非空字符串成单元素、其它为空）。`category` 保持原样不动——它是既有字段，改语义会波及消费方。
+    # 工作日志判据 `_candidate_pool.is_worklog` 读它（spec 2.4.0 W1，与写端由根目录对拍用例钉住）。
+    categories: tuple[str, ...] = field(default_factory=tuple)
+    # tag 集合判不全（见 `normalize_tags`）：精排外发通路对它 fail-closed，粗排不读
+    tags_unknown: bool = False
 
 
 class CacheStatus(str, Enum):
@@ -138,19 +191,19 @@ def load_cache_status(vault_path: Path) -> tuple[dict[str, Entry], CacheStatus]:
                 if not isinstance(meta, dict):
                     skipped += 1
                     continue
-                if not isinstance(path, str) or len(path) > MAX_PATH_CHARS:
+                # 键在入口处按纯字符串判据拒收（spec 2.4.0 §8.3）：下游注入、精排目录层与补充投递
+                # 拿到的键恒可安全拼到 vault 下，且判据先于任何文件系统调用。
+                if (not isinstance(path, str) or len(path) > MAX_PATH_CHARS
+                        or not safe_rel_note_path(path)):
                     skipped += 1
                     continue
-                # tags 必须是 list：写成标量字符串时 `or []` 保留原值，
-                # `tuple(t for t in "foo")` 会逐字符迭代出 ('f','o','o') 三个假 tag。
-                # 假 tag 会进 build_tag_df 参与 IDF 统计，而 tag-IDF 加权正是 0.5.0 的
-                # 核心特性——每个只出现一次的单字符 tag 会被当成高信息量精确信号。
-                # 与下面 kw_raw 的守卫对称（那侧本就有，这侧此前漏了）。
-                tags_raw = meta.get("tags")
-                if not isinstance(tags_raw, list):
-                    tags_raw = []
-                tags = tuple(t for t in tags_raw
-                             if isinstance(t, str) and len(t) <= MAX_TAG_CHARS)[:MAX_TAGS_PER_ENTRY]
+                # tags 不得逐字符迭代：`tuple(t for t in "foo")` 会造出 ('f','o','o') 三个假 tag，
+                # 进 build_tag_df 被当成高信息量的精确信号（0.5.0 的 tag-IDF 加权）。2.4.0 起标量按
+                # 逗号或空白切开、不再整个丢弃：写端把 `tags: private` 存成字符串，丢弃它会让 private
+                # 排除失效（full-review S-H1）。
+                tags, tags_unknown = normalize_tags(meta.get("tags"))
+                if meta.get(FM_TRUNCATED_KEY):
+                    tags_unknown = True
                 kw_raw = meta.get("keywords")
                 if not isinstance(kw_raw, list):
                     kw_raw = []
@@ -158,9 +211,18 @@ def load_cache_status(vault_path: Path) -> tuple[dict[str, Entry], CacheStatus]:
                     k for k in kw_raw
                     if isinstance(k, str) and len(k.strip()) >= 2
                 )[:MAX_KEYWORDS_PER_ENTRY]
+                cat_raw = meta.get("category")
+                if isinstance(cat_raw, list):
+                    categories = tuple(str(c)[:MAX_TAG_CHARS] for c in cat_raw[:MAX_TAGS_PER_ENTRY])
+                elif isinstance(cat_raw, str) and cat_raw:
+                    categories = (cat_raw[:MAX_TAG_CHARS],)
+                else:
+                    categories = ()
                 result[path] = Entry(
                     path=path,
+                    categories=categories,
                     tags=tags,
+                    tags_unknown=tags_unknown,
                     category=str(meta.get("category", ""))[:MAX_SUMMARY_CHARS],
                     summary=str(meta.get("summary", ""))[:MAX_SUMMARY_CHARS],
                     mtime=_coerce_mtime(meta.get("mtime")),

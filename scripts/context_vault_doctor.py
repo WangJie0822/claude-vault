@@ -99,4 +99,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # 输出含 HOME 下的路径（ensure_ascii=False）：控制台编码不是 UTF-8 时（中文 Windows 默认 GBK），GBK 之外的
+    # 字符会让 print 崩（2.4.0 编码一族，同 skills 下各 CLI）
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 — 被替换成不支持 reconfigure 的流时保持原样
+            pass
     raise SystemExit(main())

@@ -73,13 +73,35 @@ def _keyword_hits_entry(keyword: str, entry: Entry) -> bool:
     return False
 
 
-def is_archived(entry: Entry, exclude_tags: set[str]) -> bool:
-    """笔记是否命中排除 tag（archived 等，大小写不敏感）。第1层召回池过滤单点，
-    供 prompt_submit_load(UPS) / session_start_load(SessionStart) / 回归 gold 集共用，
-    避免过滤逻辑三处漂移。exclude_tags 应为已 lower 的 set；空 set → 恒 False。"""
+def tag_key(t: str) -> str:
+    """tag 的比较口径：去首尾空白、去前导 `#`、小写（`#X` 与 `x` 视为同一个 tag）。"""
+    return t.strip().lstrip("#").strip().lower()
+
+
+@lru_cache(maxsize=64)
+def _exclude_keys(tags: frozenset) -> "tuple[frozenset, tuple]":
+    keys = frozenset(k for k in (tag_key(x) for x in tags if isinstance(x, str)) if k)
+    return keys, tuple(k + "/" for k in keys)
+
+
+def is_archived(entry: Entry, exclude_tags) -> bool:
+    """笔记是否命中排除 tag（archived、private 等）。第1层召回池过滤单点，
+    供 prompt_submit_load(UPS) / session_start_load(SessionStart) / 精排外发（`_fine_input`）/ 回归 gold 集
+    共用，避免过滤逻辑多处漂移。
+
+    两侧都按 `tag_key` 比（大小写不敏感、忽略前导 `#`），并认嵌套 tag：`private/journal` 命中 `private`，
+    `privatestuff` 不命中。2.4.0 之前只做精确匹配，`#private`、`private/journal` 都漏（full-review S-H1）。
+    空集合（或只含空串）→ 恒 False。"""
     if not exclude_tags:
         return False
-    return any(t.lower() in exclude_tags for t in entry.tags)
+    keys, prefixes = _exclude_keys(frozenset(exclude_tags))
+    if not keys:
+        return False
+    for t in entry.tags:
+        k = tag_key(t)
+        if k in keys or k.startswith(prefixes):
+            return True
+    return False
 
 
 def _keyword_hits_tags(keyword: str, entry: Entry) -> bool:

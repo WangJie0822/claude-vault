@@ -20,7 +20,21 @@
   "metrics_on": true,
   "prompt_h": "0123456789abcdef",
   "llm": {"state": "ok", "fail": null, "words": ["设计"], "in_scoring": 1, "n_pinned": 1,
-          "age_s": 30, "pin_on": true, "stale_pins": false},
+          "age_s": 30, "pin_on": true, "stale_pins": false, "mode": "pin", "fail_streak": 0,
+          "calls": 1, "disabled": null},
   "thresholds": {"min_topical": 4, "ft_topical": 6, "topic_hit_weight": 2},
-  "ts": 1800000000
+  "ts": 1800000000,
+  "supps": [{"path": "项目笔记/demo/f.md", "title": "f", "src_seq": 3, "recheck": "passed",
+             "rendered": true}],
+  "settings": {"effective": {"coarse_inject": true, "fine_rank": true, "fine_supplement": true,
+                             "auto_fulltext": false, "user_prompt_submit.max_notes": 3,
+                             "fine_pin_max": 1, "fine_max_notes": 3, "fine_model": "haiku"},
+               "session": {},
+               "locked": [],
+               "source": {"coarse_inject": "default", "fine_rank": "default",
+                          "fine_supplement": "default", "auto_fulltext": "default",
+                          "user_prompt_submit.max_notes": "default", "fine_pin_max": "default",
+                          "fine_max_notes": "default", "fine_model": "default"}},
+  "persisted": ["fine_max_notes"],
+  "vault_root": "/home/u/vault"
 }

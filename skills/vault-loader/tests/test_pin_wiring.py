@@ -81,36 +81,36 @@ def vault_with_project(tmp_home, tmp_vault, write_frontmatter_cache):
     return tmp_vault
 
 
-def test_pool_includes_project_notes_and_spawn_gate_unchanged(monkeypatch, tmp_path, vault_with_project):
+def test_first_round_spawn_payload(monkeypatch, tmp_path, vault_with_project):
+    """候选池改在子进程里构造（spec 2026-10-13 §6.3），父进程只交本轮输入；首轮点名尚未成功 ⇒ pin 模式。"""
     cwd = _mkrepo(tmp_path / "cv")
     calls = []
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: calls.append(a) or True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda cwd, sid, payload: calls.append(payload) or "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明")
     assert len(calls) == 1
-    cands = calls[0][3]
-    paths = [p for p, _ in cands]
-    assert paths[0] == "笔记/配额.md"                       # admitted 在前
-    assert "项目笔记/cv/p1.md" in paths and "项目笔记/cv/p2.md" in paths
-    assert paths.index("项目笔记/cv/p1.md") < paths.index("项目笔记/cv/p2.md")   # mtime 降序
-    assert "项目笔记/cv/INDEX.md" not in paths
+    p = calls[0]
+    assert p["mode"] == "pin" and p["cfg"]["pin_max"] == 1
+    assert "笔记/配额.md" in p["injected"]              # 本轮粗排展示篇随 injected 交给子进程排除
+    assert p["extra_paths"] == []
 
 
-def test_no_spawn_when_admitted_empty_even_if_project_notes_exist(monkeypatch, tmp_path, vault_with_project):
-    """reverse H：门禁必须仍是 admitted 非空，否则无匹配的开场 prompt 会把 pinned 锁定 24h。"""
+def test_pin_spawn_does_not_require_admitted(monkeypatch, tmp_path, vault_with_project):
+    """spec 2026-10-13 §6.1：精排候选不再受粗排过滤（Q8/Q23），门禁是「排除后候选非空」（F62）而不是
+    「admitted 非空」——无匹配的开场提问也发起首轮，模板要求都不相关写 NONE（宁缺毋滥）。"""
     cwd = _mkrepo(tmp_path / "cv")
     calls = []
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: calls.append(a) or True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda cwd, sid, payload: calls.append(payload) or "spawned")
     _run_main(monkeypatch, cwd, "完全 无关 的 提问 词语")
-    assert calls == []
+    assert [p["mode"] for p in calls] == ["pin"]
 
 
-def test_pin_disabled_restores_v121_pool(monkeypatch, tmp_path, vault_with_project):
+def test_pin_disabled_sends_pin_max_zero(monkeypatch, tmp_path, vault_with_project):
+    """`session_pin_enabled: false` ⇒ 子进程走单段模板、不点名（1.2.1 形态）；pin_max 经写读同一单点为 0。"""
     cwd = _mkrepo(tmp_path / "cv")
     calls = []
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: calls.append(a) or True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda cwd, sid, payload: calls.append(payload) or "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"relevance": {"session_pin_enabled": False}})
-    paths = [p for p, _ in calls[0][3]]
-    assert paths == ["笔记/配额.md"]
+    assert calls[0]["cfg"]["pin_max"] == 0
 
 
 def _seed_pinned(cwd: Path, session: str, paths: list[str]):
@@ -121,10 +121,10 @@ def test_pinned_injected_when_admitted_empty(monkeypatch, tmp_path, vault_with_p
     """Critical R1：admitted 为空正是机械召回失效、pinned 价值最高的场景。"""
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p1.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     out = _run_main(monkeypatch, cwd, "完全 无关 的 提问 词语")
     ctx = (out.get("hookSpecificOutput") or {}).get("additionalContext", "")
-    assert "[[项目笔记/cv/p1.md]]" in ctx
+    assert "「p1」" in ctx
     assert psl.PIN_HEADER in ctx
     assert "未匹配到强相关笔记" not in json.dumps(out, ensure_ascii=False)   # 有 pinned 就不出兜底提示
 
@@ -133,11 +133,11 @@ def test_pinned_appended_after_normal_injection_and_deduped(monkeypatch, tmp_pat
     """落盘 2 篇 pinned 须把 `session_pin_max` 配到 2：读端按配置值收口（1B-M-6），默认 1 只会读到首篇。"""
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["笔记/配额.md", "项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     out = _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"relevance": {"session_pin_max": 2}})
     ctx = (out.get("hookSpecificOutput") or {}).get("additionalContext", "")
-    assert ctx.count("[[笔记/配额.md]]") == 1            # 已在机械清单里，pinned 不重复
-    assert "[[项目笔记/cv/p2.md]]" in ctx
+    assert ctx.count("「配额」") == 1             # 已在机械清单里，pinned 不重复
+    assert "「p2」" in ctx
     assert ctx.index(psl.PIN_HEADER) > ctx.index("📚 vault-loader")   # 小节在正文之后
     assert ctx.count(INJECTION_NOTICE.rstrip("\n")) == 1             # 清单头部已有，小节不重复（1A-L7）
 
@@ -147,7 +147,7 @@ def test_pinned_not_in_injected_state(monkeypatch, tmp_path, vault_with_project)
     from scripts._state import load_already_injected
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明")
     assert "项目笔记/cv/p2.md" not in load_already_injected(cwd, 24)
 
@@ -157,10 +157,10 @@ def test_pinned_skipped_when_already_fulltext_injected(monkeypatch, tmp_path, va
     cwd = _mkrepo(tmp_path / "cv")
     save_injected(cwd, ["项目笔记/cv/p2.md"], fulltext_paths=["项目笔记/cv/p2.md"])
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     out = _run_main(monkeypatch, cwd, "配额 上限 说明")
     ctx = (out.get("hookSpecificOutput") or {}).get("additionalContext", "")
-    assert "[[项目笔记/cv/p2.md]]" not in ctx
+    assert "「p2」" not in ctx
 
 
 def test_gate_early_exit_does_not_inject_pinned(monkeypatch, tmp_path, vault_with_project):
@@ -173,7 +173,7 @@ def test_gate_early_exit_does_not_inject_pinned(monkeypatch, tmp_path, vault_wit
 def test_user_summary_mentions_pinned(monkeypatch, tmp_path, vault_with_project):
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     out = _run_main(monkeypatch, cwd, "配额 上限 说明")
     msg = out.get("systemMessage", "")
     assert "📌" in msg and "p2" in msg
@@ -185,7 +185,7 @@ def test_pinned_injected_annotated(monkeypatch, tmp_path, vault_with_project):
     monkeypatch.setattr(_metrics, "annotate", lambda **kw: seen.update(kw))
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"metrics": {"enabled": True}})
     assert seen.get("pinned_injected") == 1
 
@@ -194,7 +194,7 @@ def test_dry_run_pinned_only_round_does_not_inject(monkeypatch, tmp_path, vault_
     """dry_run 契约：admitted 为空只剩 pinned 时也只预览、不落 additionalContext。"""
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p1.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     out = _run_main(monkeypatch, cwd, "完全 无关 的 提问 词语", cfg_extra={"dry_run": True})
     assert "additionalContext" not in json.dumps(out)
     assert "[DRY-RUN]" in out.get("systemMessage", "") and "📌" in out.get("systemMessage", "")
@@ -221,7 +221,7 @@ def test_accounting_happens_once_on_first_pinned_round(monkeypatch, tmp_path, va
     monkeypatch.setattr(_metrics, "annotate", lambda **kw: None)
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     cfg = {"metrics": {"enabled": True}}
     _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra=cfg)
     _run_main(monkeypatch, cwd, "配额 上限 再问", cfg_extra=cfg)
@@ -241,7 +241,7 @@ def test_rank_is_position_in_admitted(monkeypatch, tmp_path, vault_with_project)
     monkeypatch.setattr(_metrics, "annotate", lambda **kw: None)
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["笔记/配额.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"metrics": {"enabled": True}})
     assert staged[0]["llm_pinned_rank"] == [1]
 
@@ -267,8 +267,8 @@ def test_pinned_after_fulltext_fence_and_deduped_against_fulltext_pick(
     })
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["笔记/配额.md", "项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
-    out = _run_main(monkeypatch, cwd, "配额上限说明 详细", cfg_extra={"relevance": {"session_pin_max": 2}})
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
+    out = _run_main(monkeypatch, cwd, "配额上限说明 详细", cfg_extra={"relevance": {"session_pin_max": 2, "auto_fulltext": True}})
     ctx = (out.get("hookSpecificOutput") or {}).get("additionalContext", "")
     if "强命中" not in ctx:
         raise AssertionError(
@@ -276,7 +276,8 @@ def test_pinned_after_fulltext_fence_and_deduped_against_fulltext_pick(
             + ctx[:500])
     assert ctx.index(psl.PIN_HEADER) > ctx.rindex(">>>")   # pinned 小节在 fence 闭合之后
     assert ctx.count("[[笔记/配额.md]]") == 1               # 本轮全文候选自身，去重不重复渲染
-    assert ctx.count("[[项目笔记/cv/p2.md]]") == 1
+    assert "「配额」" not in ctx                      # pinned 小节不重复渲染全文候选
+    assert ctx.count("「p2」") == 1
     # 全文分支的隔离声明在 fence **内**（属于 ft_body），pinned 小节追加在 fence 外、必须自带一份：
     # 最后一次出现须在 fence 闭合之后（清单分支则只有头部那一份，见上一条用例的 count == 1）。
     notice = INJECTION_NOTICE.rstrip("\n")
@@ -303,7 +304,7 @@ def test_rank_two_when_pinned_note_is_second_in_admitted(
     })
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["笔记/配额2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"metrics": {"enabled": True}})
     observed = staged[0]["llm_pinned_rank"]
     if observed != [2]:
@@ -320,7 +321,7 @@ def test_topic_hash_never_contains_plaintext(monkeypatch, tmp_path, vault_with_p
     monkeypatch.setattr(_metrics, "annotate", lambda **kw: None)
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"metrics": {"enabled": True}})
     assert "配额" not in json.dumps(staged[0].get("topic_extracted_h"), ensure_ascii=False)
 
@@ -339,8 +340,9 @@ def test_accounting_marker_not_flipped_when_flush_fails(monkeypatch, tmp_path, v
     monkeypatch.setattr(_metrics, "flush", boom)
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
-    cfg = {"metrics": {"enabled": True}}
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
+    # 第二轮要 admitted 非空才重记：同一篇第一轮已注入，靠 upgrade_candidate 重新放行，2.4.0 起它随自动全文默认关
+    cfg = {"metrics": {"enabled": True}, "relevance": {"auto_fulltext": True}}
     _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra=cfg)
     assert "llm_pinned" in staged[0]
     assert load_pinned_accounted(cwd, "s-pin", 24) is False          # 没落盘就不翻
@@ -359,7 +361,7 @@ def test_accounting_deferred_until_admitted_nonempty(monkeypatch, tmp_path, vaul
     monkeypatch.setattr(_metrics, "annotate", lambda **kw: None)
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     cfg = {"metrics": {"enabled": True}}
     _run_main(monkeypatch, cwd, "完全 无关 的 提问 词语", cfg_extra=cfg)   # admitted 为空、pinned 仍注入
     assert "llm_pinned" not in staged[0]
@@ -387,39 +389,23 @@ def test_llm_pinned_dedup_names_fulltext_injected(monkeypatch, tmp_path, vault_w
     cwd = _mkrepo(tmp_path / "cv")
     save_injected(cwd, ["笔记/配额.md"], fulltext_paths=["笔记/配额.md"])
     _seed_pinned(cwd, "s-pin", ["笔记/配额.md", "项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明",
               cfg_extra={"metrics": {"enabled": True}, "relevance": {"session_pin_max": 2}})
     assert staged[0]["llm_pinned_rank"] == [None, None]
     assert staged[0]["llm_pinned_dedup"] == ["fulltext_injected", None]
 
 
-def test_pool_composition_recorded_on_spawn_round(monkeypatch, tmp_path, vault_with_project):
-    """1B-H-1：候选池构成随记录落盘——fixture 里 admitted 1 篇 + 项目笔记 2 篇（INDEX 排除）。
-    关掉 pin 时池回落纯 admitted：n_pool_proj 恒 0 且 pin_on=False 说明为什么。"""
+def test_pool_fields_no_longer_recorded(monkeypatch, tmp_path, vault_with_project):
+    """候选池构成改由子进程统计回报（n_summary_layer / n_catalog），父进程记录不再落 n_pool / n_pool_proj。"""
     from scripts import _metrics
     staged = []
     monkeypatch.setattr(_metrics, "stage", lambda rec: staged.append(rec))
     monkeypatch.setattr(_metrics, "annotate", lambda **kw: None)
     cwd = _mkrepo(tmp_path / "cv")
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"metrics": {"enabled": True}})
     assert staged[0]["pin_on"] is True
-    assert staged[0]["n_pool"] == 3 and staged[0]["n_pool_proj"] == 2
-    _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"relevance": {"session_pin_enabled": False}})
-    assert staged[1]["pin_on"] is False
-    assert staged[1]["n_pool"] == 1 and "n_pool_proj" not in staged[1]   # 关着时不算项目片，不落键（A-M1）
-
-
-def test_pool_fields_absent_when_no_spawn(monkeypatch, tmp_path, vault_with_project):
-    """没送出提炼的轮次不得落 n_pool（否则「池为 0」会被读成组件 A 退化）。"""
-    from scripts import _metrics
-    staged = []
-    monkeypatch.setattr(_metrics, "stage", lambda rec: staged.append(rec))
-    monkeypatch.setattr(_metrics, "annotate", lambda **kw: None)
-    cwd = _mkrepo(tmp_path / "cv")
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
-    _run_main(monkeypatch, cwd, "完全 无关 的 提问 词语", cfg_extra={"metrics": {"enabled": True}})
     assert "n_pool" not in staged[0] and "n_pool_proj" not in staged[0]
 
 
@@ -429,7 +415,7 @@ def test_pinned_injected_recorded_on_every_scored_round_not_on_gate(monkeypatch,
     seen = []
     monkeypatch.setattr(_metrics, "annotate", lambda **kw: seen.append(dict(kw)))
     cwd = _mkrepo(tmp_path / "cv")
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
 
     def _pinned_vals():
         return [d["pinned_injected"] for d in seen if "pinned_injected" in d]
@@ -460,30 +446,10 @@ def test_read_side_clamp_drops_extra_pins_under_default_config(monkeypatch, tmp_
     """1B-M-6 接线：文件里 2 篇、配置默认 `session_pin_max=1` ⇒ 只注入首篇。变异：读端不传 pin_max 即红。"""
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p1.md", "项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     out = _run_main(monkeypatch, cwd, "完全 无关 的 提问 词语")
     ctx = (out.get("hookSpecificOutput") or {}).get("additionalContext", "")
-    assert "[[项目笔记/cv/p1.md]]" in ctx and "[[项目笔记/cv/p2.md]]" not in ctx
-
-
-def test_pool_project_share_counts_admitted_project_notes_too(monkeypatch, tmp_path, vault_with_project,
-                                                              write_frontmatter_cache):
-    """post-review A-M1 路径二：既是项目笔记又已 admitted 的篇也算项目片——它同样证明前缀解析是对的。
-    q.md 命中「配额」进 admitted，p1/p2 走项目片：池 3 篇、项目归属 3 篇（按补集数只会得 2）。"""
-    from scripts import _metrics
-    staged = []
-    monkeypatch.setattr(_metrics, "stage", lambda rec: staged.append(rec))
-    monkeypatch.setattr(_metrics, "annotate", lambda **kw: None)
-    write_frontmatter_cache({
-        "项目笔记/cv/q.md": {"tags": ["配额"], "summary": "配额上限说明", "mtime": 100, "keywords": ["配额"]},
-        "项目笔记/cv/p1.md": {"tags": [], "summary": "项目笔记一", "mtime": 300, "keywords": []},
-        "项目笔记/cv/p2.md": {"tags": [], "summary": "项目笔记二", "mtime": 200, "keywords": []},
-        "项目笔记/cv/INDEX.md": {"tags": [], "summary": "索引", "mtime": 999, "keywords": []},
-    })
-    cwd = _mkrepo(tmp_path / "cv")
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
-    _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"metrics": {"enabled": True}})
-    assert staged[0]["n_pool"] == 3 and staged[0]["n_pool_proj"] == 3
+    assert "「p1」" in ctx and "「p2」" not in ctx
 
 
 def test_accounting_marker_not_flipped_on_metrics_stub_path(monkeypatch, tmp_path, vault_with_project):
@@ -537,6 +503,6 @@ def test_accounting_marker_not_flipped_on_metrics_stub_path(monkeypatch, tmp_pat
     monkeypatch.setattr(psl, "_metrics", _Stub())
     cwd = _mkrepo(tmp_path / "cv")
     _seed_pinned(cwd, "s-pin", ["项目笔记/cv/p2.md"])
-    monkeypatch.setattr(psl, "spawn_topic_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(psl, "spawn_fine", lambda *a, **k: "spawned")
     _run_main(monkeypatch, cwd, "配额 上限 说明", cfg_extra={"metrics": {"enabled": True}})
     assert load_pinned_accounted(cwd, "s-pin", 24) is False

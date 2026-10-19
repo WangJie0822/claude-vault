@@ -30,14 +30,21 @@ TOPIC_WORDS = ["配额", "fulltext", "注入"]
 
 
 def _setup(tmp_home: Path, tmp_vault: Path, write_frontmatter_cache, extra: dict) -> None:
+    # spare.md 不命中提问，是本轮注入 quota.md 之后唯一的精排候选：2.4.0 的发起门禁是「排除后候选非空」
+    # （spec 2026-10-13 F62），只有一篇时两档都不发起，下面那条「确实走到了发起」的断言无从成立。
     write_frontmatter_cache({
         "技术笔记/quota.md": {
             "tags": ["配额", "fulltext"], "category": "技术笔记",
             "summary": "fulltext 配额的实现与坑", "mtime": 1900000000,
-        }
+        },
+        "技术笔记/spare.md": {
+            "tags": ["烹饪"], "category": "技术笔记",
+            "summary": "红烧肉的做法与火候控制要点", "mtime": 1900000000,
+        },
     })
     (tmp_vault / "技术笔记").mkdir()
     (tmp_vault / "技术笔记" / "quota.md").write_text("# quota", encoding="utf-8")
+    (tmp_vault / "技术笔记" / "spare.md").write_text("# spare", encoding="utf-8")
     cfg = tmp_home / ".claude" / "skills" / "vault-loader" / "config.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text(json.dumps({"dry_run": False, "vault_path": str(tmp_vault),
@@ -55,8 +62,8 @@ def _run_main_inprocess(monkeypatch, capsys, cwd: Path, prompt: str, session: st
     """
     import scripts.prompt_submit_load as P
     spawned: list = []
-    monkeypatch.setattr(P, "spawn_topic_extraction",
-                        lambda *a, **k: (spawned.append(a), True)[1])
+    monkeypatch.setattr(P, "spawn_fine",
+                        lambda cwd, sid, payload: (spawned.append(payload), "spawned")[1])
     payload = {"cwd": str(cwd), "prompt": prompt,
                "session_id": session, "prompt_id": "pid-T"}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
@@ -116,8 +123,8 @@ def test_ups_record_reports_effective_topic_words(
     assert rc == 0
     # 钉住「那个 patch 不是多余的」：state 里没有主题词的那一档确实会走到 spawn 门禁。
     # 没有这条，将来有人删掉 patch 也看不出差别，直到某台未隔离 HOME 的机器上真跑起来。
-    assert len(spawned) == (0 if preset else 1), (
-        f"preset={preset!r} 时 spawn 调用次数应为 {0 if preset else 1}，实际 {len(spawned)}")
+    # 2.4.0：两档都会走到发起——无主题词时首轮点名，已有主题词时逐轮补充（spec 2026-10-13 §6.1）
+    assert [p["mode"] for p in spawned] == (["supp"] if preset else ["pin"]), spawned
 
     # 判据用 `"admitted" in r` 而不是 `"gate" not in r`：完整记录**也**带 `gate` 键
     # （值为空串 `decision.gate_reason`），后者会把它一并滤掉、断言恒空。

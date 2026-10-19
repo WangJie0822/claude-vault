@@ -38,7 +38,7 @@ def test_writer_failure_never_breaks_injection(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(_metrics, "flush", boom)
     _metrics.reset()
-    rc = m._finish_with_metrics({"display": {"user_visible": True}}, tmp_path,
+    rc = m._finish_with_metrics(m._Turn(), {"display": {"user_visible": True}}, tmp_path,
                                 additional_context="正文", system_message="摘要")
     out = capsys.readouterr().out
     assert rc == 0

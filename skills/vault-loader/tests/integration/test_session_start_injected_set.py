@@ -78,11 +78,13 @@ _UPS_PROMPT = "项目设计 相关的历史决策 怎么做的"
 def _setup_shared(tmp_home, tmp_vault, tmp_git_repo, write_frontmatter_cache) -> str:
     cfg_dir = tmp_home / ".context-vault"
     cfg_dir.mkdir(parents=True, exist_ok=True)
-    # session_topic 关掉：否则 UPS 会拉起真实的 `claude -p` 提炼子进程
+    # session_topic 关掉：否则 UPS 会拉起真实的 `claude -p` 提炼子进程。
+    # auto_fulltext 打开：观测量是 admitted 条目上的 dedup，曾注入过的篇靠 upgrade_candidate 重新进
+    # admitted；2.4.0 起这条通路随自动全文默认关，不开它这篇只落 excluded、admitted 里看不到它
     (cfg_dir / "config.json").write_text(json.dumps({
         "vault_path": str(tmp_vault),
         "metrics": {"enabled": True},
-        "relevance": {"session_topic": False},
+        "relevance": {"session_topic": False, "auto_fulltext": True},
     }), encoding="utf-8")
     project = tmp_git_repo.name
     note_rel = f"项目笔记/{project}/design.md"
@@ -121,7 +123,8 @@ def test_ups_sees_session_start_injected_set(
     ss = _run({"cwd": str(tmp_git_repo), "hook_event_name": "SessionStart",
                "session_id": "S-shared", "source": "startup"})
     assert ss.returncode == 0, ss.stderr
-    assert note_rel in json.loads(ss.stdout)["hookSpecificOutput"]["additionalContext"], \
+    # 统一行不再渲染相对路径 `[[rel]]`：认文件名标题（绝对路径里的分隔符随平台变，不能拿 rel 去子串匹配）
+    assert "「design」" in json.loads(ss.stdout)["hookSpecificOutput"]["additionalContext"], \
         "前提：SessionStart 注入了这篇项目笔记"
 
     ups = _ups(tmp_git_repo)

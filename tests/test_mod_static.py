@@ -123,7 +123,7 @@ def test_mod_reads_only_contract_snapshot_fields():
 
 
 _ITEM_PARSERS = {"injectedItems": ("injected",), "items": ("pins.llm", "pins.user", "excluded"),
-                 "ssItems": ("session_start",)}
+                 "ssItems": ("session_start",), "suppItems": ("supps",)}
 
 
 def _fn_body(src: str, name: str) -> str:
@@ -149,7 +149,8 @@ def test_mod_reads_only_contract_item_fields():
         assert "path" in read, fn                                  # 正则没失效
         allowed = set().union(*(_fixture_item_keys(fixture, p) for p in places))
         assert read <= allowed, (fn, sorted(read - allowed))
-    for fn, key, var in (("parseLlm", "llm", "l"), ("parseThresholds", "thresholds", "t")):
+    for fn, key, var in (("parseLlm", "llm", "l"), ("parseThresholds", "thresholds", "t"),
+                         ("parseSettings", "settings", "s")):
         read = set(re.findall(rf"\b{var}\.([a-z_]+)", _fn_body(src, fn)))
         assert read, fn
         assert read <= set(fixture[key]), (fn, sorted(read - set(fixture[key])))
@@ -171,3 +172,21 @@ def test_js_suite_passes(tmp_path):
     ran = re.search(r"^Ran (\d+) tests?", out, re.M)
     assert ran and int(ran.group(1)) > 0, out
     assert re.search(r"^\s*0 fail\b", out, re.M), out
+
+
+def test_read_observer_skips_subagents_and_errors():
+    """Read 观测只看结果、不改写 e；子 agent（带 agentId）与被拒的 Read（结果带 isError 或 deny）不计。
+
+    kit 未必能在测试 `$` 上构造带 agentId 的 tool.call（Task 19 Step 2 的探针），这里钉语句形态兜底；
+    行为面由 tests/mod/vault-mod.test.ts 的 Read 用例覆盖。
+    """
+    src = (ROOT / "hooks" / "vault-mod.js").read_text(encoding="utf-8").replace("\r\n", "\n")
+    m = re.search(r"  on\('tool\.call', \{ tool: 'Read' \}, async \(\$, e, next\) => \{\n(.*?)\n  \}\)\n",
+                  src, re.S)
+    assert m, "找不到 Read 观测 hook"
+    body = m.group(1)
+    assert re.search(r"^    const r = await next\(e\)$", body, re.M)
+    assert re.search(r"^      if \(!e\.agentId && r && r\.isError !== true && typeof r\.deny !== 'string'\) "
+                     r"await noteRead\(\$, e\.file_path\)$", body, re.M), body
+    assert re.search(r"^    return r$", body, re.M)
+    assert "next({" not in body                            # 不改写 e

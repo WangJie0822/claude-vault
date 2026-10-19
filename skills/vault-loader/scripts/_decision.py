@@ -239,11 +239,15 @@ def select_fulltext(candidates, ft_topical: float):
 
 
 def decide_injection(active_entries: dict, signals: Signals, weights: dict,
-                     config: dict, state: StateView) -> Decision:
+                     config: dict, state: StateView, *, auto_fulltext: bool = True) -> Decision:
     """UPS 候选决策：闸门 + 打分 + 去重 + 全文主候选选择，纯计算、无 IO。
 
     active_entries 须已完成第1层排除（archived 等，由调用方过滤）。
     config 为 load_config 返回的完整 merge 后 dict（内部取 relevance/user_prompt_submit 段）。
+
+    auto_fulltext（spec 2.4.0 §8.2）：False 时本轮不升级全文——曾弱候选注入的篇不再按 upgrade_candidate
+    放行（只按去重排除，dedup="candidate_injected"，仍相关则置 any_relevant），fulltext_path=None。
+    新篇的放行与排序不变。默认 True 与 2.3.0 等价；UPS 传 `relevance.auto_fulltext` 的有效值。
     """
     rel_cfg = config["relevance"]
     prompt_keywords = signals.prompt_keywords
@@ -295,8 +299,9 @@ def decide_injection(active_entries: dict, signals: Signals, weights: dict,
             continue
         if path in state.candidate_injected:
             # 曾弱候选注入：仅升到全文阈值才作升级候选再注入（治 reverse High#1：
-            # 升级候选不在渲染层排除，进候选参与主候选；非主候选时仍可见于清单、保留升级机会）
-            if t >= ft_topical:
+            # 升级候选不在渲染层排除，进候选参与主候选；非主候选时仍可见于清单、保留升级机会）。
+            # auto_fulltext 关时整条升级通路切断（spec 2.4.0 §8.2），落入下面的「已注入过」分支
+            if auto_fulltext and t >= ft_topical:
                 admitted.append(EntryDecision(
                     path=path, topical=t, total=_total(),
                     hits=_hit_keywords(entry, prompt_keywords),
@@ -341,7 +346,7 @@ def decide_injection(active_entries: dict, signals: Signals, weights: dict,
     fulltext_path: str | None = None
     fulltext_arm = ""
     winner = select_fulltext(
-        ((ed.topical, ed.total, ed.hits, ed) for ed in admitted), ft_topical)
+        ((ed.topical, ed.total, ed.hits, ed) for ed in admitted), ft_topical) if auto_fulltext else None
     if winner is not None:
         fulltext_path = winner.path
         fulltext_arm = f"topical>={ft_topical}+strong_evidence"

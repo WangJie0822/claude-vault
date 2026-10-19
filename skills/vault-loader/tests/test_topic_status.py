@@ -4,23 +4,24 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import time
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from scripts import _topic
+from scripts import _fine_state, _topic
 from scripts._state import session_topics_path
-from scripts._topic import (PENDING_GRACE_SEC, TOPIC_TIMEOUT_SEC, describe_session_topic,
-                            run_extraction_child, save_session_topic, spawn_topic_extraction,
-                            take_spawn_outcome)
+from scripts._topic import (PENDING_GRACE_SEC, TOPIC_TIMEOUT_SEC, build_fine_payload,
+                            describe_session_topic, run_extraction_child, save_session_topic,
+                            spawn_fine, take_spawn_outcome)
 
 ON = {"relevance": {"session_topic": True, "session_pin_max": 1},
       "user_prompt_submit": {"state_ttl_hours": 24}}
 OFF = {"relevance": {"session_topic": False}}
-KEYS = {"state", "fail", "words", "in_scoring", "n_pinned", "age_s", "pin_on", "stale_pins"}
+KEYS = {"state", "fail", "words", "in_scoring", "n_pinned", "age_s", "pin_on", "stale_pins",
+        "mode", "fail_streak", "calls", "disabled"}
+GEN = "0123456789abcdef"
 NOW = time.time()
 LOST_AGE = TOPIC_TIMEOUT_SEC + PENDING_GRACE_SEC + 1
 
@@ -32,8 +33,18 @@ def _mkrepo(root: Path) -> Path:
     return root
 
 
-def _stdin() -> str:
-    return json.dumps({"prompt": "q", "candidates": [["a.md", "A"]], "pin_max": 1}, ensure_ascii=False)
+@pytest.fixture
+def vault(tmp_vault, write_frontmatter_cache):
+    write_frontmatter_cache({"笔记/a.md": {"tags": ["精排"], "summary": "精排的设计", "mtime": 1, "keywords": []}})
+    return tmp_vault
+
+
+def _child(cwd: Path, vault: Path) -> None:
+    """真实形状的 v1 payload 跑一次子进程主体（`_call_model` 由调用方 monkeypatch）。"""
+    payload = build_fine_payload("pin", prompt="q", config={"relevance": {}, "vault_path": str(vault)},
+                                 gen_id=GEN, src_seq=1, slot=None, transcript_path="", injected=[],
+                                 excluded=[], prev_words=[], extra_paths=[])
+    run_extraction_child([str(cwd), "s1"], stdin_text=json.dumps(payload, ensure_ascii=False))
 
 
 def _entry(cwd: Path, sid: str = "s1") -> dict:
@@ -57,23 +68,23 @@ class _FakePopen:
         self.stdin = mock.MagicMock()
 
 
-def test_placeholder_is_pending_and_child_success_is_ok(tmp_path, monkeypatch):
+def test_spawn_writes_no_placeholder_and_child_success_is_ok(tmp_path, vault, monkeypatch):
     cwd = _mkrepo(tmp_path / "p")
     monkeypatch.setattr("scripts._topic.shutil.which", lambda _n: "/usr/bin/claude")
     monkeypatch.setattr("scripts._topic.subprocess.Popen", _FakePopen)
-    assert spawn_topic_extraction(cwd, "s1", "q", [], ON) is True
+    assert spawn_fine(cwd, "s1", {"v": 1}) == "spawned"
     assert take_spawn_outcome() == "spawned"
     assert take_spawn_outcome() is None                       # 取走即清空
-    assert _entry(cwd)["state"] == "pending"
-    monkeypatch.setattr(_topic, "_call_model", lambda text: "PINNED: 1\nWORDS: 精排")
-    run_extraction_child([str(cwd), "s1"], stdin_text=_stdin())
+    assert not session_topics_path(cwd).exists()              # 2.4.0 不再写 pending 占位（F01/F02）
+    monkeypatch.setattr(_topic, "_call_model", lambda text: "PINNED: NONE\nWORDS: 精排")
+    _child(cwd, vault)
     e = _entry(cwd)
     assert e["state"] == "ok" and "fail" not in e
 
 
 def test_spawn_outcome_no_claude_and_spawn_error(tmp_path, monkeypatch):
     monkeypatch.setattr("scripts._topic.shutil.which", lambda _n: None)
-    assert spawn_topic_extraction(tmp_path, "s1", "q", [], ON) is False
+    assert spawn_fine(tmp_path, "s1", {"v": 1}) == "no_claude"
     assert take_spawn_outcome() == "no_claude"
 
     def _boom(*a, **kw):
@@ -81,12 +92,12 @@ def test_spawn_outcome_no_claude_and_spawn_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr("scripts._topic.shutil.which", lambda _n: "/usr/bin/claude")
     monkeypatch.setattr("scripts._topic.subprocess.Popen", _boom)
-    assert spawn_topic_extraction(tmp_path, "s2", "q", [], ON) is False
+    assert spawn_fine(tmp_path, "s2", {"v": 1}) == "spawn_error"
     assert take_spawn_outcome() == "spawn_error"
 
 
 @pytest.mark.parametrize("reason", ["timeout", "exit_nonzero", "no_claude"])
-def test_child_failure_records_reason(tmp_path, monkeypatch, reason):
+def test_child_failure_records_reason_in_fine(tmp_path, vault, monkeypatch, reason):
     cwd = _mkrepo(tmp_path / "p")
 
     def fake(text):
@@ -94,18 +105,18 @@ def test_child_failure_records_reason(tmp_path, monkeypatch, reason):
         return None
 
     monkeypatch.setattr(_topic, "_call_model", fake)
-    run_extraction_child([str(cwd), "s1"], stdin_text=_stdin())
-    e = _entry(cwd)
-    assert (e["state"], e["fail"]) == ("failed", reason)
+    _child(cwd, vault)
+    assert _fine_state.load_fine("s1").last_fail == reason
+    assert not session_topics_path(cwd).exists()              # 失败只写 fine，不碰 topics（F01）
 
 
-def test_stub_without_reason_records_error(tmp_path, monkeypatch):
-    """现有替身只返回 None、不设 _LAST_FAIL：按 error 记，且不能读到上一次调用残留的原因。"""
+def test_stub_without_reason_records_error(tmp_path, vault, monkeypatch):
+    """替身只返回 None、不设 _LAST_FAIL：按 error 记，且不能读到上一次调用残留的原因。"""
     cwd = _mkrepo(tmp_path / "p")
     monkeypatch.setattr(_topic, "_LAST_FAIL", "timeout")      # 上一次调用的残留
     monkeypatch.setattr(_topic, "_call_model", lambda text: None)
-    run_extraction_child([str(cwd), "s1"], stdin_text=_stdin())
-    assert _entry(cwd)["fail"] == "error"
+    _child(cwd, vault)
+    assert _fine_state.load_fine("s1").last_fail == "error"
 
 
 def test_placeholder_does_not_inherit_ok(tmp_path):
@@ -115,32 +126,6 @@ def test_placeholder_does_not_inherit_ok(tmp_path):
     e = _entry(cwd)
     assert e["state"] == "pending" and "fail" not in e
     assert e["pinned"] == ["a.md"]                            # pinned 照旧按 _KEEP 继承，由 stale_pins 标出
-
-
-class _R:
-    def __init__(self, rc: int, out: str = ""):
-        self.returncode, self.stdout = rc, out
-
-
-@pytest.mark.parametrize("which,mode,expect", [
-    (None, "", "no_claude"),
-    ("/usr/bin/claude", "rc1", "exit_nonzero"),
-    ("/usr/bin/claude", "timeout", "timeout"),
-    ("/usr/bin/claude", "oserror", "error"),
-])
-def test_call_model_sets_last_fail(monkeypatch, which, mode, expect):
-    def fake_run(*a, **kw):
-        if mode == "rc1":
-            return _R(1)
-        if mode == "timeout":
-            raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
-        raise OSError("x")
-
-    monkeypatch.setattr("scripts._topic.shutil.which", lambda _n: which)
-    monkeypatch.setattr("scripts._topic.subprocess.run", fake_run)
-    monkeypatch.setattr(_topic, "_LAST_FAIL", None)
-    assert _topic._call_model("p") is None
-    assert _topic._LAST_FAIL == expect
 
 
 def test_describe_keys_are_constant(tmp_path):
@@ -272,9 +257,10 @@ def test_describe_dry_run_never_spawns(tmp_path):
     assert _d(cwd, config=dry)["state"] == "ok"
 
 
-def test_describe_switch_default_matches_spawn_gate(tmp_path):
-    """开关缺键时与 spawn 门禁同一默认（`rel_cfg.get("session_topic", False)`）：门禁不发起，面板就不能报 idle。"""
-    assert _d(_mkrepo(tmp_path / "p"), config={"relevance": {}})["state"] == "off"
+def test_describe_switch_default_is_on(tmp_path):
+    """开关缺键时按默认开（`relevance.fine_rank` 默认 true，判据单点 `_fine_config.fine_rank_on`）：报 idle，
+    不报 off。UPS 的 spawn 门禁在接线任务里改读同一单点。"""
+    assert _d(_mkrepo(tmp_path / "p"), config={"relevance": {}})["state"] == "idle"
 
 
 def test_describe_outputs_stay_within_wire_enums(tmp_path):
@@ -347,3 +333,66 @@ def test_failed_then_placeholder_self_heals(tmp_path):
     ts = _entry(cwd)["ts"]
     d = describe_session_topic(cwd, "s1", ON, now=ts + LOST_AGE)
     assert (d["state"], d["fail"]) == ("failed", "lost")
+
+
+def test_describe_inflight_is_pending(tmp_path):
+    """2.4.0 起「提炼中」只来自在飞标记（topics 不再有 pending 占位）。"""
+    d = _d(_mkrepo(tmp_path / "p"), inflight={"gen_id": GEN, "started": NOW - 7, "timeout": 120})
+    assert (d["state"], d["age_s"], d["fail"], d["mode"]) == ("pending", 7, None, "pin")
+
+
+def test_describe_inflight_in_supp_mode_keeps_current_pins(tmp_path):
+    cwd = _mkrepo(tmp_path / "p")
+    _set_entry(cwd, words=["精排"], pinned=["a.md"], ts=NOW - 50, state="ok")
+    d = _d(cwd, inflight={"gen_id": GEN, "started": NOW - 3, "timeout": 120})
+    assert (d["state"], d["mode"], d["stale_pins"], d["words"]) == ("pending", "supp", False, ["精排"])
+
+
+def test_describe_fine_failure_newer_than_entry(tmp_path):
+    cwd = _mkrepo(tmp_path / "p")
+    _set_entry(cwd, words=["精排"], pinned=["a.md"], ts=NOW - 50, state="ok")
+    fine = _fine_state.FineState(last_fail="timeout", last_ts=NOW - 5, fail_streak=1, calls=3)
+    d = _d(cwd, fine=fine)
+    assert (d["state"], d["fail"], d["fail_streak"], d["calls"], d["mode"]) == ("failed", "timeout", 1, 3, "supp")
+    # 补充轮失败不动首轮点名：注入中的点名就是本窗口的，不是「沿用上一窗口」
+    assert d["stale_pins"] is False and d["n_pinned"] == 1
+    old = _fine_state.FineState(last_fail="timeout", last_ts=NOW - 500)
+    assert _d(cwd, fine=old)["state"] == "ok"                 # 失败早于这份结果：以结果为准
+
+
+@pytest.mark.parametrize("entry_state", ["pending", "failed"])
+def test_describe_fine_failure_before_first_round_keeps_stale_pins(tmp_path, entry_state):
+    """对照：首轮点名还没成功（entry 为 pending / failed、带着上一窗口的 pinned）时再记一次 fine 失败，
+    pinned 仍是旧的——stale_pins 必须照旧为 True、n_pinned 为空。"""
+    cwd = _mkrepo(tmp_path / "p")
+    _set_entry(cwd, words=[], pinned=["a.md"], ts=NOW - 50, state=entry_state, fail="timeout")
+    d = _d(cwd, fine=_fine_state.FineState(last_fail="exit_nonzero", last_ts=NOW - 5))
+    assert (d["state"], d["mode"]) == ("failed", "pin")
+    assert d["stale_pins"] is True and d["n_pinned"] is None
+
+
+def test_describe_failed_first_round_without_entry(tmp_path):
+    d = _d(_mkrepo(tmp_path / "p"), fine=_fine_state.FineState(last_fail="exit_nonzero", last_ts=NOW))
+    assert (d["state"], d["fail"], d["mode"]) == ("failed", "exit_nonzero", "pin")
+
+
+def test_describe_disabled_passthrough(tmp_path):
+    cwd = _mkrepo(tmp_path / "p")
+    assert _d(cwd, fine=_fine_state.FineState(disabled_reason="call_cap"))["disabled"] == "call_cap"
+    assert _d(cwd, fine=_fine_state.FineState(disabled_reason="hacked"))["disabled"] is None
+    d = _d(cwd)
+    assert d["disabled"] is None and d["calls"] is None and d["fail_streak"] is None
+
+
+def test_describe_bad_model_is_reported(tmp_path):
+    cwd = _mkrepo(tmp_path / "p")
+    _set_entry(cwd, words=["精排"], ts=NOW - 5, state="ok")
+    cfg = {"relevance": {"fine_model": "-x"}, "user_prompt_submit": {"state_ttl_hours": 24}}
+    assert (_d(cwd, config=cfg)["state"], _d(cwd, config=cfg)["fail"]) == ("ok", "bad_model")
+
+
+def test_describe_mode_none_when_supplement_off(tmp_path):
+    cwd = _mkrepo(tmp_path / "p")
+    _set_entry(cwd, words=["精排"], ts=NOW - 5, state="ok")
+    cfg = {"relevance": {"fine_supplement": False}, "user_prompt_submit": {"state_ttl_hours": 24}}
+    assert _d(cwd, config=cfg)["mode"] is None

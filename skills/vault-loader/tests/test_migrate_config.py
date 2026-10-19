@@ -16,7 +16,8 @@ import pytest
 
 from scripts import migrate_config as mc
 from scripts._config_history import HISTORICAL_DEFAULTS
-from scripts._config_loader import DEFAULT_CONFIG
+from scripts._config_loader import DEFAULT_CONFIG, load_config_ex
+from scripts._topic import effective_pin_max
 
 
 def _config_path(home: Path) -> Path:
@@ -413,6 +414,45 @@ def test_historical_defaults_keys_all_allowlisted() -> None:
         assert mc.is_allowlisted(path), f"{path} 登记在历史表中但不属于 allowlist 范围"
 
 
+def test_apply_keeps_explicit_session_pin_max_and_privacy_ints(tmp_home: Path) -> None:
+    """F33：`relevance.session_pin_max` 已被 `fine_pin_max` 取代、仍兼容读取。用户显式写的 1
+    （恰好等于默认）是一次选择而不是物化残留——当残留删掉后，有效值会改由新键默认决定。
+    三个隐私数值键同理（显式写过的值等于一次隐私决定）。"""
+    p = _write_config(tmp_home, {"relevance": {
+        "session_pin_max": 1, "fine_recent_prompts": 3, "fine_catalog_max_chars": 80000,
+        "fine_session_max_bytes": 1000000, "fine_max_notes": 3}})
+
+    rc = mc.main(["--apply", "--path", str(p)])
+
+    assert rc == 0
+    rel = json.loads(p.read_text(encoding="utf-8"))["relevance"]
+    assert rel["session_pin_max"] == 1
+    assert rel["fine_recent_prompts"] == 3
+    assert rel["fine_catalog_max_chars"] == 80000
+    assert rel["fine_session_max_bytes"] == 1000000
+    # 阳性对照：普通数值调参键等于历史默认照常判残留删除（证明 --apply 确实跑过判定）
+    assert "fine_max_notes" not in rel
+
+
+def test_apply_keeps_explicit_fine_pin_max_over_legacy(tmp_home: Path) -> None:
+    """F33 的镜像（角色互换）：用户显式写的 `fine_pin_max: 1`（恰好等于默认）压过旧键
+    `session_pin_max: 3`。若新键在历史默认表里，`--apply` 会把它当物化残留删掉，旧键 3 随即补位，
+    有效点名上限无声地由 1 变成 3（review Important）。"""
+    p = _write_config(tmp_home, {"relevance": {
+        "session_pin_max": 3, "fine_pin_max": 1, "fine_max_notes": 3}})
+    assert effective_pin_max(load_config_ex(p).config) == 1          # 迁移前
+
+    rc = mc.main(["--apply", "--path", str(p)])
+
+    assert rc == 0
+    rel = json.loads(p.read_text(encoding="utf-8"))["relevance"]
+    assert rel["fine_pin_max"] == 1
+    assert rel["session_pin_max"] == 3
+    assert effective_pin_max(load_config_ex(p).config) == 1          # 迁移后有效值不变
+    # 阳性对照：同一份 config 里的普通调参键照常被判残留删除（证明 --apply 确实跑过判定）
+    assert "fine_max_notes" not in rel
+
+
 # ── OBS-9 --doctor ─────────────────────────────────────────────────────────
 
 def _doctor(capsys, path: Path) -> str:
@@ -515,3 +555,106 @@ def test_doctor_silent_on_residue_for_fresh_install(tmp_home, capsys):
     对新用户显示「✅ 无」也是噪声。"""
     out = _doctor(capsys, tmp_home / "nope" / "config.json")
     assert "旧版默认值残留" not in out
+
+
+def test_doctor_prints_read_permission_hint_without_path(tmp_path, capsys):
+    """2.4.0 默认不再自动注入全文：doctor 给出窄范围 Read 权限的写法，但不打印 vault 路径原文
+    （doctor 的输出会被贴进 issue，路径原文从略的约定见 `_do_doctor` 的 docstring）。"""
+    vault = tmp_path / "VaultNameProbe"
+    vault.mkdir()
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"vault_path": str(vault)}), encoding="utf-8")
+    out = _doctor(capsys, cfg)
+    assert "按需读取笔记" in out
+    hint = out.split("按需读取笔记", 1)[1]
+    assert "permissions.allow" in hint and "Read(//<vault 绝对路径>/**/*.md)" in hint
+    assert "additionalDirectories" in hint
+    assert ".git/**" in hint, "deny 提示要点名 .git/**（vault 是 git 仓库，.git/config 不该免确认可读）"
+    assert ".obsidian/**" in hint, "deny 提示要点名 .obsidian/**（插件数据）"
+    assert "deny" in hint
+    assert "Read(//srv/notes/vault/**/*.md)" in hint, "要给出 POSIX 示例（去掉开头 / 的绝对路径接在 // 后面）"
+    assert "Read(//d/Notes/Vault/**/*.md)" in hint, "要给出 Windows 示例"
+    assert "VaultNameProbe" not in hint, "权限提示不得打印 vault 路径原文"
+
+
+# ── 不带 --path：操作 hook 实际读取的那一份（2.4.0 full-review DO-H1）──────────
+#
+# 1.0 起 loader 读 canonical，而 `default_config_path` 一直固定返回 legacy：canonical 用户照文档跑
+# `--restore`，工具报「已还原」却写出一份 hook 不读的 legacy config；这份新文件又让 `has_legacy_data()`
+# 成立，`use_canonical_namespace()` 翻成 False。三种布局逐一对照 loader 自己的判据
+# `resolve_config_path()`，期望路径一律取它的返回值，不手写。
+
+_FORMS = ("canonical", "legacy", "both")
+
+
+def _layout(home: Path, form: str) -> dict:
+    """按布局写出 config（`fine_rank: true`），返回 {文件: 写入后的字节}。"""
+    from context_vault.paths import canonical_config, legacy_loader_config
+    files = {"canonical": [canonical_config(home)], "legacy": [legacy_loader_config(home)],
+             "both": [canonical_config(home), legacy_loader_config(home)]}[form]
+    for p in files:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"relevance": {"fine_rank": True}}), encoding="utf-8")
+    return {p: p.read_bytes() for p in files}
+
+
+def _ns() -> bool:
+    from context_vault.paths import use_canonical_namespace
+    return use_canonical_namespace()
+
+
+@pytest.mark.parametrize("form", _FORMS)
+def test_no_path_restore_writes_the_file_the_loader_reads(tmp_home: Path, tmp_path: Path, form: str) -> None:
+    from context_vault.paths import canonical_config, legacy_loader_config
+    from scripts._config_loader import resolve_config_path
+    before = _layout(tmp_home, form)
+    target = resolve_config_path()[0]
+    assert target in before                      # 前提：loader 读的是本布局里已有的那份
+    ns_before = _ns()
+    bak = tmp_path / "bak.json"
+    bak.write_text(json.dumps({"relevance": {"fine_rank": False}}), encoding="utf-8")
+
+    assert mc.main(["--restore", str(bak)]) == 0
+
+    assert json.loads(target.read_text(encoding="utf-8"))["relevance"]["fine_rank"] is False
+    assert load_config_ex().config["relevance"]["fine_rank"] is False, "hook 读不到还原后的值"
+    for p, raw in before.items():                # 其余已有的 config 逐字节不变
+        if p != target:
+            assert p.read_bytes() == raw
+    for p in (canonical_config(tmp_home), legacy_loader_config(tmp_home)):
+        if p not in before:
+            assert not p.exists(), f"--restore 新建了 loader 不读的 {p}"
+    assert resolve_config_path()[0] == target
+    assert _ns() == ns_before, "--restore 翻转了 state 命名空间"
+    if form == "canonical":
+        assert ns_before is True and not legacy_loader_config(tmp_home).exists()
+
+
+@pytest.mark.parametrize("form", _FORMS)
+def test_no_path_doctor_reports_the_file_the_loader_reads(tmp_home: Path, capsys, form: str) -> None:
+    from scripts._config_loader import resolve_config_path
+    from scripts._diagnostics import fold_home
+    _layout(tmp_home, form)
+    assert mc.main(["--doctor"]) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "config 路径" in ln)
+    assert line.split(":", 1)[1].strip() == str(fold_home(resolve_config_path()[0])), out
+    assert "✅ 可解析" in out, out
+
+
+def test_no_path_dry_run_and_apply_act_on_canonical(tmp_home: Path, capsys) -> None:
+    """只有 canonical 时，dry-run 报的与 --apply 清的都是它；legacy 不被创建。"""
+    from context_vault.paths import canonical_config, legacy_loader_config
+    from scripts._config_loader import resolve_config_path
+    p = canonical_config(tmp_home)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"scoring": {"prompt_keyword_hit": 3}}), encoding="utf-8")
+    target = resolve_config_path()[0]
+    assert target == p
+
+    assert mc.main([]) == 0
+    assert str(target) in capsys.readouterr().out
+    assert mc.main(["--apply"]) == 0
+    assert "prompt_keyword_hit" not in json.loads(target.read_text(encoding="utf-8")).get("scoring", {})
+    assert not legacy_loader_config(tmp_home).exists()
+    assert _ns() is True

@@ -155,7 +155,7 @@ def test_pool_fields_are_cleaned_as_numeric_top_fields():
 def test_kind_tables_cover_every_kind():
     """1A-M3 / 1B-M-5：kind → hit 判据与 kind → 配额桶都必须**全覆盖** KINDS，加第 5 个 kind 时这里先红。"""
     assert set(am.KINDS) == set(am._KIND_HIT) == set(am._KIND_BUCKET)
-    assert set(am._KIND_BUCKET.values()) == {"fulltext", "pinned", "list"}
+    assert set(am._KIND_BUCKET.values()) == {"fulltext", "pinned", "supp", "list"}
 
 
 def test_kind_hits_path_dispatch_and_unknown_kind_never_hits():

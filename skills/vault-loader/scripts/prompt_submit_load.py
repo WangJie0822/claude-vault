@@ -10,6 +10,7 @@ import os
 import secrets
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -58,6 +59,11 @@ if _LOOKS_LIKE_PLUGIN_ROOT and str(_PLUGIN_ROOT) not in sys.path:
 # （实测 EXIT=1）。作为 hook，这会让每次 prompt 都产生一次 hook 错误。
 # 故在此补一层：以脚本身份运行时降级为静默 exit 0；被测试 import 时仍原样抛出（否则
 # 真实的导入错误会被测试进程当成正常退出而永久隐身）。
+#
+# 这个块是召回的核心导入链：其中任一模块（含它们在模块级传递导入的模块）加载失败，整轮不注入。下面单独
+# 兜底的那几个模块（`_metrics`、`_session_ops`、`_fine_input`、`_fine_flow`、`_fine_state`）不得被这里的任何
+# 模块在模块级传递导入，否则它们的「单独兜底」形同虚设（2.4.0 full-review A-H1：`_topic` 曾在模块级导入
+# `_fine_state` 与 `_fine_input`）。守卫 `tests/test_import_isolation.py` 逐个拦截这几个模块、从真实入口跑一轮。
 try:
     from scripts._config_loader import load_config_ex
     from scripts._frontmatter_reader import load_cache_status
@@ -77,19 +83,21 @@ try:
     )
     from scripts._state import (
         load_already_injected, load_fulltext_injected, save_injected,
-        fallback_cooldown_expired, save_fallback_ts, _repo_root,
+        fallback_cooldown_expired, save_fallback_ts,
     )
     from scripts._decision import (
         decide_injection, StateView, _hit_keywords, gate_keywords, select_fulltext,
         is_deictic_only, is_skipped_slash_command,
     )
     from scripts._topic import (
-        load_session_topic, spawn_topic_extraction, has_recent_topic_attempt,
+        load_session_topic, spawn_fine, build_fine_payload, first_round_done,
         load_session_pinned, load_pinned_accounted, mark_pinned_accounted,
-        effective_pin_max, split_pin_budget, describe_session_topic, take_spawn_outcome,
+        effective_pin_max, split_pin_budget, describe_session_topic,
     )
-    from scripts._candidate_pool import (build_topic_pool, count_project_notes, safe_int,
-                                         SUMMARY_CHARS)
+    from scripts._candidate_pool import is_worklog
+    from scripts._fine_config import check_persist, fine_rank_on, fine_supplement_on, get_value
+    from scripts._inject_format import (FMT_VERSION, PATH_NOTE, SUPP_HEADER, coarse_annot,
+                                        note_line)
 except Exception as _import_exc:  # noqa: BLE001 — fail-open 优先于一切
     if __name__ != "__main__":
         raise
@@ -205,34 +213,98 @@ except Exception as _metrics_exc:  # noqa: BLE001
     _metrics = _MetricsStub()
 
 # 会话操作模块单独兜底（spec 2026-10-09 mod 注入可见与可控）：它服务的是 mod 的展示与操作，
-# 加载失败只让本轮没有快照，召回照常。
+# 加载失败只让本轮没有快照、也不读 mod 的请求（排除、钉住、会话设置的变更、标注），召回照常。成立的前提是核心导入链与
+# 下面的精排模块都不在模块级导入它（`_fine_state` 用的链接判据因此放在 `_state.is_link_like`）。
 try:
     from scripts import _session_ops
 except Exception as _ops_exc:  # noqa: BLE001
     print(f"[vault-loader] 会话操作模块不可用，本轮无快照：{_ops_exc}", file=sys.stderr)
     _session_ops = None
 
-# 本轮的快照素材。生产每轮新进程；`main()` 入口与出口各清一次，防同进程多轮调用（测试）串味。
-_REPORT = None
+# 精排编排模块单独兜底（spec 2026-10-13）：它服务的是逐轮补充与精排发起，加载失败只让本轮不投递补充、
+# 不发起精排，粗排注入照常（快照的 `llm` 照常按 topics 报，只是看不到 fine 状态）。成立的前提同上：
+# `_topic` 只在函数内导入 `_fine_state`。
+try:
+    from scripts import _fine_flow, _fine_state
+except Exception as _fine_exc:  # noqa: BLE001
+    print(f"[vault-loader] 精排编排模块不可用，本轮无逐轮补充：{_fine_exc}", file=sys.stderr)
+    _fine_flow = None
+    _fine_state = None
+
+# 精排输入模块单独兜底：父进程只用它的 `exclusion_set`（发起前数「排除后还有没有候选」，与子进程同一份排除集）。
+# 加载失败只让本轮不发起精排；已写回的补充照常投递，粗排照常。
+try:
+    from scripts._fine_input import exclusion_set
+except Exception as _fin_exc:  # noqa: BLE001
+    print(f"[vault-loader] 精排输入模块不可用，本轮不发起精排：{_fin_exc}", file=sys.stderr)
+    exclusion_set = None
+
+@dataclass
+class _Turn:
+    """本轮的状态。`main()` 每次调用新建一个，显式传给 `_main_impl` 与需要它的函数；复位是结构性的（每轮一个
+    新对象），同进程连续调用 `main()`（测试）也不会串味。2.4.0 full-review Q-H1 之前它们是 7 个模块级全局：
+    入口、出口各复位一次，对账标记另有一处，再加一个就要改三处，漏了在生产里看不出来（每轮都是新进程）。
+
+    - `report`：本轮的快照素材（`_session_ops.TurnReport`），`main()` 出口统一 `finalize`；
+    - `fine`：本轮的精排状态（`_fine_flow.TurnFine`），`_finish_with_metrics` 据此做本轮唯一一次 fine 写回；
+      补充的时效丢弃与复核丢弃数都在它上面（`stale_dropped` / `recheck_dropped`）；
+    - `full_record`：本轮是否已 stage 一条完整决策记录。精排计数只追加在这种记录上：闸门记录的键集合由守卫
+      钉住，不能混进去；
+    - `past_gate`：本轮是否过闸（走到了打分与记录构造，没在闸门早退），见 `mark_scored`；
+    - `persist_notes`：本轮「设为默认」成功的说明（spec §10.4：每次成功持久化在 systemMessage 说明一次），
+      由 `_finish` 并入；
+    - `pending_pin`：一次性对账标记（`mark_pinned_accounted`）的延迟登记 `(cwd, session_id)`。只在
+      `_finish_with_metrics` 里 flush **没抛**之后才翻（1A-M2 / 1B-M-3）：`stage` 是零 IO 缓冲，真正落盘在
+      flush；此前标记在 stage 之后立即翻，flush 失败时那份每会话一次的对账数据永久丢失且无任何信号。
+    - `cfg_corrupt`：本轮 config 读坏、整份回落默认值（`load_config_ex` 回报 `corrupt`）。`_maybe_spawn` 据它
+      拒绝发起（2.4.0 full-review DO-M2）：默认值里精排、逐轮补充与目录层都开着，读坏的那份里用户可能关过。
+    """
+    report: "object | None" = None
+    fine: "object | None" = None
+    full_record: bool = False
+    persist_notes: list = field(default_factory=list)
+    pending_pin: "tuple[Path, str] | None" = None
+    cfg_corrupt: bool = False
+    _past_gate: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def past_gate(self) -> bool:
+        return self._past_gate
+
+    def mark_scored(self) -> None:
+        """过闸：`decide_injection` 之后、`_maybe_spawn` 之前调一次，是 `past_gate` 唯一的置位途径。
+
+        两处据它判：`_finish_with_metrics` 决定 fine 写回是否消费子进程统计（判据不能用 `full_record`：
+        记录构造失败时统计会永远出不了队）；`_maybe_spawn` 在它为假时拒绝发起。后者把「精排只在过闸轮发起」
+        从语句位置变成数据约束——`finish_turn` 的「两次过闸之间 stats_q 至多 +1、触不到 `STATS_Q_MAX`
+        截断」靠的就是它：以后在这里之前插一个新出口、或把发起挪到闸门之前，发起会被拒，而不是悄悄打破上界。
+        """
+        self._past_gate = True
 
 
-def _bind_report(hook_input: dict) -> None:
-    global _REPORT
-    _REPORT = None
+# 渲染层拿不到 vault 路径时的占位：一个必然不存在的目录，`resolve_note_path` 对它恒返回 None，统一行
+# 于是省略路径字段。不能用 None 或空路径代替：`Path("")` 会按当前目录解析。
+_NO_VAULT = Path(__file__).resolve().parent / "__no_vault__"
+# describe_session_topic 认识的发起结果；其余（没发起、被门禁挡下）一律不传，按「尚未发起」显示。
+_SPAWN_OUTCOMES = ("spawned", "no_claude", "spawn_error")
+
+
+def _bind_report(turn: _Turn, hook_input: dict) -> None:
+    turn.report = None
     if _session_ops is None:
         return
     try:
-        _REPORT = _session_ops.TurnReport.for_ups(hook_input)
+        turn.report = _session_ops.TurnReport.for_ups(hook_input)
     except Exception as exc:  # noqa: BLE001
         print(f"[vault-loader] 会话快照初始化失败：{exc}", file=sys.stderr)
 
 
-def _report_status(status: str) -> None:
-    if _REPORT is not None:
-        _REPORT.status = status
+def _report_status(turn: _Turn, status: str) -> None:
+    if turn.report is not None:
+        turn.report.status = status
 
 
-def _take_session_ops(config: dict, home: Path, cfg_fallback=None):
+def _take_session_ops(turn: _Turn, config: dict, home: Path, cfg_fallback=None):
     """通过全部停用闸门后才读请求；标注在这里处理（与召回无关，闸门轮也处理）。
 
     标注的拒收是终局（mod 收到即从队列删除），所以只在确知不该写时拒收：
@@ -240,7 +312,7 @@ def _take_session_ops(config: dict, home: Path, cfg_fallback=None):
     - dry_run 承诺「预览、不落盘」，不表示要丢弃用户的标注。
     这两种都既不 ack 也不拒收，标注留在 mod 队列里下一轮重投。
     """
-    rep = _REPORT
+    rep = turn.report
     if rep is None or not rep.request_seen:
         return None
     # 闸门轮的出口不经过 _fill_report：在这里先报一次，否则快照恒为 false，mod 收到后把
@@ -267,21 +339,58 @@ def _take_session_ops(config: dict, home: Path, cfg_fallback=None):
     return ops
 
 
-def _report_llm(config: dict, cwd: Path, hook_input: dict, *, in_scoring=None,
-                spawn_outcome=None) -> None:
+def _inflight_quiet(session_id: str):
+    """本会话未过期的在飞标记；没有、读不了或精排模块不可用时 None（只服务快照，fail-open）。"""
+    if not session_id or _fine_state is None:
+        return None
+    try:
+        return _fine_state.inflight_active(session_id, time.time())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fine_quiet(session_id: str):
+    """本会话的 fine 状态（只读一次）；读不了时 None（只服务快照，fail-open）。"""
+    if not session_id or _fine_state is None:
+        return None
+    try:
+        return _fine_state.load_fine(session_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _report_llm(turn: _Turn, config: dict, cwd: Path, hook_input: dict, *, in_scoring=None,
+                spawn_outcome=None, raw_model=None) -> None:
     """快照的 `llm`：LLM 精排此刻的状态（spec 2026-10-12 §3.1）。
 
     只在本轮有 mod 请求时读 topics 文件；出错只打一行 stderr、`rep.llm` 保持调用前的值，绝不连累召回
     （`main()` 没有 except，异常逃出去本轮注入整体丢失）。第一次调用在停用闸门之后、召回闸门之前
     （闸门轮也带状态；`disabled` 出口不带），打分轮在 spawn 之后再调一次，带上本轮打分实际用了几个
     主题词与本轮 spawn 的结果；第二次出错时留下的是第一次的结果（`in_scoring` 为 None）。
+
+    `fine` / `inflight`：本会话的精排状态与在飞标记。不传 inflight 时刚发起的这一轮显示「尚未发起」而不是
+    「提炼中」；不传 fine 时被停用的会话也显示「尚未发起」，看不到停用原因与最近一次失败。第一次调用早于
+    `begin_turn`，此时按会话 id 直接读（闸门轮只有这一次调用）；第二次用本轮 `TurnFine.state`。
+    `raw_model`：本轮实际生效的模型名原值（会话设置里选的优先，其次是会话设置合并之前 config 里的
+    `relevance.fine_model`）。合并后的 config 已把不合法的模型名归一成 haiku（`_fine_config.apply_session_settings`），
+    据它判不出 bad_model（spec §5.2：回落 haiku、快照如实报出）；判据仍只在 `describe_session_topic` 一处，
+    这里只把原值放回去给它看。
     """
-    rep = _REPORT
+    rep = turn.report
     if rep is None or not rep.request_seen or _session_ops is None:
         return
     try:
-        llm = describe_session_topic(cwd, hook_input.get("session_id", "") or "", config,
-                                     spawn_outcome=spawn_outcome)
+        tf = turn.fine
+        sid = hook_input.get("session_id", "") or ""
+        # 第一次调用早于 begin_turn（tf 为 None），而闸门轮只有这一次：在飞标记与 fine 状态都按会话 id 直接读，
+        # 否则闸门轮的面板看不到「提炼中」与停用原因（2.4.0 起 topics 不写 pending 占位）。
+        inflight = _inflight_quiet(sid)
+        fine = tf.state if tf is not None else _fine_quiet(sid)
+        desc_cfg = config
+        if raw_model is not None:
+            desc_cfg = dict(config, relevance=dict(config.get("relevance") or {}, fine_model=raw_model))
+        llm = describe_session_topic(cwd, sid, desc_cfg,
+                                     spawn_outcome=spawn_outcome, fine=fine, inflight=inflight)
         llm["words"] = [w for w in (_session_ops.display_text(x, 40) for x in llm["words"]) if w][:8]
         llm["in_scoring"] = in_scoring
         rep.llm = llm
@@ -292,23 +401,6 @@ def _report_llm(config: dict, cwd: Path, hook_input: dict, *, in_scoring=None,
 # 故不能用 None 区分"调用方没传"。没传 → 渲染层按 select_fulltext 自行回退计算
 # （仅剩测试/未接决策层的调用点会走到；生产 main() 恒显式传值）。
 _UNSET = object()
-
-# 一次性对账标记（`mark_pinned_accounted`）的延迟登记：只在 `_finish_with_metrics` 里 flush
-# **没抛**之后才翻（1A-M2 / 1B-M-3）。`stage` 是零 IO 缓冲，真正落盘在 flush；此前标记在 stage 之后
-# 立即翻，flush 失败时那份每会话一次的对账数据永久丢失且无任何信号。生产里每轮 hook 是新进程，
-# 这个模块级变量只活一轮；`main()` 入口先清一次，防同进程多轮调用（测试）串味。
-_PENDING_PIN_ACCOUNT: "tuple[Path, str] | None" = None
-
-
-def _register_pin_account(cwd: Path, session_id: str) -> None:
-    global _PENDING_PIN_ACCOUNT
-    _PENDING_PIN_ACCOUNT = (cwd, session_id)
-
-
-def _take_pin_account():
-    global _PENDING_PIN_ACCOUNT
-    v, _PENDING_PIN_ACCOUNT = _PENDING_PIN_ACCOUNT, None
-    return v
 
 
 # 摘要清单里单个标题的字符上限。标题来自 cache 的 path 键（不可信），除净化外还需
@@ -441,55 +533,61 @@ def _make_hits_getter(prompt_keywords, hits_by_path):
     return _get
 
 
-def _candidate_title(entry, short_chars: int) -> str:
-    """summary 为空或过短 → 回退文件名标题（治短摘要无法被主模型判断）。
-    F5：无论哪个分支，返回前净化——summary 是不可信笔记内容，回退用的文件名同样源自
-    不可信笔记 path，均需剥控制字符 + 折叠换行（清单单行项，防伪造分隔符/新段落）。"""
-    summary = entry.summary or ""
-    if len(summary) < short_chars:
-        name = entry.path.split("/")[-1]
-        name = name[:-3] if name.endswith(".md") else name
-        return sanitize_injected_text(f"{name}（仅标题，summary 缺失）", keep_newlines=False)
-    return sanitize_injected_text(summary, keep_newlines=False)
-
-
 # 用户可见文案里嵌的是**真实配置键名**（1A-L11：键一旦改名，用户会照着一个不存在的键去配）。
 # 守卫 test_skill_doc_config_coverage.py::test_pin_header_names_a_real_config_key 钉住它在 DEFAULT_CONFIG 里。
 PIN_SWITCH_KEY = "session_pin_enabled"
 PIN_HEADER = f"📌 本会话固定上下文（LLM 首轮点名；`relevance.{PIN_SWITCH_KEY}: false` 可关）："
 
 
-def render_pinned_section(pinned_paths, active_entries: dict, already: set, short_chars: int,
-                          with_notice: bool = True):
-    """会话级固定注入小节。返回 (文本 或 "", 实际渲染 path 列表)。
+def _section_lines(paths, active_entries: dict, already: set, vault_path, short_chars: int,
+                   cap: "int | None" = None):
+    """三个会话级小节共用的逐篇渲染。
 
-    **默认自带 `INJECTION_NOTICE`**：全文分支的 `out_lines`（`build_injection_text_ups` 里以「📚 vault-loader 强命中」开头的那段）没有外层隔离声明、
-    nonce fence 只包 `ft_body`，pinned 小节若追加在那里就落在任何隔离声明之外（reverse/impact
-    /feasibility 三维各自抓到）。清单分支头部已有一份，调用方传 `with_notice=False` 免重复
-    （1A-L7）；admitted 为空的早退分支小节单独成篇，必须带。path 与 summary 同源自不可信 cache，走 F5 净化。
-    只从 `active_entries` 取（已过 archived 过滤）、`.get()` 跳过缺失——pinned 指向已删除笔记
-    时不得让 KeyError 被顶层 fail-open 吞成「整轮无注入」。
+    只从 `active_entries` 取（已过归档与工作日志过滤）、`.get()` 跳过缺失——指向已删除笔记时不得让
+    KeyError 被顶层 fail-open 吞成「整轮无注入」；跳过 `already` 与自身重复。行格式走
+    `_inject_format.note_line`：标题、摘要与插件生成的绝对路径都在那里净化（spec 2026-10-13 §8.1）。
+    `cap` 按给出顺序截（补充的顺序是模型给的相关度顺序，F68）。
     """
+    vp = vault_path if vault_path is not None else _NO_VAULT
     lines: list[str] = []
     rendered: list[str] = []
+    for p in (paths or []):
+        if cap is not None and len(rendered) >= cap:
+            break
+        if not isinstance(p, str) or p in already or p in rendered:
+            continue
+        e = active_entries.get(p)
+        if e is None:
+            continue
+        lines.append(note_line(p, e, vp, short_chars=short_chars))
+        rendered.append(p)
+    return lines, rendered
+
+
+def _section(header: str, paths, active_entries: dict, already: set, short_chars: int,
+             with_notice: bool, vault_path, cap: "int | None" = None, what: str = "小节"):
     try:
-        for p in (pinned_paths or []):
-            if not isinstance(p, str) or p in already or p in rendered:
-                continue
-            e = active_entries.get(p)
-            if e is None:
-                continue
-            path_clean = sanitize_injected_text(p, keep_newlines=False)
-            title = _candidate_title(e, short_chars)
-            lines.append(f"- [[{path_clean}]] — {title}")
-            rendered.append(p)
+        lines, rendered = _section_lines(paths, active_entries, already, vault_path, short_chars, cap)
     except Exception as exc:                     # noqa: BLE001 — fail-open
-        print(f"[vault-loader] pinned 渲染失败：{exc}", file=sys.stderr)
+        print(f"[vault-loader] {what}渲染失败：{exc}", file=sys.stderr)
         return "", []
     if not lines:
         return "", []
     head = [INJECTION_NOTICE.rstrip("\n")] if with_notice else []
-    return "\n".join([*head, PIN_HEADER, *lines]), rendered
+    return "\n".join([*head, header, PATH_NOTE, *lines]), rendered
+
+
+def render_pinned_section(pinned_paths, active_entries: dict, already: set, short_chars: int,
+                          with_notice: bool = True, vault_path=None):
+    """会话级固定注入小节（LLM 首轮点名）。返回 (文本 或 "", 实际渲染 path 列表)。
+
+    **默认自带 `INJECTION_NOTICE`**：全文分支的 `out_lines`（以「📚 vault-loader 强命中」开头的那段）
+    没有外层隔离声明、nonce fence 只包 `ft_body`，小节追加在那里就落在任何隔离声明之外。清单分支头部
+    已有一份，调用方传 `with_notice=False` 免重复（1A-L7）；admitted 为空或粗排不展示时小节单独成篇，
+    必须带。小节头之后紧跟 `PATH_NOTE`（spec §8.1）。`vault_path` 缺省时省略路径字段。
+    """
+    return _section(PIN_HEADER, pinned_paths, active_entries, already, short_chars,
+                    with_notice, vault_path, what="pinned ")
 
 
 # 手动钉住另起一个小节头（spec N6：`PIN_HEADER` 一字不改，不用 mod 的用户注入正文不变）。
@@ -497,33 +595,22 @@ USER_PIN_HEADER = "📌 本会话手动钉住（/vault-injected 里操作）："
 
 
 def render_user_pins_section(user_pins, active_entries: dict, already: set, short_chars: int,
-                             with_notice: bool = True):
+                             with_notice: bool = True, vault_path=None):
     """手动钉住小节。返回 (文本 或 "", 实际渲染 path 列表)。
 
-    与 `render_pinned_section` 同形：只从 `active_entries` 取、`.get()` 跳过缺失、path 与
-    summary 走 F5 净化。`already` 只含**本轮**已注入与本轮 LLM 点名渲染的篇——**不含**跨会话的
-    `fulltext_injected`：用户显式钉住的篇，被另一会话 24 小时内全文注入过不是不渲染的理由
-    （feasibility M4）。
+    `already` 只含**本轮**已注入与本轮 LLM 点名渲染的篇——**不含**跨会话的 `fulltext_injected`：
+    用户显式钉住的篇，被另一会话 24 小时内全文注入过不是不渲染的理由（feasibility M4）。
     """
-    lines: list[str] = []
-    rendered: list[str] = []
-    try:
-        for p in (user_pins or []):
-            if not isinstance(p, str) or p in already or p in rendered:
-                continue
-            e = active_entries.get(p)
-            if e is None:
-                continue
-            path_clean = sanitize_injected_text(p, keep_newlines=False)
-            lines.append(f"- [[{path_clean}]] — {_candidate_title(e, short_chars)}")
-            rendered.append(p)
-    except Exception as exc:                     # noqa: BLE001 — fail-open
-        print(f"[vault-loader] 手动钉住渲染失败：{exc}", file=sys.stderr)
-        return "", []
-    if not lines:
-        return "", []
-    head = [INJECTION_NOTICE.rstrip("\n")] if with_notice else []
-    return "\n".join([*head, USER_PIN_HEADER, *lines]), rendered
+    return _section(USER_PIN_HEADER, user_pins, active_entries, already, short_chars,
+                    with_notice, vault_path, what="手动钉住")
+
+
+def render_supp_section(supp_paths, active_entries: dict, already: set, short_chars: int,
+                        with_notice: bool = True, vault_path=None, cap: "int | None" = None):
+    """精排补充小节（spec 2026-10-13 §8.1：`SUPP_HEADER`，只出现一次）。返回 (文本 或 "", 实际渲染
+    path 列表)。`cap` 是本轮补充上限 `fine_max_notes`。"""
+    return _section(SUPP_HEADER, supp_paths, active_entries, already, short_chars,
+                    with_notice, vault_path, cap, what="精排补充")
 
 
 def build_injection_text_ups(scored, keywords_str, prompt_keywords, ups_cfg, rel_cfg, vault_path,
@@ -605,13 +692,12 @@ def build_injection_text_ups(scored, keywords_str, prompt_keywords, ups_cfg, rel
             "",
         ]
         if rest:
-            out_lines.append(f"💡 还有 {len(rest)} 篇候选，需要时运行 `/vault <关键词>` 加载：")
+            out_lines.append(f"💡 还有 {len(rest)} 篇候选：")
+            out_lines.append(PATH_NOTE)
             for (_tot, _top, e), _dist in zip(rest, rest_hits):
-                _path_clean = sanitize_injected_text(e.path, keep_newlines=False)
-                _hits_str = "、".join(_dist) or "—"
-                out_lines.append(
-                    f"- [[{_path_clean}]]（{_confidence_label(_top, _dist, conf_high)}置信，"
-                    f"命中：{_hits_str}）")
+                out_lines.append(note_line(
+                    e.path, e, vault_path, short_chars=short_chars,
+                    annot=coarse_annot(_confidence_label(_top, _dist, conf_high), _dist)))
         injected_paths = [ft_entry.path] + [e.path for _, _, e in rest]
         return "\n".join(out_lines), injected_paths, ft_entry.path
 
@@ -629,23 +715,22 @@ def build_injection_text_ups(scored, keywords_str, prompt_keywords, ups_cfg, rel
         f"📚 vault-loader 候选（按本轮提问关键词粗筛：{shown_hits_str}）",
         "请仅在确与当前话题相关时参考、按需 `/vault` 展开；流程词（如 superpowers/brainstorming）"
         "不代表话题相关，若都不相关请忽略。",
+        PATH_NOTE,
         "",
     ]
     for (_tot, _top, e), hit_list in zip(top_n, hit_lists):
         conf = _confidence_label(_top, hit_list, conf_high)
-        hits = "、".join(hit_list) or "—"
-        title = _candidate_title(e, short_chars)
-        # F5：wikilink 嵌入点净化 path 控制字符（同 title/summary 一致对待）
-        path_clean = sanitize_injected_text(e.path, keep_newlines=False)
-        out_lines.append(f"- [[{path_clean}]]（{conf}置信，命中：{hits}）— {title}")
+        # 标题、摘要、路径的净化都在 note_line 里（F5 与 spec §8.1 的伪造路径防线在同一处）
+        out_lines.append(note_line(e.path, e, vault_path, short_chars=short_chars,
+                                   annot=coarse_annot(conf, hit_list)))
     out_lines.append("")
-    out_lines.append("💡 运行 `/vault <关键词>` 加载全文")
+    out_lines.append("💡 `/vault <关键词>` 可检索更多笔记")
     injected_paths = [e.path for _, _, e in top_n]
     return "\n".join(out_lines), injected_paths, None
 
 
 def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, display_cfg, rel_cfg,
-                      hits_by_path=None, pinned_paths=None):
+                      hits_by_path=None, pinned_paths=None, supp_paths=None):
     """UserPromptSubmit 用户可见清单摘要。verbosity=off → None。
     items: list[(total, topical, entry)]。
     hits_by_path: 决策层 {path: hits} 缓存（可选，缺省现算；见 `_make_hits_getter`）。
@@ -653,7 +738,9 @@ def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, di
         原始 path，即 rendered）；标题经函数内 `_title()` 派生——与其余标题同走
         `sanitize_injected_text(..., keep_newlines=False)[:MAX_TITLE_CHARS]`（SEC-1），
         不接受调用方预先算好、未经净化的标题字符串。追加进「N 笔记」计数与摘要尾部的
-        📌 段；None/空列表时行为与加参数前逐字一致。"""
+        📌 段；None/空列表时行为与加参数前逐字一致。
+    supp_paths: 本轮渲染的精排补充 path 列表（`render_supp_section` 的 rendered），同样计入「N 笔记」、
+        标题同走 `_title()`，在 📌 段之后单列 🔎 段。"""
     verbosity = display_cfg.get("verbosity", "compact")
     if verbosity == "off":
         return None
@@ -666,7 +753,7 @@ def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, di
     _hits = _make_hits_getter(prompt_keywords, hits_by_path)
     hit_lists = [_hits(e) for _, _, e in items]
     kw = ", ".join(sorted(set().union(*hit_lists)))
-    n = len(items) + len(pinned_paths or [])
+    n = len(items) + len(pinned_paths or []) + len(supp_paths or [])
 
     def _title(path):
         """标题源自 cache 的 path 键 —— **不可信外部输入**，必须净化后截断（SEC-1）。
@@ -685,6 +772,8 @@ def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, di
 
     ft = f" · 全文加载：{_title(fulltext_title)}" if fulltext_title else ""
     pin = (" · 📌" + "·".join(_title(p) for p in pinned_paths)) if pinned_paths else ""
+    # 精排补充（spec 2026-10-13）：与 📌 分开标，用户据此知道这几篇是上一轮精排补的、只出现一次
+    supp = (" · 🔎" + "·".join(_title(p) for p in supp_paths)) if supp_paths else ""
     if verbosity == "compact":
         titles = "·".join(_title(e.path) for _, _, e in items[:3])
         more = "…" if len(items) > 3 else ""
@@ -692,15 +781,16 @@ def build_summary_ups(items, prompt_keywords, fulltext_title, injection_text, di
         # （1A-L4）——这一档按设计会常态出现，不能让它看起来像坏了。有内容时形态与改前逐字相同。
         bracket = f"[{titles}{more}]" if titles else ""
         hit = f" 命中[{kw}]" if kw else ""
-        return f"📚 vault-loader(提问): {n}笔记{bracket}{hit}{size}{ft}{pin} · /vault 展开"
+        return f"📚 vault-loader(提问): {n}笔记{bracket}{hit}{size}{ft}{pin}{supp} · /vault 展开"
     hit = f" · 命中[{kw}]" if kw else ""
-    head = f"📚 vault-loader · 提问注入 · {n} 笔记{hit}{size}{ft}{pin}"
+    head = f"📚 vault-loader · 提问注入 · {n} 笔记{hit}{size}{ft}{pin}{supp}"
     body = [f"- {_title(e.path)}  [{_confidence_label(top, hit_list, conf_high)}置信]"
             for (_, top, e), hit_list in zip(items, hit_lists)]
     return "\n".join([head, *body, "💡 /vault <关键词> 展开全文"])
 
 
 def _finish(
+    turn: _Turn,
     config: dict,
     cwd: Path,
     additional_context: str | None = None,
@@ -721,13 +811,16 @@ def _finish(
     except Exception as exc:  # noqa: BLE001 — 诊断绝不阻断召回
         print(f"[vault-loader] 诊断渲染失败，已跳过：{exc}", file=sys.stderr)
         diag_text = ""
+    if turn.persist_notes:
+        note = "\n".join(turn.persist_notes)
+        system_message = f"{note}\n{system_message}" if system_message else note
     if diag_text:
         system_message = f"{diag_text}\n{system_message}" if system_message else diag_text
     emit(additional_context, system_message, "UserPromptSubmit")
     return 0
 
 
-def _stage_gate_record(config: dict, hook_input: dict, gate: str) -> None:
+def _stage_gate_record(turn: _Turn, config: dict, hook_input: dict, gate: str) -> None:
     """给「未走到打分就早退」的轮次留一条极简记录。
 
     改动前这四类轮次完全不落盘，导致 `gate` 字段恒为空、报表的闸门分布退化成
@@ -750,23 +843,28 @@ def _stage_gate_record(config: dict, hook_input: dict, gate: str) -> None:
     metrics 关闭时也落盘、绕过 opt-in 边界。
     fail-open：任何异常只打 stderr，绝不连累召回。
     """
-    _report_status(f"gate:{gate}")
+    _report_status(turn, f"gate:{gate}")
     if not config.get("metrics", {}).get("enabled", False):
         return
     try:
-        _metrics.stage({
-            "_schema": _metrics.current_schema(),
-            "ts": round(time.time(), 3),
-            "session": hook_input.get("session_id", "") or "",
-            "prompt_id": hook_input.get("prompt_id", "") or "",
-            "gate": gate,
-            **_metrics.runtime_record_fields(),
-        })
+        _metrics.stage(_gate_base(hook_input, gate))
     except Exception as exc:  # noqa: BLE001
         print(f"[vault-loader] gate 记录构造失败：{exc}", file=sys.stderr)
 
 
-def _finish_with_metrics(config: dict, cwd: Path,
+def _gate_base(hook_input: dict, gate: str) -> dict:
+    """闸门早退记录的基础键（`_metrics.GATE_RECORD_KEYS` 五键 + 命名空间字段）。"""
+    return {
+        "_schema": _metrics.current_schema(),
+        "ts": round(time.time(), 3),
+        "session": hook_input.get("session_id", "") or "",
+        "prompt_id": hook_input.get("prompt_id", "") or "",
+        "gate": gate,
+        **_metrics.runtime_record_fields(),
+    }
+
+
+def _finish_with_metrics(turn: _Turn, config: dict, cwd: Path,
                          additional_context: str | None = None,
                          system_message: str | None = None) -> int:
     """先走原出口完成 emit，再写 metrics。
@@ -779,8 +877,13 @@ def _finish_with_metrics(config: dict, cwd: Path,
     超期清理与其余全部 metrics 副作用（落盘、near-miss 计数、nudge 提示）同一
     opt-in 前提：未开启时不落盘也不做任何 metrics 目录相关 IO，维持零足迹。
     """
-    pending_pin = _take_pin_account()
-    rc = _finish(config, cwd, additional_context, system_message)
+    rc = _finish(turn, config, cwd, additional_context, system_message)
+    # 本轮 fine 状态的唯一一次条件写：在 emit 之后（写回失败不影响本轮已发出的注入）、metrics annotate
+    # 之前（写回失败记的 `degraded=lock` 要随本轮记录落盘，见 `_finish_fine`）。
+    # 子进程统计只在 metrics 开着的闸门轮留队（闸门记录放不下它，留到下一个过闸轮计）；
+    # 过闸轮一律出队并账，记录构造失败也一样——外发字节记账优先于 metrics 完整；metrics 关时照常出队。
+    metrics_on = bool((config.get("metrics", {}) or {}).get("enabled", False))
+    _finish_fine(turn.fine, consume_stats=(not metrics_on) or turn.past_gate)
     try:
         mcfg = config.get("metrics", {}) or {}
         enabled = mcfg.get("enabled", False)
@@ -795,27 +898,383 @@ def _finish_with_metrics(config: dict, cwd: Path,
         # 分母那一侧由 summarize 用 `"inj_chars" in r` 判存在来配套，不用 .get(0)。
         if enabled and additional_context is not None:
             _metrics.annotate(inj_chars=len(additional_context))
+        if enabled and turn.full_record:
+            _annotate_fine(turn.fine)
         retention_days = mcfg.get("retention_days", 90) if enabled else None
         _metrics.flush(Path.home(), retention_days=retention_days)
         # 1A-M2 / 1B-M-3：一次性对账标记只在记录**真正落盘之后**才翻——flush 里 write_record 抛了
         # 就走不到这行，下一轮重算重记（at-least-once：多一条对账记录在报表上可见，静默少一条不可见）。
-        if pending_pin is not None:
-            mark_pinned_accounted(*pending_pin)
+        if turn.pending_pin is not None:
+            mark_pinned_accounted(*turn.pending_pin)
     except Exception as exc:  # noqa: BLE001 — 指标绝不阻断召回
         _report_nonfatal("metrics 写入失败", exc)
     return rc
 
 
-def _fill_report(*, config: dict, prompt: str, home: Path, active_entries: dict,
+def _finish_fine(tf, *, consume_stats: bool = True) -> None:
+    """本轮 fine 状态的唯一一次条件写（spec 2026-10-13 §7）。放在 emit 之后、metrics annotate 与 flush
+    之前（`_finish_with_metrics`）：写失败只影响下一轮（少一次投递或多一次发起），绝不影响本轮已发出的
+    注入；而 `finish_turn` 写失败时往 `tf.degraded` 追加的 `lock` 要由随后的 `_annotate_fine` 落进本轮
+    记录（放在 flush 之后，这个码没有任何消费者）。
+
+    `consume_stats` 原样交给 `finish_turn`。调用处只在 metrics 开、且本轮没过闸（闸门轮）时传 False：闸门
+    记录放不下子进程统计，留到下一个过闸轮再计。过闸轮一律消费，记录构造失败也一样。
+    精排只在过闸轮发起、过闸轮必定出队，所以两次过闸之间 stats_q 至多新增 1 条——这个上界不依赖 metrics
+    是否健康，留队不会触到 `STATS_Q_MAX` 的截断（「只在过闸轮发起」由 `_maybe_spawn` 读 `_Turn.past_gate`
+    保证，见 `_Turn.mark_scored`）。"""
+    if tf is None or _fine_flow is None:
+        return
+    try:
+        _fine_flow.finish_turn(tf, consume_stats=consume_stats)
+    except Exception as exc:  # noqa: BLE001
+        _report_nonfatal("精排状态写回失败", exc)
+
+
+def _begin_fine(hook_input: dict, config: dict, session_ops):
+    """读一次本会话 fine 状态（spec §4 ②③）。
+
+    dry_run 整轮不走精排：dry_run 下从不发起提炼（F08），也就没有补充可投递；会话设置与 persist
+    一并按 dry_run「预览、不落盘」的承诺跳过。请求里的会话设置经 `_request_settings(session_ops)` 取出，
+    由 `begin_turn` 合并进本轮有效 config。返回本轮的 `TurnFine`（调用方放进 `_Turn.fine`）或 None。
+    """
+    if _fine_flow is None or config.get("dry_run", False):
+        return None
+    try:
+        return _fine_flow.begin_turn(hook_input.get("session_id", "") or "", config,
+                                     _request_settings(session_ops))
+    except Exception as exc:  # noqa: BLE001
+        _report_nonfatal("精排状态读取失败", exc)
+        return None
+
+
+def _report_vault_root(turn: _Turn, vault_path: Path) -> None:
+    """快照的 `vault_root`：mod 据此判断主模型 Read 的路径在不在 vault 内（spec §10.5）。
+    只在本轮有 mod 请求时写；超长不发、不截断（截断的前缀会把 vault 外的路径误判成 vault 内），
+    判据单点在 `_session_ops.vault_root_text`。"""
+    rep = turn.report
+    if rep is None or not rep.request_seen or _session_ops is None:
+        return
+    try:
+        rep.vault_root = _session_ops.vault_root_text(vault_path.resolve())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 快照 vault_root 填充失败：{exc}", file=sys.stderr)
+
+
+def _active_entries(entries: dict, rel_cfg: dict) -> dict:
+    """召回池：剔除归档与工作日志。
+
+    archived 等排除 tag 不进召回池（卫生措施非安全边界；/vault 手动检索不受影响）。工作日志同层剔除
+    （spec 2026-10-13 W1）：它们的摘要是模板、tag 只有「工作日志」，粗排结构上无法按内容命中，只会被泛词
+    带进来；SessionStart 的近期日志清单走信号 F 直接扫目录，不受影响。结果是 decide_injection 的输入前提
+    ——tag_df/n_docs 必须与其决策循环同口径（均基于它），所以两类剔除放在同一处。
+    """
+    exclude_tags = {t.lower() for t in rel_cfg.get("exclude_note_tags", [])}
+    return {p: e for p, e in entries.items()
+            if not is_archived(e, exclude_tags) and not is_worklog(p, e)}
+
+
+def _supp_ready(tf, active_entries: dict, excluded_paths) -> list:
+    """F25：投递前按**当前**的本会话排除、精排开关与本会话已注入重核（上限在渲染时按 fine_max_notes 截）。
+    不在 `active_entries` 里的（已删除、归档、工作日志）直接跳过。"""
+    if tf is None or not tf.supp_candidates or not fine_supplement_on(tf.view.config):
+        return []
+    injected = set(tf.state.injected or [])
+    out: list = []
+    for p in tf.supp_candidates:
+        if p in excluded_paths or p in injected or p not in active_entries or p in out:
+            continue
+        out.append(p)
+    return out
+
+
+def _note_fine_delivery(tf, rendered_all: list, supp_rendered: list) -> None:
+    """把本轮渲染进上下文的篇登记进本会话已注入集合（Q5），并记下实际投递的补充。"""
+    if tf is None:
+        return
+    tf.injected_add.extend(p for p in rendered_all if isinstance(p, str))
+    tf.delivered = list(supp_rendered)
+
+
+def _report_supps(turn: _Turn, rendered: list, judged: list, *, recheck: str, dropped=()) -> None:
+    """快照 `supps[]`（spec §10.6）：本轮判过的补充逐篇给出复核结果与是否渲染。条目形状与值域走
+    `_session_ops.supp_item`；复核未命中的记 `failed`（`_session_ops.SUPP_RECHECKS`）。"""
+    tf, rep = turn.fine, turn.report
+    if tf is None or rep is None or not rep.request_seen or _session_ops is None:
+        return
+    try:
+        items = [_session_ops.supp_item(p, tf.supp_src_seq, recheck, p in rendered) for p in judged]
+        items += [_session_ops.supp_item(p, tf.supp_src_seq, "failed", False)
+                  for p in dropped if p not in judged]
+        rep.supps = items[:_session_ops.MAX_LIST_ITEMS]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 快照补充明细填充失败：{exc}", file=sys.stderr)
+
+
+def _stat_int(v) -> int:
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def _annotate_fine(tf) -> None:
+    """完整决策记录上的精排计数（spec §12）。只在 `_Turn.full_record` 时调，且在 `_finish_fine` 之后调：
+    写回失败记的 `degraded=lock` 由这里落盘。只读 `tf`：补充的时效丢弃与复核丢弃数都在它上面。
+
+    子进程统计（fine 状态的 stats_q）在本轮并账：它们是此前发起、本轮开始前已写回的那些调用；
+    `finish_turn` 会按 gen_id 把同一批从队列里移除，所以每次调用只计一次。写回失败（`lock`）时它们没出队、
+    下一轮还会读到，本轮就不计这部分（子进程计数、字节、来自统计的降级码），留给写成的那一轮；
+    tf 自身的降级码照常计，含 `lock`。"""
+    if tf is None:
+        return
+    try:
+        stats = ([] if "lock" in tf.degraded
+                 else [s for s in tf.stats if isinstance(s, dict)])
+        degraded = set(tf.degraded)
+        for s in stats:
+            d = s.get("degraded")
+            if isinstance(d, list):
+                degraded.update(x for x in d if isinstance(x, str))
+        n_del = len(tf.delivered)
+        _metrics.annotate(
+            supp_shown=list(tf.delivered),
+            n_supp_gen=1 if tf.supp_gen else 0,
+            n_supp_drop_stale=tf.stale_dropped,
+            n_supp_drop_recheck=tf.recheck_dropped,
+            n_supp_delivered=n_del,
+            n_supp_late_delivered=n_del if tf.late else 0,
+            bytes_sent=_stat_int(tf.state.bytes_sent) + sum(_stat_int(s.get("bytes")) for s in stats),
+            n_fine_done=len(stats),
+            n_fine_fail=sum(1 for s in stats if s.get("ok") is False),     # n_fine_done 里失败的那几次
+            llm_none=sum(1 for s in stats if s.get("none") is True),
+            n_echo_mismatch=sum(_stat_int(s.get("n_echo_mismatch")) for s in stats),
+            n_catalog=sum(_stat_int(s.get("n_catalog")) for s in stats),
+            n_catalog_dropped=sum(_stat_int(s.get("n_catalog_dropped")) for s in stats),
+            n_summary_layer=sum(_stat_int(s.get("n_summary_layer")) for s in stats),
+            degraded=sorted(degraded),
+        )
+    except Exception as exc:  # noqa: BLE001 — metrics 绝不阻断召回
+        print(f"[vault-loader] 精排计数落盘失败：{exc}", file=sys.stderr)
+
+
+def _gate_releases_supp(turn: _Turn) -> None:
+    """指代型 / 关键词不足的闸门轮不认领、不投递补充（2.4.0 批次 3c）：撤销 `begin_turn` 对补充的认领，
+    让它留到下一个过闸轮照时效判（理由见 `_fine_flow.release_supp_claim`）。"""
+    if turn.fine is not None and _fine_flow is not None:
+        _fine_flow.release_supp_claim(turn.fine)
+
+
+def _request_settings(session_ops):
+    """本轮 mod 请求里的会话设置。没有请求、请求不带 `settings` 键（2.3.0 形态的 mod）、`settings` 不是对象，
+    或整份请求作废（bad_request）时返回 None——沿用已存的会话设置（`_fine_flow.begin_turn` 的契约），不把这几种
+    情形当成「用户清空了设置」。只有显式给出 `settings: {}` 才返回 {}、清空已存的那份。
+
+    判据只有 `SessionOps.has_settings` 一个：整份作废的请求由 `_session_ops.parse_request` 置为 False，
+    不再另判 `rejected` 里的 bad_request（两道关卡时去掉任一道都不会有用例转红）。"""
+    if session_ops is None or not getattr(session_ops, "has_settings", False):
+        return None
+    s = getattr(session_ops, "settings", None)
+    return s if isinstance(s, dict) else None
+
+
+def _report_settings(turn: _Turn) -> None:
+    """快照 `settings{effective, session, locked, source}`（spec §10.6）与会话设置的拒收。
+    形状、取值净化与键集合走 `_session_ops.settings_snapshot` 单点（只输出面板认识的键）。"""
+    tf, rep = turn.fine, turn.report
+    if tf is None or rep is None or not rep.request_seen or _session_ops is None:
+        return
+    try:
+        v = tf.view
+        rep.settings = _session_ops.settings_snapshot(v.effective, v.session, v.locked, v.source)
+        rep.rejected.extend(v.rejected)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 快照会话设置填充失败：{exc}", file=sys.stderr)
+
+
+def _load_config_set():
+    """按插件内相对位置加载 `skills/config/scripts/config_set.py`（与 vault-loader 同属一个插件）。
+    legacy 独立布局下该文件不存在 → ImportError，调用方按 unavailable 拒收（spec §11）。"""
+    import importlib.util
+    path = Path(__file__).resolve().parents[2] / "config" / "scripts" / "config_set.py"
+    if not path.is_file():
+        raise ImportError(f"config_set 不在 {path}")
+    spec = importlib.util.spec_from_file_location("_cv_config_set", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _persist_raw(value) -> str:
+    """`set_key` 收的是命令行形态的字符串：bool 写 true/false，其余按 str。"""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _apply_persist(turn: _Turn, session_ops, cfg_fallback) -> None:
+    """「设为默认」（spec §10.4、§11）：只允许收窄（`check_persist`），经 `config_set.set_key` 写回。
+
+    config 读坏回落默认值的那一轮不执行、也不拒收（与标注「不 ack 也不拒收」同口径）；dry_run 轮次
+    本就没有 tf。成功的写进快照 `persisted[]`，并在本轮 systemMessage 说明一次。拒收原因：加载不了 config
+    skill（legacy 独立布局）记 `unavailable`；`set_key` 返回失败或抛异常记 `write_failed`。会话设置照常生效。"""
+    tf, rep = turn.fine, turn.report
+    keys = list(getattr(session_ops, "persist", ()) or ()) if session_ops is not None else []
+    if tf is None or not keys or cfg_fallback is not None:
+        return
+    cs = None                     # config_set 模块；加载失败时为 False，本轮余下的键一律 unavailable
+    for key in keys:
+        value = tf.view.effective.get(key) if isinstance(key, str) else None
+        try:
+            reason = check_persist(key, value, tf.view)
+        except Exception:  # noqa: BLE001
+            reason = "bad_key"
+        if reason is None:
+            full = key if key.startswith("user_prompt_submit.") else f"relevance.{key}"
+            if cs is None:
+                try:
+                    cs = _load_config_set()
+                except Exception:  # noqa: BLE001 — legacy 独立布局没有 config skill（spec §11）
+                    cs = False
+            if cs is False:
+                reason = "unavailable"
+            else:
+                try:
+                    res = cs.set_key(full, _persist_raw(value))
+                except Exception:  # noqa: BLE001 — set_key 本应不抛；抛了也只算这一键写失败
+                    res = None
+                if isinstance(res, dict) and res.get("ok"):
+                    if rep is not None:
+                        rep.persisted.append(key)
+                    turn.persist_notes.append(
+                        f"📚 vault-loader：已把 {full} 设为默认：{_persist_raw(value)}（/config 可查看或改回）")
+                    continue
+                reason = "write_failed"
+        if rep is not None:
+            rep.rejected.append({"what": "persist", "key": str(key)[:64], "reason": reason})
+
+
+def _record_reads(tf, session_ops, entries: dict) -> None:
+    """D6：mod 观测到的主模型 Read（vault 内相对路径）按索引核对后落 metrics。只在完整记录上落，
+    与已注入 path 同一保护边界（相对路径、不含正文）。"""
+    reads = list(getattr(session_ops, "reads", ()) or ()) if session_ops is not None else []
+    if not reads:
+        return
+    try:
+        ok = [p for p in dict.fromkeys(reads)
+              if isinstance(p, str) and p in entries][:_session_ops.MAX_READS]
+        injected = set(tf.state.injected or []) if tf is not None else set()
+        _metrics.annotate(vault_reads=ok, n_vault_reads=len(ok),
+                          n_vault_reads_injected=sum(1 for p in ok if p in injected))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] Read 记录失败：{exc}", file=sys.stderr)
+
+
+def _first_round_done(cwd: Path, hook_input: dict, ups_cfg: dict) -> bool:
+    """本会话首轮点名是否已成功（判据单点 `_topic.first_round_done`）。读失败按「未成功」，fail-open。"""
+    try:
+        return first_round_done(cwd, hook_input.get("session_id", "") or "", ups_cfg["state_ttl_hours"])
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vault-loader] 首轮点名状态读取失败：{exc}", file=sys.stderr)
+        return False
+
+
+def _payload_injected(tf, turn_injected) -> list:
+    """交给子进程排除的「本会话已注入」：此前各轮的（fine 状态）加本轮要渲染的，去重保序、留最近
+    `MAX_INJECTED` 篇。父进程数候选（`_maybe_spawn`）与 payload（`_fine_payload`）用同一份。"""
+    injected = list(dict.fromkeys([*(tf.state.injected or []), *turn_injected]))
+    return injected[-_fine_state.MAX_INJECTED:]
+
+
+def _fine_payload(tf, mode: str, gen: str, slot: str, *, prompt: str, hook_input: dict,
+                  vault_path: Path, config: dict, turn_injected, excluded_paths, prev_words,
+                  extra_paths) -> dict:
+    """父 → 子的 stdin（spec §6.3）。字段拼装的单点是 `_topic.build_fine_payload`（Task 12）：这里只算
+    本轮输入，不另拼一份——两份会漂移，子进程读不到的字段静默回落默认（合稿裁定：此前这里漏了
+    `use_tag_idf` / `tag_idf_floor` / `weights`，用户改过的打分权重不会传给精排）。"""
+    cfg = dict(config)
+    cfg["vault_path"] = str(vault_path)       # 本轮已 expanduser 的 vault，与粗排读的是同一个
+    return build_fine_payload(
+        mode, prompt=prompt or "", config=cfg, gen_id=gen, src_seq=tf.turn_seq, slot=slot,
+        transcript_path=str(hook_input.get("transcript_path") or ""),
+        injected=_payload_injected(tf, turn_injected), excluded=sorted(excluded_paths),
+        prev_words=list(prev_words), extra_paths=[str(x) for x in extra_paths])
+
+
+def _maybe_spawn(turn: _Turn, *, cwd: Path, hook_input: dict, prompt: str, vault_path: Path,
+                 config: dict, active_entries: dict, excluded_paths, topics_ok: bool, turn_injected,
+                 prev_words, extra_paths) -> "str | None":
+    """§6.1：模式 → 门禁 → 抢机器槽位 → `O_EXCL` 在飞标记 → detached 子进程；失败回滚标记与槽位（F04）。
+    返回 spawn_fine 的结果；没有发起（模式为空、门禁挡下、抢不到槽位或标记、精排模块不可用、config 读坏）返回 None。fail-open。
+
+    本轮没过闸（`turn.past_gate` 为假）时拒绝发起：精排只在过闸轮发起是 fine 统计队列上界的前提，
+    见 `_Turn.mark_scored`。正常流程走不到这条分支，走到了说明有人把发起挪到了闸门之前，打一行 stderr。"""
+    tf = turn.fine
+    if tf is None or _fine_flow is None or _fine_state is None or exclusion_set is None:
+        return None
+    if not turn.past_gate:
+        print("[vault-loader] 精排发起被拒：本轮尚未过闸（mark_scored 之前不得发起）", file=sys.stderr)
+        return None
+    # config 读坏的一轮外发按关处理（DO-M2）：不发起、不动 fine 状态与在飞标记。粗排、已写回补充的投递照常
+    # （不外发）；读坏这件事由 `config_corrupt` 诊断告知
+    if turn.cfg_corrupt:
+        return None
+    try:
+        mode = _fine_flow.spawn_mode(tf, topics_ok=topics_ok)
+        if mode is None:
+            return None
+        now = time.time()
+        # F62 / F67：排除后还有候选才发起，O(n) 计数。排除集与子进程同一个实现（`_fine_input.exclusion_set`：
+        # 不安全的 cache 键、归档与两组排除 tag、系统索引、工作日志、本会话排除与已注入），输入与 payload
+        # 同一份——两边各写一份时，子进程不当候选的篇（如系统索引）会让父进程发起一次注定无候选的调用。
+        rel = config.get("relevance") or {}
+        excl = exclusion_set(active_entries, exclude_note_tags=list(rel.get("exclude_note_tags") or []),
+                             fine_exclude_tags=get_value(config, "fine_exclude_tags"),
+                             injected=_payload_injected(tf, turn_injected),
+                             excluded=sorted(excluded_paths))
+        n_cand = sum(1 for p in active_entries if p not in excl)
+        if _fine_flow.spawn_blocked(tf, gate_passed=True, dry_run=bool(config.get("dry_run", False)),
+                                    agent_type=hook_input.get("agent_type"), n_candidates=n_cand,
+                                    now=now):
+            return None
+        gen = secrets.token_hex(8)
+        timeout = int(get_value(config, "fine_timeout_sec"))
+        slot = _fine_state.claim_slot(gen, timeout, now)
+        if slot is None:
+            return None
+        if not _fine_state.claim_inflight(tf.session_id, gen, timeout, now):
+            _fine_state.release_slot(slot, gen)
+            return None
+        # 抢到标记与槽位之后的一切失败都要走下面的回滚：payload 构造抛异常时若直接落到外层 except，
+        # 在飞标记要挂到超时，过期后还会被下一轮记成一次 lost（fail_streak +1）。
+        try:
+            payload = _fine_payload(tf, mode, gen, slot, prompt=prompt, hook_input=hook_input,
+                                    vault_path=vault_path, config=config, turn_injected=turn_injected,
+                                    excluded_paths=excluded_paths, prev_words=prev_words,
+                                    extra_paths=extra_paths)
+            outcome = spawn_fine(cwd, tf.session_id, payload)
+        except Exception:  # noqa: BLE001
+            outcome = "spawn_error"
+        if outcome != "spawned":
+            _fine_state.release_inflight(tf.session_id, gen)
+            _fine_state.release_slot(slot, gen)
+        else:
+            tf.spawned_gen = gen
+        tf.spawn_result = outcome
+        return outcome if outcome in _SPAWN_OUTCOMES else None
+    except Exception as exc:  # noqa: BLE001
+        _report_nonfatal("精排发起失败", exc)
+        return None
+
+
+def _fill_report(turn: _Turn, *, config: dict, prompt: str, home: Path, active_entries: dict,
                  decision, injected_paths, fulltext_title, hits_by_path,
                  pinned_render, pinned_rendered, user_pins, user_rendered,
                  excluded_paths, topic_words=frozenset()) -> None:
-    """把本轮展示所需的数据写进 `_REPORT`。任何异常只降级为「快照内容不全」。
+    """把本轮展示所需的数据写进 `turn.report`。任何异常只降级为「快照内容不全」。
 
     命中词不论 metrics 开关都写（spec 2026-10-12 D2，用户决定）；`prompt_h` 仍只在 metrics 开启时写。
     `topic_words` 必须是本轮实际参与打分的那份（`signals.session_topic_words`），不重读状态（节点 1 T6）。
     """
-    rep = _REPORT
+    rep = turn.report
     if rep is None or not rep.request_seen or _session_ops is None:
         return
     try:
@@ -879,12 +1338,12 @@ def _fill_provenance(rep, config: dict, active_entries: dict, decision, pinned_r
 
 
 def main() -> int:
-    global _REPORT
-    _REPORT = None
+    # 每轮一个新的 `_Turn`：本轮状态的复位是结构性的，没有入口、出口的复位语句（见 `_Turn`）
+    turn = _Turn()
     try:
-        return _main_impl()
+        return _main_impl(turn)
     finally:
-        rep, _REPORT = _REPORT, None
+        rep = turn.report
         if rep is not None:
             try:
                 rep.finalize()
@@ -892,18 +1351,30 @@ def main() -> int:
                 _report_nonfatal("会话快照写入失败", exc)
 
 
-def _main_impl() -> int:
+def _read_hook_stdin() -> str:
+    """hook 输入按字节读、按 UTF-8 解码（写法同 `_topic.run_extraction_child`；2.4.0 BP-H1）。
+
+    文本模式的 `sys.stdin` 按 locale 解码：中文 Windows 默认是 GBK，宿主交来的 UTF-8 JSON 会被解成乱码
+    （surrogateescape），设了 `PYTHONIOENCODING=gbk` 时则直接抛 `UnicodeDecodeError`；两种情形中文提问都召回
+    不到笔记。没有字节层的流（测试换上的 `io.StringIO`）本来就是文本，原样读。
+    """
+    buf = getattr(sys.stdin, "buffer", None)
+    if buf is None:
+        return sys.stdin.read()
+    return buf.read().decode("utf-8", errors="replace")
+
+
+def _main_impl(turn: _Turn) -> int:
     home = Path.home()
-    _take_pin_account()          # 清掉同进程上一轮可能残留的延迟登记（生产每轮新进程，恒为空）
 
     try:
-        hook_input = json.loads(sys.stdin.read() or "{}")
+        hook_input = json.loads(_read_hook_stdin() or "{}")
     except json.JSONDecodeError:
         hook_input = {}
 
     cwd = Path(hook_input.get("cwd", os.getcwd()))
     prompt = hook_input.get("prompt", "")
-    _bind_report(hook_input)
+    _bind_report(turn, hook_input)
     should_claim = False
     legacy_enabled = False
     coexist_note = ""
@@ -942,6 +1413,7 @@ def _main_impl() -> int:
         pass
 
     config, cfg_fallback, cfg_detail = load_config_ex()
+    turn.cfg_corrupt = cfg_fallback == "corrupt"
     if hook_context is not None:
         try:
             from scripts._state import configure_context
@@ -995,14 +1467,14 @@ def _main_impl() -> int:
                 stable=hook_context.stable_event_id,
                 home=home,
             ):
-                _report_status("duplicate")
+                _report_status(turn, "duplicate")
                 return 0
         except Exception as exc:
             _report_nonfatal("事件去重失败，继续执行", exc)
 
-    _report_status("pending")
-    session_ops = _take_session_ops(config, home, cfg_fallback)
-    _report_llm(config, cwd, hook_input)
+    _report_status(turn, "pending")
+    session_ops = _take_session_ops(turn, config, home, cfg_fallback)
+    _report_llm(turn, config, cwd, hook_input)
     # ↓↓↓ 停用闸门到此为止，从这里开始才允许登记诊断 ↓↓↓
     if cfg_fallback == "corrupt":
         notify(config_corrupt(cfg_detail))
@@ -1018,26 +1490,12 @@ def _main_impl() -> int:
                                      ttl_hours=mcfg.get("nudge_ttl_hours", 168))
             if due:
                 notify(near_miss_nudge(due))
-                # fix round 1：刻意接受的取舍，不是遗漏。`notify()` 只把诊断登记进
-                # `_diagnostics._PENDING`——「登记了」不等于「用户看到了」：真正是否
-                # 渲染进 systemMessage 取决于本轮末尾 `take_user_visible()` 的两道
-                # 独立门禁（`display.user_visible` 开关、按 code+cwd 的 TTL 冷却）。
-                # 正常路径下这两道门禁不构成风险：全局 168h 冷却远大于 per-cwd 默认
-                # 24h TTL，不会被拦；`display.user_visible=false` 时用户本就主动关掉
-                # 了全部诊断，看不到是预期行为。真正的残余风险只有一种——`_finish`
-                # 里 `take_user_visible()` 抛异常会被吞掉、降级为「没有诊断」（诊断
-                # 绝不能阻断召回），此时这一周的提示机会已被 `mark_nudged` 消耗且
-                # 不可逆、且无任何痕迹。这里不额外加 `display.user_visible` 前置检查
-                # ——那只会让代码看起来解决了比实际更多的问题（`take_user_visible`
-                # 内部的门禁逻辑仍可能变、双份判断反而是新的不一致来源），真正的洞
-                # （渲染期异常）加这个检查也堵不住。
+                # 取舍说明见 2.3.0 同处注释：`notify()` 只登记诊断，是否渲染取决于本轮末尾
+                # `take_user_visible()`；这里不额外加 `display.user_visible` 前置检查。
                 _metrics.mark_nudged(Path.home())
         except Exception as exc:  # noqa: BLE001 — 提示绝不阻断召回
-            # 2026-09-07 补路由：这个 except 包裹的 nudge_due / bump_near_miss_counts /
-            # mark_nudged 全都写 `metrics_dir(home)`（`bump_near_miss_counts` 还会
-            # mkdir + chmod）——正是 `_metrics.flush()` 那处降级注释所援引的目录。
-            # 此前它无条件 print，于是宿主只读时「七处里六处安静、这一处每轮刷屏」，
-            # 而部分覆盖比完全没有更糟：看起来已经解决了。
+            # nudge_due / bump_near_miss_counts / mark_nudged 全都写 `metrics_dir(home)`；
+            # 宿主只读时走统一降级判据，不每轮刷屏。
             _report_nonfatal("near-miss 提示失败", exc)
 
     vault_path = Path(config["vault_path"]).expanduser()
@@ -1046,8 +1504,7 @@ def _main_impl() -> int:
     # 的不变量说明，直接落到下面的「vault 不可达」早退。
     #
     # config 回退时额外抑制：回退后 vault_path 恰好**就是**默认值，代建会把那个错误路径
-    # 连同 .meta/ 建出来，现场看起来像一次正常的新装——用户真实 vault 完全没被读，
-    # 而排障文档教的第一步（检查 <vault>/.meta/frontmatter-cache.json）会指向错误的 vault。
+    # 连同 .meta/ 建出来，现场看起来像一次正常的新装——用户真实 vault 完全没被读。
     if not config.get("dry_run", False) and cfg_fallback is None:
         try:
             ensure_vault_if_default(vault_path)
@@ -1055,23 +1512,39 @@ def _main_impl() -> int:
             pass
     if not vault_path.exists():
         notify(vault_unreachable(vault_path))
-        _stage_gate_record(config, hook_input, "vault_unreachable")
-        return _finish_with_metrics(config, cwd)
+        _stage_gate_record(turn, config, hook_input, "vault_unreachable")
+        return _finish_with_metrics(turn, config, cwd)
+    _report_vault_root(turn, vault_path)
 
     rel_cfg = config["relevance"]
     # 拦截非用户手输 prompt（后台 task-notification / 系统注入）——其文本含 UUID/tool-id/路径碎片，
     # 当关键词会污染注入（实证：会话 a9ee6be0 后台命令完成通知被处理、切出 cashbook 假强命中）。
     if rel_cfg.get("skip_non_user_prompts", True) and _is_system_injected_prompt(hook_input, prompt):
-        _stage_gate_record(config, hook_input, "skipped_source")
-        return _finish_with_metrics(config, cwd)
+        _stage_gate_record(turn, config, hook_input, "skipped_source")
+        return _finish_with_metrics(turn, config, cwd)
 
     # 跳过名单：用户点名的 slash 命令整轮不注入（`relevance.skip_slash_commands`，默认空）。
     # **必须在信号 J 之前** —— 分词会把命令名 token 剥掉（`strip_slash_command`），
     # 之后就再也拿不到判据输入了。与上面那道同属「看 prompt 原文的来源型闸门」，
     # 故紧邻放置，让闸门集中、不在别处再造第四个。
     if is_skipped_slash_command(prompt, config):
-        _stage_gate_record(config, hook_input, "skipped_slash_command")
-        return _finish_with_metrics(config, cwd)
+        _stage_gate_record(turn, config, hook_input, "skipped_slash_command")
+        return _finish_with_metrics(turn, config, cwd)
+
+    # 精排（spec 2026-10-13 §4 ②③）：通过两道来源闸门后、指代闸门前读一次本会话 fine 状态。
+    # 非用户来源与 slash 跳过的轮次不计轮次（D1），所以放在这两道之后；指代 / 关键词不足的轮次计
+    # 轮次（但不认领补充，见 `_gate_releases_supp`），所以放在它们之前。此后整轮读 `tf.view.config`：
+    # mod 面板的会话设置已合并进去。合并会把不合法的 fine_model 归一成 haiku，原值先留给快照判 bad_model。
+    raw_model = (config.get("relevance") or {}).get("fine_model")
+    tf = turn.fine = _begin_fine(hook_input, config, session_ops)
+    if tf is not None:
+        config = tf.view.config
+        rel_cfg = config["relevance"]
+        ups_cfg = config["user_prompt_submit"]
+        # 本轮实际生效的模型：会话设置里选的（已校验合法）优先，否则是 config 原值
+        raw_model = (tf.view.session or {}).get("fine_model", raw_model)
+        _report_settings(turn)
+        _apply_persist(turn, session_ops, cfg_fallback)
 
     # 信号 J（剥 slash + 英文切分 + CJK bigram + 头尾截断均由 relevance 控制）
     prompt_keywords = collect_signal_j_prompt_keywords(
@@ -1082,44 +1555,34 @@ def _main_impl() -> int:
         split_cjk_bigram=rel_cfg.get("split_cjk_bigram", True),
         max_keywords=rel_cfg.get("max_prompt_keywords", 30),
     )
-    # 触发点0（2026-09-02）：纯指代/应答型 prompt（「继续执行」「ok」）静默早退。
-    # 紧邻触发点1 放置，是为了让「闸门只有这两处」一眼可见，避免日后有人在别处再造第三个。
-    # 两者判据不同且互不依赖：本条看 prompt **原文**、整串匹配；触发点1 看分词后的关键词数。
-    # 谁先谁后不影响放行结果，但**影响 gate 字段的归因**，故顺序是刻意的：
-    # 空 prompt 必须归给 too_few_keywords（`is_deictic_only` 对空串返回 False，见其
-    # docstring），否则报表上会显示成「被指代闸门拦的」，而实际原因是没词。
+    # 触发点0（2026-09-02）：纯指代/应答型 prompt（「继续执行」「ok」）静默早退，精排补充也不投递、不认领。
+    # 紧邻触发点1 放置，让「闸门只有这两处」一眼可见。
+    # 顺序是刻意的：空 prompt 必须归给 too_few_keywords（`is_deictic_only` 对空串返回 False）。
     if is_deictic_only(prompt, config):
-        _stage_gate_record(config, hook_input, "deictic_only")
-        return _finish_with_metrics(config, cwd)
+        _gate_releases_supp(turn)
+        _stage_gate_record(turn, config, hook_input, "deictic_only")
+        return _finish_with_metrics(turn, config, cwd)
 
-    # 触发点1：关键词数不足 → 静默早退。单一真源 gate_keywords（与 decide_injection
-    # 内部共用同一函数，无第二处逻辑副本）；F1：在此处（cache/state IO 之前）立即判定，
-    # 保持旧时机——不因抽出决策纯函数而推迟早退、令热路径多背两次 state 读 + 一次 cache 读。
+    # 触发点1：关键词数不足 → 静默早退（补充同上）。单一真源 gate_keywords（与
+    # decide_injection 内部共用同一函数）；在 cache/state IO 之前立即判定。
     gate_reason, _ = gate_keywords(prompt_keywords, config)
     if gate_reason == "too_few_keywords":
-        _stage_gate_record(config, hook_input, "too_few_keywords")
-        return _finish_with_metrics(config, cwd)
+        _gate_releases_supp(turn)
+        _stage_gate_record(turn, config, hook_input, "too_few_keywords")
+        return _finish_with_metrics(turn, config, cwd)
 
     target_tags = set(i_result.tags) | collect_signal_b_keyword_map(
         cwd, config.get("keyword_to_tags", {})
     )
 
-    # 层 3：会话主题词作为独立信号。默认关；读失败一律空集合（fail-open）。
-    # 注：此处不能用下方 `ttl = ups_cfg["state_ttl_hours"]`（entries 加载之后才定义、
-    # 晚于本处）——`ups_cfg` 本身在 main() 更早处已构造，直接取同一个键。
+    # 层 3：会话主题词作为独立信号。读失败一律空集合（fail-open）。精排开关读单点 `fine_rank_on`：
+    # 新键 `relevance.fine_rank` 与旧键 `session_topic` 任一为 false 即关（spec 2026-10-13 §5.3，F36）。
+    fine_on = fine_rank_on(config)
     topic_words: set[str] = set()
-    # F2（整分支终审，2026-09-02）：`topic_attempted` 标记本会话是否已有一次提炼
-    # 尝试（成功或失败）落在 TTL 窗口内——`topic_words` 为空集分不清"从未尝试"与
-    # "尝试过但失败/尚在飞行"，必须单独判一次，见 has_recent_topic_attempt 的 spawn
-    # 门禁用法。
-    topic_attempted = False
-    if rel_cfg.get("session_topic", False):
+    if fine_on:
         try:
-            session_id = hook_input.get("session_id", "") or ""
             topic_words = set(load_session_topic(
-                cwd, session_id, ups_cfg["state_ttl_hours"]))
-            topic_attempted = has_recent_topic_attempt(
-                cwd, session_id, ups_cfg["state_ttl_hours"])
+                cwd, hook_input.get("session_id", "") or "", ups_cfg["state_ttl_hours"]))
         except Exception as exc:                 # noqa: BLE001
             print(f"[vault-loader] 主题读取失败：{exc}", file=sys.stderr)
 
@@ -1128,7 +1591,7 @@ def _main_impl() -> int:
     # 点名上限写读两侧同一单点（`effective_pin_max`）；`pin_on` 是本轮该功能的生效态，随记录落盘
     # （自描述字段，1A-M1 / 1B-M-2）。读端按配置值收口（1B-M-6），不再按内部常量 8。
     pin_max = effective_pin_max(config)
-    pin_on = bool(rel_cfg.get("session_topic", False)) and pin_max > 0
+    pin_on = fine_on and pin_max > 0
     if pin_on:
         try:
             pinned_paths = load_session_pinned(cwd, pin_session_id, ups_cfg["state_ttl_hours"],
@@ -1147,13 +1610,11 @@ def _main_impl() -> int:
         # prompt 路径只产笔记（无 commit/worklog 组），cache 空即无可注入，早退。
         # 与 SessionStart「cache 空不早退」语义相反但合理——勿误将两处对齐。
         #
-        # 只有 CORRUPT / OVERSIZE 才告警：ABSENT（还没跑过 summarize-session）、
-        # VERSION_MISMATCH（预期过渡态，写端下次运行会重建）、EMPTY（vault 里确实没笔记）
-        # 都是健康态，对它们告警会命中每个新装用户和下次 bump 后的全部存量用户。
+        # 只有 CORRUPT / OVERSIZE 才告警：ABSENT / VERSION_MISMATCH / EMPTY 都是健康态。
         if cache_status.is_failure():
             notify(cache_broken(cache_status.value, vault_path))
-        _stage_gate_record(config, hook_input, "cache_empty")
-        return _finish_with_metrics(config, cwd)
+        _stage_gate_record(turn, config, hook_input, "cache_empty")
+        return _finish_with_metrics(turn, config, cwd)
 
     ttl = ups_cfg["state_ttl_hours"]
     all_injected = load_already_injected(cwd, ttl)
@@ -1161,18 +1622,14 @@ def _main_impl() -> int:
     candidate_injected = all_injected - fulltext_injected  # 曾以弱候选注入、未升级全文
 
     weights = config["scoring"]
-    # 第1层：archived 等排除 tag 不进召回池（卫生措施非安全边界；/vault 手动检索不受影响）。
-    # active_entries 是 decide_injection 的输入前提——tag_df/n_docs 必须与其决策循环同口径
-    # （均基于 active_entries）：否则 archived 笔记的 tag 会抬高 tag_df/n_docs 分母，而它们
-    # 根本不参与排序竞争，造成 IDF 因子失真、PoC 数字不可复现。
-    exclude_tags = {t.lower() for t in rel_cfg.get("exclude_note_tags", [])}
-    active_entries = {p: e for p, e in entries.items() if not is_archived(e, exclude_tags)}
+    # 第1层：归档与工作日志不进召回池（判据与理由见 `_active_entries`）。
+    active_entries = _active_entries(entries, rel_cfg)
 
     excluded_paths: frozenset = frozenset()
     user_pins_req: list = []
-    if session_ops is not None and _REPORT is not None:
+    if session_ops is not None and turn.report is not None:
         try:
-            session_ops = _REPORT.restrict(active_entries.keys())
+            session_ops = turn.report.restrict(active_entries.keys())
             excluded_paths = _session_ops.excluded_set(session_ops)
             user_pins_req = list(session_ops.pin)
         except Exception as exc:  # noqa: BLE001
@@ -1180,93 +1637,65 @@ def _main_impl() -> int:
 
     state = StateView(fulltext_injected=fulltext_injected, candidate_injected=candidate_injected,
                       user_excluded=set(excluded_paths))
-    decision = decide_injection(active_entries, signals, weights, config, state)
-    _report_status("dry_run" if config.get("dry_run", False) else "scored")
-    # decision.gate_reason 恒为 ""：main() 已在 IO 之前用同一 gate_keywords 提前
-    # return 0（见上方），本调用点 prompt_keywords/config 与该早退判定完全同源，
-    # decide_injection 内部复算的 gate_keywords 结果必然一致，不会再触发 too_few_keywords。
+    # 自动全文默认关（spec 2026-10-13 §8.2）：关时决策层不再按 upgrade_candidate 放行、不选全文。
+    decision = decide_injection(active_entries, signals, weights, config, state,
+                                auto_fulltext=bool(get_value(config, "auto_fulltext")))
+    # 过闸：此后是打分轮的发起、记录构造与渲染。fine 写回按它消费子进程统计（`_finish_with_metrics`），
+    # `_maybe_spawn` 在它之前拒绝发起（见 `_Turn.mark_scored`）
+    turn.mark_scored()
+    _report_status(turn, "dry_run" if config.get("dry_run", False) else "scored")
+    # decision.gate_reason 恒为 ""：main() 已在 IO 之前用同一 gate_keywords 提前早退。
 
-    # 层 3：本会话尚无主题 ⇒ 首个有效轮次，异步提炼。放在 decision 算出之后紧邻处——
-    # 这是唯一一个"decision.admitted 已知且必然执行到"的位置：主注入路径有 7 个
-    # `_finish_with_metrics` 出口，若放在 emit 之后需在每个出口前重复插入，必然漏一个。
-    # spawn 是 detached 进程创建，实测为毫秒级，远低于 UPS 的 300ms 预算，不阻塞、
-    # 不必等到 emit 完成才拉起（具体数字来自一次性真机验证，非自动化守卫钉住的值，
-    # 不在仓库内留可核验出处，此处刻意不写具体毫秒数）。
-    #
-    # F1（评审新发现，2026-09-02）：局部变量 `dry_run = config.get("dry_run", False)`
-    # 在本函数更靠后、emit 之前才赋值（本触发点在它之前执行），故此处必须直接读
-    # `config.get("dry_run", False)`，不能等复用下面那个同名局部变量（按行号引用会被
-    # 后续编辑顶歪，此处按符号定位）。dry_run 的语义是「灰度期只看会注入什么、
-    # 不产生真实副作用」（SKILL.md 承诺"不真实注入"），而 spawn 会真实拉起
-    # `claude -p` 子进程、产生真实 LLM 调用与写盘——这与 dry_run 的不变量冲突，
-    # 必须一并拦截。
-    #
-    # 已知遗留（刻意不修，2026-09-02 裁定；2026-09-02 整分支终审 Ruling 15 订正代价模型）：
-    # 同一会话内，若前一次提炼仍在飞行中（子进程尚未写回 state——中位 21s / 最长 120s
-    # 超时窗口内），此时又发一轮 UPS，两次都会判定"尚无主题记录"而各拉起一个提炼
-    # 子进程，重复消耗一次 LLM 配额。state 写入受 context_vault/atomic.py 的
-    # lease_lock 保护，不会损坏数据；加去重需要新增"正在提炼"状态及其生命周期管理
-    # （何时置位、何时清、崩溃后谁清），成本大于收益——代价上限是"飞行窗口期内的
-    # 并发轮次数"，是有界的。
-    #
-    # 此前这条注释把"提炼失败"也算进这条可接受的遗留里，代价模型只算了成功路径、
-    # 漏算了失败路径：旧实现失败时不落任何标记，`not topic_words` 会永远为真，
-    # 导致**持续失效场景下每一轮 UPS 都重新拉起子进程、无上限**——真实上界是完整
-    # LLM 时延，不是先前估计的"同会话 30 秒内"。已在 F2（整分支终审，2026-09-02）
-    # 修复：`run_extraction_child` 现在无论成功失败都调用 `save_session_topic` 落一个
-    # 带 ts 的标记，`has_recent_topic_attempt` 据此判定"是否已尝试过且未过期"，使
-    # 持续失效的代价收敛为"每个 TTL 窗口最多一次"，不再是每轮一次。
-    # (候选池篇数, 其中项目笔记片篇数 | None)，只在真正送出提炼的那一轮有值；pin 关着时池回落纯 admitted、
-    # 第二项为 None（不落键）——否则报表会把「功能关闭」读成「组件 A 未生效」（post-review A-M1）。
-    pool_stats: "tuple[int, int | None] | None" = None
-    spawn_outcome = None
-    if (rel_cfg.get("session_topic", False) and not topic_words and not topic_attempted
-            and not config.get("dry_run", False)):
+    # 本轮要渲染的会话级内容（spec §4 ⑥⑦⑧）。粗排清单在三种情况下不展示：admitted 为空、粗排关
+    # （coarse_inject=false，F31：打分照跑）、粗排篇数为 0——这三种都走下面「单独成篇」的分支。
+    short_chars = rel_cfg["short_summary_chars"]
+    max_notes = int(get_value(config, "user_prompt_submit.max_notes"))
+    ups_cfg = dict(ups_cfg, max_notes=max_notes)          # F40：会话设置可调，区间 [0, 8] 已在单点截断
+    coarse_on = bool(get_value(config, "coarse_inject"))
+    show_coarse = coarse_on and max_notes > 0 and bool(decision.admitted)
+    # LLM 点名的对账字段（pin_kwargs）仍用 pinned_paths（N5）；渲染用剔除本会话排除之后的列表，
+    # 名额由 split_pin_budget 与手动钉住合计分配（spec 2026-10-09 mod §6.2）。
+    user_cap, llm_cap = split_pin_budget(len(user_pins_req), config)
+    pinned_render = [p for p in pinned_paths if p not in excluded_paths][:llm_cap]
+    user_pins = [p for p in user_pins_req if p not in excluded_paths][:user_cap]
+    # 精排补充（spec §6.4）：时效合格的 → F25 重核 → 本轮提问词复核（D1-b，不含主题词）。
+    supp_kept: list = []
+    supp_dropped: list = []
+    if tf is not None and _fine_flow is not None:
         try:
-            top_n = max(0, safe_int(rel_cfg.get("session_topic_top_n", 30), 30))
-            adm_paths = [ed.path for ed in decision.admitted]
-            n_proj: "int | None" = None
-            if pin_max > 0:
-                root = _repo_root(cwd)
-                extra = list(getattr(i_result, "extra_paths", []) or [])
-                cands = build_topic_pool(
-                    adm_paths, active_entries, root, extra,
-                    top_n, safe_int(rel_cfg.get("session_topic_project_top_k", 20), 20),
-                    safe_int(rel_cfg.get("session_topic_pool_max", 50), 50))
-                # 1B-H-1：按项目前缀归属数池里的项目笔记。组件 A 退化成纯 admitted（basename 归一失败、
-                # admitted 篇数把项目片挤光）时功能照常工作、输出与健康态无差别，只有这个数能把它照出来
-                # （spec §2.1 验收判据「proj 命中计数 > 0」）。前缀与池同源，归一坏了这里就是 0。
-                n_proj = count_project_notes(cands, root, extra)
-            else:
-                cands = [(e.path, (active_entries[e.path].summary or "")[:SUMMARY_CHARS])
-                         for e in decision.admitted[:top_n]]
-            # 门禁保持「admitted 非空」：池扩展只影响送什么，不影响是否送。
-            if cands and decision.admitted:
-                spawn_topic_extraction(
-                    cwd, hook_input.get("session_id", "") or "",
-                    prompt, cands, config)
-                spawn_outcome = take_spawn_outcome()
-                pool_stats = (len(cands), n_proj)     # 只记真正送出去的那一轮，没送的池不算
-        except Exception as exc:                 # noqa: BLE001
-            print(f"[vault-loader] 主题提炼触发失败：{exc}", file=sys.stderr)
-    _report_llm(config, cwd, hook_input, in_scoring=len(signals.session_topic_words),
-                spawn_outcome=spawn_outcome)
+            supp_kept, supp_dropped = _fine_flow.recheck_supp(
+                _supp_ready(tf, active_entries, excluded_paths), active_entries, prompt_keywords)
+        except Exception as exc:  # noqa: BLE001
+            _report_nonfatal("精排补充复核失败", exc)
+    if tf is not None:
+        tf.recheck_dropped = len(supp_dropped)          # `_annotate_fine` 落 `n_supp_drop_recheck`
+    supp_cap = int(get_value(config, "fine_max_notes"))
 
-    # metrics 落盘：默认关闭（config 无 "metrics" 键时 .get 恒返回 False），仅开发者
-    # 手动开启。stage 零 IO，真正写盘延后到 _finish_with_metrics 的 flush；此处任何
-    # 异常只降级为「这条指标没记上」，绝不连累召回（下面 admitted/not admitted 两分支
-    # 共用同一出口，near-miss 与命中都要能被记录）。
+    # 精排发起（spec 2026-10-13 §6.1）：模式（首轮点名 / 逐轮补充）→ 门禁 → 抢机器槽位 → O_EXCL 在飞
+    # 标记 → detached 子进程。不再写 topics 的 pending 占位（F01/F02），「TTL 内尝试过就不再发起」的旧门禁
+    # 一并退出：并发由在飞标记挡，持续失败由 fail_streak 停用挡（F07）。候选在子进程里构造（§6.3），
+    # 这里只按「排除后是否还有候选」决定发不发（F62/F67）。首轮点名成功与否与快照同一判据
+    # （`_topic.first_round_done`：state=ok，或旧 entry 有词）——不按「有词或有点名」判：子进程在无候选时写
+    # 的 ok 占位没有词，那样判会每轮付费重发首轮（F35）。
+    topics_ok = _first_round_done(cwd, hook_input, ups_cfg) if (fine_on and tf is not None) else False
+    turn_injected = (([ed.path for ed in decision.admitted[:max_notes]] if show_coarse else [])
+                     + pinned_render + user_pins + supp_kept)
+    spawn_outcome = _maybe_spawn(
+        turn, cwd=cwd, hook_input=hook_input, prompt=prompt, vault_path=vault_path, config=config,
+        active_entries=active_entries, excluded_paths=excluded_paths, topics_ok=topics_ok,
+        turn_injected=turn_injected, prev_words=sorted(signals.session_topic_words),
+        extra_paths=list(getattr(i_result, "extra_paths", []) or []))
+    _report_llm(turn, config, cwd, hook_input, in_scoring=len(signals.session_topic_words),
+                spawn_outcome=spawn_outcome, raw_model=raw_model)
+
+    # metrics 落盘：默认关闭，仅开发者手动开启。stage 零 IO，真正写盘延后到 _finish_with_metrics 的
+    # flush；此处任何异常只降级为「这条指标没记上」，绝不连累召回。
     if config.get("metrics", {}).get("enabled", False):
         try:
             salt = _metrics.get_salt(Path.home())
-            # 对账字段（spec §2.5）：只在「本会话首个读到非空 pinned 且尚未记账」的轮次
-            # 填充，填完立即 mark_pinned_accounted 翻标记，后续轮次不再重复记账。
-            # rank_of 按 1-based 位置记 LLM 点名的篇目在本轮机械排名（decision.admitted）
-            # 里排第几——不在其中则为 None（该篇未被机械召回选中）。
+            # 对账字段（spec §2.5）：只在「本会话首个读到非空 pinned 且尚未记账」的轮次填充。
             pin_kwargs: dict = {}
-            # 1B-M-4：admitted 为空的轮次没有机械排名可对（rank 全 None 却零信息），一次性名额留到下一个
-            # 有 admitted 的轮次再花。终审 I-3：rank 为 None 时用决策层自己的 `dedup` 裁决区分
-            # 「被跨轮去重压掉」与「真不在本轮 admitted」。
+            # 1B-M-4：admitted 为空的轮次没有机械排名可对，一次性名额留到下一个有 admitted 的轮次。
             if (pinned_paths and decision.admitted
                     and not load_pinned_accounted(cwd, pin_session_id, ups_cfg["state_ttl_hours"])):
                 rank_of = {ed.path: i for i, ed in enumerate(decision.admitted, 1)}
@@ -1278,9 +1707,7 @@ def _main_impl() -> int:
                     "topic_extracted_h": [_metrics.h(w, salt) for w in sorted(topic_words)],
                     "n_topic_extracted": len(topic_words),
                 }
-            # session_id/prompt_id/salt/near_miss_k/admitted_k 一律按关键字传参——
-            # build_record 已把 session_id/prompt_id 收紧为 keyword-only（M3 修复），
-            # 相邻同类型位置参数一旦被上游误对调会静默错位（session 决定落盘文件名）。
+            # session_id/prompt_id/salt/near_miss_k/admitted_k 一律按关键字传参（M3）。
             record = _metrics.build_record(
                 decision, prompt_keywords, cwd,
                 session_id=hook_input.get("session_id", ""),
@@ -1288,65 +1715,66 @@ def _main_impl() -> int:
                 # 与 _is_system_injected_prompt 读同一对键，保持一致
                 src=hook_input.get("promptSource") or hook_input.get("prompt_source") or "",
                 # prompt 原文只用来算加盐 hash（build_record 内部），不落盘。
-                # 它是 --review 回查 transcript 取原文的定位键，见 build_record 说明。
                 prompt=prompt,
                 salt=salt,
                 near_miss_k=config["metrics"].get("near_miss_k", 10),
                 admitted_k=config["metrics"].get("admitted_k", 20),
-                # 渲染层配置，随记录落盘供 analyze_metrics 用（它不读 config）
-                max_notes=config["user_prompt_submit"].get("max_notes", 3),
-                # 两个最承重的判据阈值。ft 阈值在样本期内已由 6 改成 10，
-                # 不落盘则报表只能给出跨制度的合并值（实测 65.4% vs 40.1%）。
+                # 渲染层配置，随记录落盘供 analyze_metrics 用（它不读 config）；取本轮生效值
+                max_notes=max_notes,
                 min_topical=config["relevance"].get("min_topical_score"),
                 ft_topical=config["relevance"].get("fulltext_topical_threshold"),
-                # 取 `signals.session_topic_words` 而不是重新读一次 state：落盘的必须
-                # 是**本轮真正参与打分**的那一份，重读会在 TTL 边界上给出与打分不一致
-                # 的数，让这条本来用于发现失效的指标自己变成噪声源。
+                # 取 `signals.session_topic_words` 而不是重读 state：落盘的必须是本轮真正参与打分的那份。
                 n_topic_words=len(signals.session_topic_words),
-                topic_on=bool(rel_cfg.get("session_topic", False)),
+                topic_on=fine_on,
                 pin_on=pin_on,
-                # 本轮是否配了跳过名单。走到这里说明**没命中**（命中的轮次早退走
-                # gate 记录），故它是「配了名单的未命中轮次」的分母 —— 报表据此把
-                # 「配了但从未生效」与「压根没配」分开。
                 skip_on=bool(rel_cfg.get("skip_slash_commands")),
-                n_pool=pool_stats[0] if pool_stats else None,
-                n_pool_proj=pool_stats[1] if pool_stats else None,
+                # 2.4.0 自描述字段（spec §12）：报表不读 config，靠它们分清「关着」与「开着却没效果」。
+                # 候选池构成改由子进程统计回报（n_summary_layer 等），不再落 n_pool / n_pool_proj。
+                coarse_on=coarse_on,
+                fine_on=fine_on,
+                supp_on=fine_supplement_on(config),
+                catalog_on=bool(get_value(config, "fine_catalog")),
+                ft_on=bool(get_value(config, "auto_fulltext")),
+                fine_model=str(get_value(config, "fine_model")),
+                pin_max=pin_max,
+                supp_max=supp_cap,
+                fmt=FMT_VERSION,
                 **pin_kwargs,
             )
             _metrics.stage(record)
+            if record:
+                turn.full_record = True
+                _record_reads(tf, session_ops, entries)
             if pin_kwargs and record:
-                # 标记延后到 flush 成功之后再翻（见 _PENDING_PIN_ACCOUNT）。放在 stage 之后登记，且要求
-                # record 非空：build_record / stage 抛了不登记；`_MetricsStub`（metrics 模块导入失败的
-                # 降级路径）的 build_record 返回 {}、flush 无声成功，不加这一判会「没记录却翻了标记」
-                # （post-review A-L1）。
-                _register_pin_account(cwd, pin_session_id)
+                # 标记延后到 flush 成功之后再翻（见 `_Turn.pending_pin`）。要求 record 非空：
+                # `_MetricsStub` 的 build_record 返回 {}、flush 无声成功（post-review A-L1）。
+                turn.pending_pin = (cwd, pin_session_id)
         except Exception as exc:  # noqa: BLE001
             _report_nonfatal("metrics 构造失败", exc)
 
-    # 会话级固定注入：在 admitted 早退之前先渲染，admitted 为空时也要出（那正是机械召回失效的轮次）。
-    # 正常路径在 build_injection_text_ups 之后用更宽的去重集重算，这里只服务 admitted 为空的早退分支。
-    short_chars = rel_cfg["short_summary_chars"]
-    # LLM 点名的对账字段（pin_kwargs）仍用 pinned_paths（N5）；渲染用剔除本会话排除之后的列表，
-    # 名额由 split_pin_budget 与手动钉住合计分配（spec 2026-10-09 mod §6.2）。
-    user_cap, llm_cap = split_pin_budget(len(user_pins_req), config)
-    pinned_render = [p for p in pinned_paths if p not in excluded_paths][:llm_cap]
-    user_pins = [p for p in user_pins_req if p not in excluded_paths][:user_cap]
+    # 会话级小节：粗排清单不展示时单独成篇，第一节自带隔离声明（admitted 为空正是机械召回失效的轮次）。
     pinned_text, pinned_rendered = "", []
-    if pinned_render and not decision.admitted:
+    if pinned_render and not show_coarse:
         pinned_text, pinned_rendered = render_pinned_section(
-            pinned_render, active_entries, set(fulltext_injected), short_chars)
+            pinned_render, active_entries, set(fulltext_injected), short_chars,
+            vault_path=vault_path)
     user_rendered: list = []
-    if user_pins and not decision.admitted:
+    if user_pins and not show_coarse:
         user_text, user_rendered = render_user_pins_section(
             user_pins, active_entries, set(pinned_rendered), short_chars,
-            with_notice=not pinned_text)
+            with_notice=not pinned_text, vault_path=vault_path)
         if user_text:
             pinned_text = f"{pinned_text}\n\n{user_text}" if pinned_text else user_text
+    supp_rendered: list = []
+    if supp_kept and not show_coarse:
+        supp_text, supp_rendered = render_supp_section(
+            supp_kept, active_entries, set(pinned_rendered) | set(user_rendered), short_chars,
+            with_notice=not pinned_text, vault_path=vault_path, cap=supp_cap)
+        if supp_text:
+            pinned_text = f"{pinned_text}\n\n{supp_text}" if pinned_text else supp_text
 
-    if not decision.admitted:
-        # 落盘口径（1A-L12）：凡走到打分阶段的轮次一律落 `pinned_injected`（含 0），闸门早退不落——
-        # 它的**存在性**是报表「功能开着却一次都没点名」那一档的分母，与 `inj_chars`「只在有正文
-        # 时记」刻意不同。正常路径在渲染后另落一次；两条路径互斥、各落恰好一次。
+    if not show_coarse:
+        # 落盘口径（1A-L12）：凡走到打分阶段的轮次一律落 `pinned_injected`（含 0），闸门早退不落。
         try:
             _metrics.annotate(pinned_injected=len(pinned_rendered))
         except Exception:      # noqa: BLE001
@@ -1357,43 +1785,53 @@ def _main_impl() -> int:
                                   user_pinned_injected=len(user_rendered))
             except Exception:      # noqa: BLE001
                 pass
-        _fill_report(config=config, prompt=prompt, home=home, active_entries=active_entries,
+        # F31：凡没展示粗排清单的轮次（粗排关 / 粗排篇数 0 / admitted 为空，即上面 `show_coarse` 为假）都如实记
+        # 「用户看到 0 篇粗排」。只限粗排关时，`max_notes=0` 的轮次没有 `shown`，读端会按 admitted 回落重建，
+        # 把从未渲染的条目抽进不可再生的标注池。metrics 关时 `annotate` 本就是 no-op（`_PENDING is None`）
+        try:
+            _metrics.annotate(shown=[])
+        except Exception:      # noqa: BLE001
+            pass
+        _fill_report(turn, config=config, prompt=prompt, home=home, active_entries=active_entries,
                      decision=decision, injected_paths=[], fulltext_title=None, hits_by_path={},
                      pinned_render=pinned_render, pinned_rendered=pinned_rendered,
                      user_pins=user_pins, user_rendered=user_rendered,
                      excluded_paths=excluded_paths, topic_words=signals.session_topic_words)
+        _note_fine_delivery(tf, pinned_rendered + user_rendered + supp_rendered, supp_rendered)
+        _report_supps(turn, supp_rendered, supp_kept, recheck="passed", dropped=supp_dropped)
 
-    if not decision.admitted and pinned_text:
+    if not show_coarse and pinned_text:
         display_cfg = config.get("display", {})
         summary = (build_summary_ups([], prompt_keywords, None, pinned_text, display_cfg, rel_cfg,
-                                     hits_by_path={}, pinned_paths=pinned_rendered + user_rendered)
+                                     hits_by_path={}, pinned_paths=pinned_rendered + user_rendered,
+                                     supp_paths=supp_rendered)
                    if display_cfg.get("user_visible", True) else None)
         # dry_run 契约：本分支是全部主注入出口之一，必须与下方"正常路径"同样只预览、
-        # 不落 additionalContext——否则「admitted 为空、只剩 pinned」这一档会绕过
-        # dry_run（Finding 1，2026-09-15 fix round 1）。
+        # 不落 additionalContext（Finding 1，2026-09-15 fix round 1）。
         if config.get("dry_run", False):
             return _finish_with_metrics(
-                config, cwd,
+                turn, config, cwd,
                 system_message=(f"[DRY-RUN] 本应注入：\n{summary}" if summary else None))
-        return _finish_with_metrics(config, cwd, additional_context=pinned_text, system_message=summary)
+        return _finish_with_metrics(turn, config, cwd, additional_context=pinned_text, system_message=summary)
 
-    if not decision.admitted:
-        # 触发点2：关键词足够但 topical 全失配。relaxed 静默；非 relaxed 加 state 冷却
-        # （TTL 窗口内最多提示一次），确无相关篇（非"已注入过"）才出。
+    if not show_coarse:
+        # 触发点2：关键词足够但 topical 全失配——只在粗排开着时适用（粗排关时没有「未匹配」可提示）。
+        # relaxed 静默；非 relaxed 加 state 冷却（TTL 窗口内最多提示一次），确无相关篇才出。
         display_cfg = config.get("display", {})
-        if (rel_cfg.get("fallback_hint", True) and not decision.any_relevant and not decision.relaxed
+        if (coarse_on and not decision.admitted and rel_cfg.get("fallback_hint", True)
+                and not decision.any_relevant and not decision.relaxed
                 and display_cfg.get("user_visible", True)
                 and display_cfg.get("verbosity") != "off"
                 and fallback_cooldown_expired(cwd, ups_cfg["state_ttl_hours"])):
             save_fallback_ts(cwd)
             return _finish_with_metrics(
-                config, cwd,
+                turn, config, cwd,
                 system_message="📚 vault-loader：本轮提问未匹配到强相关笔记，"
                                "可运行 /vault <关键词> 手动检索",
             )
-        if config.get("verbose_on_skip"):
-            return _finish_with_metrics(config, cwd, system_message="📚 vault-loader: 本轮 prompt 无强相关笔记")
-        return _finish_with_metrics(config, cwd)
+        if coarse_on and not decision.admitted and config.get("verbose_on_skip"):
+            return _finish_with_metrics(turn, config, cwd, system_message="📚 vault-loader: 本轮 prompt 无强相关笔记")
+        return _finish_with_metrics(turn, config, cwd)
 
     # 渲染层沿用 (total, topical, entry) 三元组形态：由 EntryDecision + active_entries 还原。
     scored = [(ed.total, ed.topical, active_entries[ed.path]) for ed in decision.admitted]
@@ -1413,16 +1851,25 @@ def _main_impl() -> int:
         # 声明、fence 只包 ft_body，小节仍须自带（`fulltext_title` 非 None 即全文分支）。
         pinned_text, pinned_rendered = render_pinned_section(
             pinned_render, active_entries, set(injected_paths) | set(fulltext_injected), short_chars,
-            with_notice=fulltext_title is not None)
+            with_notice=fulltext_title is not None, vault_path=vault_path)
         if pinned_text:
             injection_text = injection_text + "\n\n" + pinned_text
     user_rendered = []
     if user_pins:
         user_text, user_rendered = render_user_pins_section(
             user_pins, active_entries, set(injected_paths) | set(pinned_rendered), short_chars,
-            with_notice=fulltext_title is not None and not pinned_rendered)
+            with_notice=fulltext_title is not None and not pinned_rendered, vault_path=vault_path)
         if user_text:
             injection_text = injection_text + "\n\n" + user_text
+    supp_rendered = []
+    if supp_kept:
+        supp_text, supp_rendered = render_supp_section(
+            supp_kept, active_entries,
+            set(injected_paths) | set(pinned_rendered) | set(user_rendered), short_chars,
+            with_notice=fulltext_title is not None and not pinned_rendered and not user_rendered,
+            vault_path=vault_path, cap=supp_cap)
+        if supp_text:
+            injection_text = injection_text + "\n\n" + supp_text
     try:
         _metrics.annotate(pinned_injected=len(pinned_rendered))
     except Exception:      # noqa: BLE001
@@ -1438,23 +1885,27 @@ def _main_impl() -> int:
         _metrics.annotate(shown=list(injected_paths))
     except Exception:      # noqa: BLE001  metrics 故障绝不影响注入
         pass
-    _fill_report(config=config, prompt=prompt, home=home, active_entries=active_entries,
+    _fill_report(turn, config=config, prompt=prompt, home=home, active_entries=active_entries,
                  decision=decision, injected_paths=injected_paths, fulltext_title=fulltext_title,
                  hits_by_path=hits_by_path, pinned_render=pinned_render,
                  pinned_rendered=pinned_rendered, user_pins=user_pins,
                  user_rendered=user_rendered, excluded_paths=excluded_paths,
                  topic_words=signals.session_topic_words)
-    summary_items = scored[: ups_cfg["max_notes"]]
+    _note_fine_delivery(tf, list(injected_paths) + pinned_rendered + user_rendered + supp_rendered,
+                        supp_rendered)
+    _report_supps(turn, supp_rendered, supp_kept, recheck="passed", dropped=supp_dropped)
+    summary_items = scored[: max_notes]
     summary = (build_summary_ups(summary_items, prompt_keywords, fulltext_title,
                                  injection_text, display_cfg, rel_cfg,
                                  hits_by_path=hits_by_path,
-                                 pinned_paths=pinned_rendered + user_rendered)
+                                 pinned_paths=pinned_rendered + user_rendered,
+                                 supp_paths=supp_rendered)
                if user_visible else None)
 
     if dry_run:
         # dry-run 下诊断并入同一条 systemMessage（由 _finish 置顶），不另起一次 emit。
         return _finish_with_metrics(
-            config, cwd,
+            turn, config, cwd,
             system_message=(f"[DRY-RUN] 本应注入：\n{summary}" if summary else None),
         )
 
@@ -1468,7 +1919,7 @@ def _main_impl() -> int:
     except Exception as exc:
         _report_nonfatal("state 写入失败", exc)
 
-    return _finish_with_metrics(config, cwd, additional_context=injection_text, system_message=summary)
+    return _finish_with_metrics(turn, config, cwd, additional_context=injection_text, system_message=summary)
 
 
 if __name__ == "__main__":

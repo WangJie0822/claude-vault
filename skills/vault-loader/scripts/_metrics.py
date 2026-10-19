@@ -356,7 +356,16 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
                  llm_pinned_rank: "list[int | None] | None" = None,
                  llm_pinned_dedup: "list[str | None] | None" = None,
                  topic_extracted_h: "list[str] | None" = None,
-                 n_topic_extracted: "int | None" = None) -> dict:
+                 n_topic_extracted: "int | None" = None,
+                 coarse_on: "bool | None" = None,
+                 fine_on: "bool | None" = None,
+                 supp_on: "bool | None" = None,
+                 catalog_on: "bool | None" = None,
+                 ft_on: "bool | None" = None,
+                 fine_model: "str | None" = None,
+                 pin_max: "int | None" = None,
+                 supp_max: "int | None" = None,
+                 fmt: "int | None" = None) -> dict:
     """把一次 UPS 决策压成一条可落盘记录。纯计算、无 IO。
 
     隐私边界（不可协商，见 task-6-brief.md）：
@@ -564,6 +573,18 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
         record["topic_extracted_h"] = [x for x in topic_extracted_h if isinstance(x, str)]
     if n_topic_extracted is not None:
         record["n_topic_extracted"] = int(n_topic_extracted)
+    # 2.4.0 精排自描述字段（spec 2026-10-13 §12）：与 topic_on / pin_on 同族——analyze_metrics 不读 config，
+    # 缺了它们报表分不开「粗排关了」「精排关了」「补充关了」「目录层关了」「自动全文开着」这几种形态。
+    # 与 topic_on 不同，None 不落键：旧调用点与旧记录同形，读端用 `in` 判存在；类型不对的值丢弃。
+    for k, v in (("coarse_on", coarse_on), ("fine_on", fine_on), ("supp_on", supp_on),
+                 ("catalog_on", catalog_on), ("ft_on", ft_on)):
+        if v is not None:
+            record[k] = bool(v)
+    if isinstance(fine_model, str) and fine_model:
+        record["fine_model"] = fine_model[:64]
+    for k, v in (("pin_max", pin_max), ("supp_max", supp_max), ("fmt", fmt)):
+        if isinstance(v, int) and not isinstance(v, bool):
+            record[k] = v
     return record
 
 
@@ -875,7 +896,24 @@ def stage(record: dict) -> None:
 # 报表「功能开着却一次都没点名」那一档的分母，与 `inj_chars`「只在有正文时记」刻意不同（1A-L12）。
 _ANNOTATE_ALLOWED = frozenset({"inj_chars", "shown", "pinned_injected",
                                # 手动钉住（spec 2026-10-09 mod §6.2）：只在本轮请求带 pin 时补记
-                               "user_pinned", "user_pinned_injected"})
+                               "user_pinned", "user_pinned_injected",
+                               # 2.4.0 精排（spec 2026-10-13 §12）：补充投递与时效 / 复核丢弃、子进程统计、
+                               # 会话累计外发、主模型对 vault 的 Read、降级枚举码。全是计数、相对路径与枚举，
+                               # 不含 prompt 与笔记正文。`fmt` 由 build_record 落盘，白名单里留着无害。
+                               # `n_fine_done` 是并账的调用数、含失败的（失败的子进程同样追加统计），
+                               # 失败数单独落 `n_fine_fail`，读端用它把「完成」与「并账」分开
+                               "supp_shown", "n_supp_gen", "n_supp_drop_stale", "n_supp_drop_recheck",
+                               "n_supp_delivered", "n_supp_late_delivered", "bytes_sent",
+                               "n_fine_done", "n_fine_fail", "llm_none", "n_echo_mismatch", "n_catalog",
+                               "n_catalog_dropped", "n_summary_layer", "vault_reads", "n_vault_reads",
+                               "n_vault_reads_injected", "degraded", "fmt"})
+
+# 闸门早退的极简记录只有这五个键（`prompt_submit_load._stage_gate_record`，守卫用集合相等钉住）。
+# 它放不下补充计数，所以指代型 / 关键词不足的闸门轮不认领精排补充（`_fine_flow.release_supp_claim`）：
+# 补充第 N 轮生成、第 N+1 轮到期，而 N+1 常是闸门轮——在那里消耗它，漏斗的「产生」就系统性少计；留给下一个
+# 过闸轮，由那一轮的完整记录照常计 `n_supp_gen` 与时效丢弃。2.4.0 开发期闸门轮曾投递补充、记为 `supp_only`
+# 形态（gate 五键加补充字段），生产者已删除，`analyze_metrics` 仍按 `"fine_on" not in r` 认读旧记录。
+GATE_RECORD_KEYS = frozenset({"_schema", "ts", "session", "prompt_id", "gate"})
 
 
 def annotate(**fields: object) -> None:

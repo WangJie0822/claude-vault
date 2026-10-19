@@ -4,7 +4,9 @@ import os
 import pytest
 from pathlib import Path
 
-from scripts._note_paths import resolve_note_path
+import time
+
+from scripts._note_paths import resolve_note_path, safe_rel_note_path
 
 
 @pytest.fixture
@@ -15,6 +17,53 @@ def vault(tmp_path: Path) -> Path:
     (tmp_path / "OUTSIDE_SECRET.txt").write_text("AWS_SECRET=leak", encoding="utf-8")
     (tmp_path / "outside.md").write_text("OUTSIDE_MD_MARKER", encoding="utf-8")
     return v
+
+
+_UNSAFE = [
+    pytest.param("", id="empty"),
+    pytest.param(None, id="none"),
+    pytest.param(5, id="not-str"),
+    pytest.param("/etc/x.md", id="posix-abs"),
+    pytest.param(chr(92) + "x.md", id="backslash-root"),
+    pytest.param("//192.0.2.1/share/x.md", id="unc-slash"),
+    pytest.param(chr(92) * 2 + "192.0.2.1" + chr(92) + "share" + chr(92) + "x.md", id="unc-backslash"),
+    pytest.param(chr(92) * 2 + "?" + chr(92) + "C:" + chr(92) + "x.md", id="verbatim"),
+    pytest.param("C:/x.md", id="drive"),
+    pytest.param("C:x.md", id="drive-relative"),
+    pytest.param("a/../b.md", id="dotdot"),
+    pytest.param("a" + chr(92) + ".." + chr(92) + "b.md", id="dotdot-backslash"),
+    pytest.param("ab:c.md", id="stream"),        # 只有冒号判据能拦：无盘符、无 ..、以 .md 结尾
+    pytest.param("a/b.txt", id="not-md"),
+    pytest.param("a/b", id="no-suffix"),
+    pytest.param("a/" + chr(0) + "b.md", id="nul"),
+    pytest.param("a/" + chr(10) + "b.md", id="newline"),
+]
+
+
+@pytest.mark.parametrize("rel", _UNSAFE)
+def test_safe_rel_note_path_rejects(rel) -> None:
+    assert safe_rel_note_path(rel) is False
+
+
+@pytest.mark.parametrize("rel", ["a.md", "项目笔记/x y [1].md", "A/B.MD", "a/..b.md", "a/b..md"])
+def test_safe_rel_note_path_accepts(rel) -> None:
+    assert safe_rel_note_path(rel) is True
+
+
+def test_unc_rejected_before_any_filesystem_call(vault: Path, monkeypatch) -> None:
+    """spec 2.4.0 §8.3（F23）：判据必须在任何文件系统调用之前。UNC 路径交给 `resolve()` /
+    `is_file()` 会去连远端主机（不可路由主机实测 21 秒才返回，`try/except` 救不了）。
+    桩掉两个文件系统入口：顺序一旦颠倒，它们抛出的 AssertionError 不在被测函数的 except 元组里、直接打红。"""
+    def _boom(*_a, **_k):
+        raise AssertionError("resolve_note_path 在字符串判据之前碰了文件系统")
+
+    monkeypatch.setattr(Path, "resolve", _boom)
+    monkeypatch.setattr(Path, "is_file", _boom)
+    t0 = time.perf_counter()
+    for rel in ("//192.0.2.1/share/x.md", chr(92) * 2 + "192.0.2.1" + chr(92) + "s" + chr(92) + "x.md",
+                chr(92) * 2 + "?" + chr(92) + "UNC" + chr(92) + "192.0.2.1" + chr(92) + "x.md"):
+        assert resolve_note_path(vault, rel) is None
+    assert time.perf_counter() - t0 < 1.0
 
 
 def test_normal_relative_path_resolves(vault: Path) -> None:

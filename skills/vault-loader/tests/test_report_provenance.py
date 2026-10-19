@@ -31,8 +31,8 @@ def _fill(monkeypatch, *, topic_words, weight=2, pinned_render=(), excluded=()):
                         excluded=list(excluded), fulltext_path=None, fulltext_arm="",
                         any_relevant=True, relaxed=False, gate_reason="")
     rep = _session_ops.TurnReport(request_seen=True)
-    monkeypatch.setattr(psl, "_REPORT", rep)
-    psl._fill_report(config=cfg, prompt="hook 注入设计", home=Path("."), active_entries=entries,
+    psl._fill_report(psl._Turn(report=rep), config=cfg, prompt="hook 注入设计", home=Path("."),
+                     active_entries=entries,
                      decision=decision, injected_paths=["笔记/a.md", "笔记/b.md"],
                      fulltext_title=None,
                      hits_by_path={"笔记/a.md": ["hook"], "笔记/b.md": ["hook"]},
@@ -45,13 +45,12 @@ def test_report_llm_swallows_describe_errors(monkeypatch, capsys):
     """精排状态读取出错只让 llm 留空，不得逃出 _report_llm：main() 没有 except，逃出去本轮召回整体丢失
     （full-review T-M2：把 except 改成 raise 此前全量不红）。"""
     rep = _session_ops.TurnReport(request_seen=True)
-    monkeypatch.setattr(psl, "_REPORT", rep)
 
     def boom(*a, **k):
         raise OverflowError("cannot convert float infinity to integer")
 
     monkeypatch.setattr(psl, "describe_session_topic", boom)
-    psl._report_llm(copy.deepcopy(DEFAULT_CONFIG), Path("."), {"session_id": "s"})
+    psl._report_llm(psl._Turn(report=rep), copy.deepcopy(DEFAULT_CONFIG), Path("."), {"session_id": "s"})
     assert rep.llm is None
     assert "精排状态读取失败" in capsys.readouterr().err
 
@@ -59,11 +58,10 @@ def test_report_llm_swallows_describe_errors(monkeypatch, capsys):
 def test_report_llm_sanitizes_words(monkeypatch):
     """LLM 主题词进快照前剥 bidi 与零宽：_topic._clean_words 只剥 C0/C1，这里是唯一一道（full-review T-M5）。"""
     rep = _session_ops.TurnReport(request_seen=True)
-    monkeypatch.setattr(psl, "_REPORT", rep)
     base = {"state": "ok", "fail": None, "words": ["a" + RLO + "b", chr(0x200B) + "cd"],
             "in_scoring": None, "n_pinned": 0, "age_s": 1, "pin_on": True, "stale_pins": False}
     monkeypatch.setattr(psl, "describe_session_topic", lambda *a, **k: dict(base))
-    psl._report_llm(copy.deepcopy(DEFAULT_CONFIG), Path("."), {"session_id": "s"})
+    psl._report_llm(psl._Turn(report=rep), copy.deepcopy(DEFAULT_CONFIG), Path("."), {"session_id": "s"})
     assert rep.llm["words"] == ["ab", "cd"]
 
 

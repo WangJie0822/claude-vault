@@ -259,8 +259,9 @@ def host_write_denied(detail: object) -> Diagnosis:
 def near_miss_nudge(paths: list[str]) -> Diagnosis:
     """某些笔记反复接近召回闸门却始终未入选——可能是打分或其 frontmatter 需要调。
 
-    path 来自 frontmatter-cache.json 的 dict key（`_frontmatter_reader.py` 只校验
-    `isinstance(str)` 与长度上限，不校验内容），属外部可控数据，必须走 `safe_field`
+    path 来自 frontmatter-cache.json 的 dict key（`_frontmatter_reader.py` 只按
+    `_note_paths.safe_rel_note_path` 拒掉 C0 控制字符、绝对路径、`..` 等形态，DEL、C1 与
+    Unicode 行分隔符照样放行），属外部可控数据，必须走 `safe_field`
     而非 `sanitize_for_display`——后者按设计保留 `\\r`/`\\n`（见模块 docstring 第 46-49
     行），折叠换行是 `safe_field`/`_NEWLINE_RE` 的职责。用错会让笔记路径里嵌的换行在
     systemMessage 里伪造出第二行、冒充 Claude Code 自身的提示，与 SEC-1（摘要标题净化）

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts._frontmatter_reader import Entry
+from scripts._inject_format import PATH_NOTE
 from scripts._output import INJECTION_NOTICE
 from scripts.prompt_submit_load import PIN_HEADER, render_pinned_section
 
@@ -16,7 +17,8 @@ def test_section_has_notice_header_and_title():
     lines = text.split("\n")
     assert lines[0] == INJECTION_NOTICE.rstrip("\n")
     assert lines[1] == PIN_HEADER
-    assert lines[2].startswith("- [[项目笔记/a.md]] — ")
+    assert lines[2] == PATH_NOTE
+    assert lines[3].startswith("- 「a」")
     assert rendered == ["项目笔记/a.md"]
 
 
@@ -31,8 +33,8 @@ def test_dedup_against_already_rendered_and_self():
     ents = {p: _e(p) for p in ["a.md", "b.md"]}
     text, rendered = render_pinned_section(["a.md", "b.md", "b.md", 42, None], ents, {"a.md"}, 20)
     assert rendered == ["b.md"]
-    assert "[[a.md]]" not in text                      # already 去重
-    assert text.count("[[b.md]]") == 1                 # 自身重复去重（删 `or p in rendered` 必红）
+    assert "「a」" not in text                          # already 去重
+    assert text.count("「b」") == 1                     # 自身重复去重（删 `or p in rendered` 必红）
 
 
 def test_missing_path_skipped_without_error():

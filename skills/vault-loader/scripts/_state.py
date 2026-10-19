@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -58,6 +60,28 @@ def _safe_component(value: str, fallback: str) -> str:
     return (cleaned[:80] or fallback)
 
 
+def is_link_like(p: Path) -> bool:
+    """符号链接或 Windows reparse point（junction 等）。
+
+    不用 `os.path.isjunction`：它 3.12 才有，3.9–3.11 的 Windows 上 `Path.is_symlink()` 对
+    junction 返回 False，`live/` 被换成 junction 时清理会删到目标目录里（节点 2 S-M1）。
+    `st_file_attributes` 只在 Windows 上有，其余平台取 0。
+
+    定义在这里而不在 `_session_ops`（原名 `_session_ops._is_link_like` 仍可用）：`_fine_state` 要用它，
+    而 `_session_ops` 与 `_fine_state` 都是 UPS 里单独兜底的模块，一个的导入失败不得经这条依赖带走另一个
+    （2.4.0 full-review A-H1）。
+    """
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def configure_context(runtime: str, session_id: str = "") -> None:
     """Select the current hook process' runtime state namespace.
 
@@ -108,8 +132,9 @@ def adopt_runtime(ns: str) -> None:
     绝大多数用户所在的那一档。父子之间 `use_canonical_namespace()` 一旦翻转
     （`has_legacy_data` 的三个探针里，`~/.claude/skills/summarize-session/config.json`
     与 `~/.claude/vault-loader-metrics/` 都是**其它组件**可能创建的路径），落点即分裂，
-    且分裂后 100% 静默：子进程 stdout/stderr 全 DEVNULL，而父进程已落 in-flight 占位，
-    `has_recent_topic_attempt` 会把重试压制到 `state_ttl_hours`（默认 24 小时）。
+    且分裂后 100% 静默：子进程 stdout/stderr 全 DEVNULL。2.4.0 之前，父进程已落的
+    in-flight 占位会让 `has_recent_topic_attempt` 把重试压制到 `state_ttl_hours`（默认 24 小时）；
+    2.4.0 起没有占位与该门禁（门禁改看 fine 状态与在飞标记，它们同样按 `current_runtime()` 落点）。
 
     ⚠️ **白名单必须保留，去掉的只能是二次推导。** `_RUNTIME` 会被
     `state_path_for_cwd` 拼进目录路径；放行任意字符串等于把它变成路径组件 sink，

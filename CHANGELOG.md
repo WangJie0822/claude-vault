@@ -2,6 +2,61 @@
 
 本文件记录 Context Vault（原 claude-vault）的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.0] - 2026-10-19
+
+> **升级前请读：默认外发范围扩大，升级时没有任何提示。** 2.3.0 每会话只在首轮外发一次；2.4.0 默认每个通过闸门的提问都可能发起一次 LLM 精排，外发内容另有目录层（全部未归档、未排除笔记的文件名）、最近几轮手输的提问与本项目近期工作日志的条目标题。config 里没写这些键的，升级后直接按新默认运行。收窄：`relevance.fine_catalog: false`（不送目录）、`fine_recent_prompts: 0`、`fine_supplement: false`（只保留首轮）、`fine_rank: false`（全关），逐篇用 `private` tag。完整外发清单见 README「2.4.0 起外发给模型的内容」，升级与回退的注意事项见 [docs/MIGRATION.md](docs/MIGRATION.md)「2.3.0 → 2.4.0」。
+
+### 行为变更
+
+- **默认不再自动注入全文**：注入行改为「标题 + 摘要 + 笔记绝对路径」，主模型需要细节时自己 Read（免确认读取的权限写法见 README「按需全文与读取权限」）。`relevance.auto_fulltext: true` 回到 2.3.0 的行为。
+- **LLM 精排逐轮化**：首轮点名之后，每个通过闸门的提问都会再发起一次精排，判断要不要补充（「🔎 精排补充」，只出现一次）。候选从「粗排结果前 30 篇 + 项目笔记」改为**全量文件名目录 + 宽召回摘要层**，被粗排过滤掉的笔记也能被选中。每会话调用上限 `relevance.fine_max_calls`（默认 20）、累计外发上限 `relevance.fine_session_max_bytes`（默认 1,000,000 字节），两者都是发起前的检查、不是硬上限，例外见 vault-loader SKILL.md「频率与上限」。外发内容的变化见 README「安全提示」。
+- 「继续」「ok」这类指代型提问与关键词太少的提问不投递精排补充；到期的补充留给下一个提问，按时效判。
+- 逐轮补充的提示词要求模型对承接性提问（继续、同意或确认前面的选项、开始执行、对前面问题的简短作答，没有引入新话题）返回 NONE。这类提问仍会发起一次精排调用、照常外发。不想要逐轮补充时设 `relevance.fine_supplement: false`。
+- 精排记住本会话已注入过哪些笔记（至多 300 篇，存在每会话的精排状态里），不再把它们当候选；`/clear`、`/compact` 后清空。
+- **工作日志不再进粗排与精排候选**；SessionStart 的近期工作日志、精排的「最近工作」背景与 `/vault` 手动检索照旧。
+- 首轮提炼失败不再「本窗口内不再重试」：下一轮继续走首轮点名；连续 2 次失败停用本会话的精排发起（首轮点名与逐轮补充都不再发起），30 分钟后或在面板里重新打开精排时恢复。
+- 精排子进程加 `--setting-sources ""`、`--strict-mcp-config`、`--disable-slash-commands`（与 2.3.0 的摘要补全同一组隔离参数），超时杀整棵进程树。
+- 各处注入（SessionStart、粗排清单、首轮点名、手动钉住、精排补充）统一为每行 `- 「标题」附注 — 摘要 ‖ 路径：<绝对路径>`。
+
+### 新增
+
+- 配置键（均在 `relevance.` 下）：`coarse_inject`、`fine_rank`、`fine_supplement`、`auto_fulltext`、`fine_pin_max`、`fine_max_notes`、`fine_model`、`fine_timeout_sec`、`fine_max_calls`、`fine_session_max_bytes`、`fine_catalog`、`fine_catalog_max_chars`、`fine_recent_prompts`、`fine_exclude_tags`；其中 `fine_session_max_bytes`、`fine_catalog`、`fine_catalog_max_chars`、`fine_recent_prompts`、`fine_exclude_tags` 与 `session_topic_*` 一样是隐私旋钮，改动需显式确认。
+- `/vault-injected` 面板新增「精排补充」与「设置」两节：会话内切换开关与篇数、切换精排模型，「设为默认」只允许往收窄的方向写进 config；补充篇可标注（kind `llm_supplement`）。
+- 输入框上方一行增加「精排补充 N」计数，末尾新增「面板」按钮（键盘路径与窄终端表现尚未在真实终端核实，见 README「注入可见与可控」）。
+- mod 观测主模型对 vault 笔记的 Read，metrics 开启时落 `vault_reads` / `n_vault_reads`。
+- `analyze_metrics.py --report` 新增 LLM 精排段：每会话调用次数分布、NONE 率、补充的产生 / 时效丢弃 / 复核丢弃 / 投递、补充标注无关率、vault 读取次数、目录丢弃数、降级码分布。
+- `migrate_config.py --doctor` 提示免确认读取笔记的窄范围权限写法。
+
+### 变更
+
+- `relevance.session_topic` 由 `relevance.fine_rank` 取代、`relevance.session_pin_max` 由 `relevance.fine_pin_max` 取代：旧键仍兼容读取（`session_topic: false` 照样关闭精排）；`/config` 显示「已由 X 取代，当前仍生效」并拒写旧键，写新键时删掉对应旧键。
+- `/config`：读 config 改为 `utf-8-sig`，带 BOM 的文件不再被当成读不出；读不出的 config 拒绝写入（此前会写成只含一个键的文件）；写入在锁内读改写；备份只保留最近 20 份；`--restore` 拒绝顶层不是 JSON 对象的备份文件，不写盘。
+- config 读不出、整份回落默认值的那一轮不发起 LLM 精排（默认值里精排与目录层是开的，读坏的 config 里你可能关过它们）；粗排召回与已生成补充的投递照常，「config 解析失败」的提示照旧。
+- `migrate_config.py --apply` 不再删除显式写成 `1` 的 `relevance.session_pin_max`。
+- `migrate_config.py` 不带 `--path` 时改为操作 hook 实际读取的那份 config（`~/.context-vault/config.json` 存在时用它）。此前恒为 `~/.claude/skills/vault-loader/config.json`：1.0 起的用户 `--restore` 报「已还原」却没有生效，并可能把 state 与 metrics 切回旧目录，`--doctor` 报「config 不存在」。
+- metrics：新增自描述字段 `coarse_on`、`fine_on`、`supp_on`、`catalog_on`、`ft_on`、`fine_model`、`pin_max`、`supp_max`、`fmt`；`sample_admitted` 按渲染层落盘的 `shown` 抽样。
+- tag 排除（`fine_exclude_tags`、`exclude_note_tags`）改为大小写不敏感、忽略前导 `#`、认嵌套 tag（`private/journal`）。排除 tag 非空时，tag 读不全的笔记（`tags` 写成映射或数字、超过 32 个、单个超过 128 字）不再送给精排。`fine_exclude_tags` 写成单个字符串时当一个 tag，其他非 list 值回落默认 `["private"]`。只认 frontmatter 的 tags，工作日志标题不受 tag 控制。
+- 未装 PyYAML 时 `rebuild_index` 认 YAML 块序列（`tags:` 换行写 `- private`）。`frontmatter-cache.json` 顶层新增写端解析器修订号 `_parser`（`_version` 仍是 1）：升级后跑一次 `/summarize-session`，其中的 `rebuild_index` 会忽略 mtime 全量重解析一次索引，之后照常增量。未装 PyYAML、用块序列写 tags 的旧笔记，以及 frontmatter 超过 2000 字符的旧笔记，要等这次重解析之后 private 等排除 tag 才生效；标量、`#` 前缀与嵌套写法由读端处理，升级后立即生效。在那之前的提问已经会按旧索引发起精排，在新会话里跑 `/summarize-session` 的那一轮本身也是（精排在 skill 重建索引之前就发起）；要避开，升级后先把 `relevance.fine_rank` 设为 `false` 再跑 `/summarize-session`、之后改回，或开会话之前在终端跑一次 `rebuild_index.py`，见 docs/MIGRATION.md「2.3.0 → 2.4.0」。
+- `rebuild_index` 读 frontmatter 时读到结束行 `---` 为止，最多读文件前 65536 个字符；此前只读前 2000 个字符，结束行落在这之外时整段 frontmatter 读不到，带 `private` 的笔记照样外发。读满仍没有结束行的笔记，cache 里记 `fm_truncated`（`_version` 仍是 1），精排按 tag 读不全处理、不外发。
+- 粗排行为的两处变化：`tags: a, b`、`tags: a` 这类标量写法的 tag 此前被读端整个丢弃，现在参与 tag 匹配与打分；`#x` 与 `x` 视为同一个 tag。
+- 读端净化剥除 Unicode Cf 类字符（零宽、bidi、tag 字符等）。笔记相对路径在任何文件系统调用之前先过纯字符串判据（拒盘符、绝对路径、`..`、`:`、UNC 与 `\\?\` 前缀）。
+- 精排或快照相关模块加载失败只影响精排与快照，粗排召回照常。
+- 精排子进程的输入改经临时文件交接，输入较长（长提问、本会话已注入较多笔记）时不再拖慢提问。
+- 未设 UTF-8 环境变量的中文 Windows 上：提问与含中文的工作目录不再被读成乱码（此前中文提问基本召回不到笔记）；`/config`、`analyze_metrics.py --report` / `--purge`，以及 `/summarize-session` 用到的 `obsidian_cli.py`、`scan_sessions.py --parse` 不再因输出含 emoji 或 GBK 以外的字符而崩溃；`scripts/context_vault_doctor.py` 与 `scripts/migrate_settings.py` 在用户目录路径含 GBK 以外的字符时同样不再崩溃。
+
+### 已知
+
+- 回退到 2.3.0 或更早时，kind 为 `llm_supplement` 的人工标注会被旧版 `load_annotations` 计为坏记录并在 stderr 报出（不影响其它标注）。
+- 回退到 2.3.0 会静默重新打开 LLM 外发：2.3.0 只认 `relevance.session_topic`，而在 2.4.0 里经 `/config` 或面板「设为默认」写 `fine_rank` 时这个旧键已被删掉，回退后精排按 2.3.0 的默认开启；2.3.0 也没有 `fine_exclude_tags`，`private` 笔记会进首轮候选。想在回退后保持精排关闭的，回退前手工在 config 的 `relevance` 段写上 `"session_topic": false`（`/config` 拒写这个旧键）。回退期间改动过的笔记按 2.3.0 的口径进索引，再升级回 2.4.0 时不会全量重解析。详见 docs/MIGRATION.md「回退到 2.3.0」。
+- 与文件名、tag、摘要、keywords 都没有词面关联的笔记，精排只能凭文件名判断，基本召不回；工作日志以外的纯日期文件名笔记在目录层信息量低。
+- 逐轮补充的相关性还没达到设计目标：发布前用作者本机 10 个会话做了两轮离线回放、逐条人工判定，补充没有一条判为相关（第二轮投递的 4 篇都是文件名或摘要与提问表面撞词）。默认仍开启，后续版本改进选篇；不需要时设 `relevance.fine_supplement: false`。
+- 精排还没写回、第 N+2 次提问就到了时，第 N 次提问产生的补充按时效丢弃；精排在跑期间到来的提问不会再发起新的精排。
+- 精排状态写回遇到锁超时的那一轮，下一轮可能把同一份补充再投一次（持续超时则持续重投，直到某一轮写回成功）。
+
+### 原始需求中留给下一版的部分
+
+- 按笔记正文语义打分（向量检索 / embedding、正文全文检索）与离题判据：本版未做。
+
 ## [2.3.0] - 2026-10-14
 
 ### 新增

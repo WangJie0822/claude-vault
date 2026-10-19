@@ -38,11 +38,26 @@ def sanitize_for_display(s: str) -> str:
 # 抄去显示侧（会重开终端转义漏洞），也勿把显示侧的 C1 剥离抄来这里（对喂模型内容无意义地更激进）。
 _CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+# Unicode Cf（格式控制：零宽、bidi、tag 字符、软连字符等），注入侧一并剥除（spec 2.4.0 §8 / 摘要子项目
+# 评审 S39）——注入正文与快照显示（`_session_ops.display_text` 经本函数取值）同口径。按码点区间硬编码
+# （Unicode 16.0，Python 3.14 的 unicodedata 实测 170 个），不在导入时扫全码表（约 110 万次 category
+# 调用，会吃掉 hook 预算）；`test_output.py::test_cf_ranges_cover_running_unicode` 拿运行时 unicodedata
+# 对账，新版 Unicode 增补的 Cf 漏掉时转红。区间用整数写、由 chr() 拼字符类：源码里不出现转义序列。
+_CF_RANGES = ((0x00AD, 0x00AD), (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD),
+              (0x070F, 0x070F), (0x0890, 0x0891), (0x08E2, 0x08E2), (0x180E, 0x180E),
+              (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x206F),
+              (0xFEFF, 0xFEFF), (0xFFF9, 0xFFFB), (0x110BD, 0x110BD), (0x110CD, 0x110CD),
+              (0x13430, 0x1343F), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0xE0001, 0xE0001),
+              (0xE0020, 0xE007F))
+_CF_RE = re.compile("[" + "".join(
+    re.escape(chr(a)) if a == b else re.escape(chr(a)) + "-" + re.escape(chr(b))
+    for a, b in _CF_RANGES) + "]")
+
 
 def sanitize_injected_text(text: str, keep_newlines: bool = True) -> str:
-    """净化进入 additionalContext 的笔记内容（F5）：剥控制字符（保 \\t）；
+    """净化进入 additionalContext 的笔记内容（F5）：剥控制字符（保 \\t）与 Unicode Cf（S39）；
     keep_newlines=False 时换行折叠为空格（清单单行项，防 summary 伪造分隔符/新段落）。"""
-    cleaned = _CTRL_CHARS_RE.sub("", text)
+    cleaned = _CF_RE.sub("", _CTRL_CHARS_RE.sub("", text))
     if keep_newlines:
         return cleaned.replace("\r", "")
     # 折叠含 Unicode 行分隔符（U+2028/U+2029/U+0085）：三者语义即换行，

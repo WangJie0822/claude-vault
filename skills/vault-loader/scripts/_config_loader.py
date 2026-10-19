@@ -174,8 +174,9 @@ DEFAULT_CONFIG: dict = {
         #
         # 与 metrics.enabled 的 opt-in 边界**刻意不同**，三项代价必须写明：
         # 1. 每会话首轮拉起一个 detached `claude -p --model haiku` 子进程，**消耗用户
-        #    额度**。失败/超时由 has_recent_topic_attempt 的负缓存收敛为「每
-        #    user_prompt_submit.state_ttl_hours 窗口最多一次」，不会每轮重试。
+        #    额度**（2.4.0 起逐轮补充也会拉起，见 relevance.fine_rank）。失败/超时不会
+        #    每轮无限重试：由 fine 状态的「连续 2 次失败停用」与 fine_max_calls 收敛
+        #    （`_fine_flow.spawn_blocked`）；1.x 的「每 state_ttl_hours 窗口最多一次」负缓存已退役。
         # 2. 该子进程收到本轮 prompt 原文 + session_topic_top_n 篇候选笔记的路径与
         #    摘要（经 stdin，不落 argv/进程表）。产物（主题词、点名篇）写本机 state；开启
         #    `metrics` 时另落主题词的**加盐 hash**与点名篇路径到 metrics 记录，可 `--purge` 清除。
@@ -202,6 +203,25 @@ DEFAULT_CONFIG: dict = {
         # 给列表则**完全替换**内置表，不是追加——追加语义无法表达「关掉某个误伤词」
         # 这个最常见的诉求。
         "deictic_words": None,
+        # ── 2.4.0 精排（spec 2026-10-13 fine-rank-per-turn §5.1）──────────────────────
+        # `fine_rank` / `fine_pin_max` 取代上面的 `session_topic` / `session_pin_max`；旧键仍兼容读取，
+        # 有效值由 `resolve_superseded` 按「新键显式 > 旧键显式 > 默认」算出后镜像写回两键。
+        # 校验与读取单点在 `_fine_config`：调用方不得各自 `rel.get(...)` 再算一份。
+        "coarse_inject": True,            # 粗排注入开关：关 = 打分照跑、不注入清单
+        "fine_rank": True,                # 精排总开关（外发类）
+        "fine_supplement": True,          # 逐轮补充（外发类；需 fine_rank 同时开）
+        "auto_fulltext": False,           # 强命中自动全文；默认关，主模型按需 Read
+        "fine_pin_max": 1,                # 首轮点名上限 [0, 8]
+        "fine_max_notes": 3,              # 每次补充上限 [0, 8]
+        "fine_model": "haiku",            # 精排模型名，校验见 _fine_config.MODEL_RE
+        "fine_timeout_sec": 120,          # [10, 300]
+        "fine_max_calls": 20,             # 每会话调用上限 [1, 500]【初值】
+        # 以下五个是隐私旋钮（config_inventory.PRIVACY_KNOBS）：决定每次调用往模型端点送多少。
+        "fine_session_max_bytes": 1000000,  # 每会话累计外发字节上限 [0, 20000000]【初值】
+        "fine_catalog": True,             # 目录层：送全部未归档、未排除笔记的文件名
+        "fine_catalog_max_chars": 80000,  # 目录层字符预算 [0, 400000]【初值】
+        "fine_recent_prompts": 3,         # 最近 K 轮用户输入 [0, 10]【初值】
+        "fine_exclude_tags": ["private"],  # 带这些 tag 的笔记不进精排候选
     },
 
     "metrics": {
@@ -323,6 +343,49 @@ def _ensure_runtimes_normalized(result: dict) -> dict:
     return result
 
 
+# 已被取代、仍兼容读取的旧键（spec 2.4.0 §5.3）：(新键, 旧键)，都在 relevance 段。
+_SUPERSEDED_PAIRS = (("fine_rank", "session_topic"), ("fine_pin_max", "session_pin_max"))
+
+
+def resolve_superseded(merged: dict, override) -> None:
+    """按「新键显式 > 旧键显式 > 默认」算出有效值，**镜像写回新旧两键**（原地改 `merged`）。
+
+    `override` 是用户原始 dict（缺失 / 损坏路径传 `{}`）。必须看原始 override 而不是合并结果：
+    `session_pin_max` 的默认 1 与用户显式写的 1 在合并后不可区分（F34），只有 override 分得出。
+
+    新键的「显式」按 §5.2 判，判据是 `_fine_config.explicit_value`（与 `validate_value` 同一份归一）：
+    类型不合格（`fine_rank: 0` / `null` / `[]`，`fine_pin_max: "3"` / `true`）⇒ 当缺失，回落旧键、再回落默认，
+    **不镜像**；类型合格但越界 / 有小数（`fine_pin_max: 9`）⇒ 取截断后的归一值，与 `pin_max_raw` 直读同值。
+    否则加载路径会让旧键里的坏值生效，与直接构造 dict 的读取结论相反。旧键保持 2.3.0 口径，原值复制
+    （`session_pin_max: false` 仍是 0 篇，由读取单点按 Ruling 9 解释）。
+
+    `_fine_config` 在调用时才延迟导入：它在模块级导入本模块（取 `DEFAULT_CONFIG`），这里模块级导入它会成环。
+    被按文件路径加载（无父包、相对导入不可用）时该导入失败，由下面的 fail-open 兜成「不镜像」；
+    config skill 只用本模块的 `DEFAULT_CONFIG` / `_deep_merge`，不调 `load_config_ex`。
+    fail-open：异常时原样不动。
+    """
+    try:
+        from ._fine_config import explicit_value
+        rel = merged.get("relevance") if isinstance(merged, dict) else None
+        if not isinstance(rel, dict):
+            return
+        ov = override.get("relevance") if isinstance(override, dict) else None
+        if not isinstance(ov, dict):
+            ov = {}
+        for new, old in _SUPERSEDED_PAIRS:
+            explicit, normalized = explicit_value(new, ov[new]) if new in ov else (False, None)
+            if explicit:
+                value = normalized
+            elif old in ov:
+                value = ov[old]
+            else:
+                value = DEFAULT_CONFIG["relevance"][new]
+            rel[new] = deepcopy(value)
+            rel[old] = deepcopy(value)
+    except Exception:  # noqa: BLE001 — 配置加载永不因此失败
+        pass
+
+
 class ConfigLoad(NamedTuple):
     """`load_config_ex` 的返回：配置本体 + 本次是否发生了**非预期**回退。
 
@@ -379,6 +442,7 @@ def load_config_ex(path: Path | None = None) -> ConfigLoad:
         result = deepcopy(DEFAULT_CONFIG)
         result["vault_path"] = _default_vault_for(path)
         _ensure_relevance_normalized(result)
+        resolve_superseded(result, {})
         # 零配置新装不是失效——不置位。
         return ConfigLoad(result, None, "")
 
@@ -400,6 +464,7 @@ def load_config_ex(path: Path | None = None) -> ConfigLoad:
         if "vault_path" not in override:
             result["vault_path"] = _default_vault_for(path)
         _ensure_relevance_normalized(result)
+        resolve_superseded(result, override)
         return ConfigLoad(result, None, "")
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         print(f"[vault-loader] config 损坏，回退默认值：{exc}", file=sys.stderr)
@@ -408,6 +473,7 @@ def load_config_ex(path: Path | None = None) -> ConfigLoad:
         # 「config 损坏」这个本已置位的失效，叠加一次不可见的 Vault 换址。
         result["vault_path"] = _default_vault_for(path)
         _ensure_relevance_normalized(result)
+        resolve_superseded(result, {})
         return ConfigLoad(result, "corrupt", str(exc))
 
 

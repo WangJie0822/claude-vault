@@ -127,3 +127,15 @@ def test_call_claude_rejects_bad_model_without_spawning(monkeypatch, bad):
     seen = _capture_run(monkeypatch)
     assert model.call_claude("hi", model=bad) is None
     assert "argv" not in seen
+
+
+def test_topic_isolation_flags_match_model_backend():
+    """精排子调用（vault-loader `_topic._call_model`）不得导入 context_vault，隔离参数只能手抄一份；
+    两份由本用例钉成逐字相同（spec D8）。按 AST 取字面量，不导入 vault-loader 模块。"""
+    import ast
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "skills" / "vault-loader" / "scripts" / "_topic.py"
+           ).read_text(encoding="utf-8")
+    vals = [ast.literal_eval(n.value) for n in ast.parse(src).body
+            if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "_ISOLATION" for t in n.targets)]
+    assert vals == [model._ISOLATION]

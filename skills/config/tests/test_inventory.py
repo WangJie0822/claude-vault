@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -144,6 +145,16 @@ def test_privacy_knobs_are_flagged(_isolate_home):
     assert by_key["relevance.min_topical_score"].get("privacy") is not True
 
 
+def test_fine_privacy_knobs_are_flagged(_isolate_home):
+    """2.4.0 精排的五个外发旋钮（spec §5.1「隐私旋钮」列）同样要带隐私标记。"""
+    by_key = {it["key"]: it for it in inv.build_inventory(home=_isolate_home)}
+    for k in ("relevance.fine_catalog", "relevance.fine_exclude_tags",
+              "relevance.fine_recent_prompts", "relevance.fine_catalog_max_chars",
+              "relevance.fine_session_max_bytes"):
+        assert by_key[k].get("privacy") is True, f"{k} 未标记为隐私旋钮"
+    assert by_key["relevance.fine_max_notes"].get("privacy") is not True
+
+
 def test_readonly_keys_are_flagged(_isolate_home):
     """首版只读的键要标出来，否则用户会以为能改而反复尝试。"""
     by_key = {it["key"]: it for it in inv.build_inventory(home=_isolate_home)}
@@ -176,3 +187,86 @@ def test_cli_human_output_mentions_counts(_isolate_home):
         env=env, timeout=60)
     assert r.returncode == 0, r.stderr[-400:]
     assert "显式" in r.stdout and "默认" in r.stdout
+
+
+# ── 被取代的旧键（spec 2026-10-13 §5.3）─────────────────────────────────────────────────
+def _vault_loader_superseded() -> dict:
+    """按源码取 vault-loader `_fine_config.SUPERSEDED`：它用相对导入，不能按路径单独加载；跨 skill
+    import 又会争用顶层包名 `scripts`（见本文件头），所以读 AST 字面量。"""
+    src = (SKILL_ROOT.parent / "vault-loader" / "scripts" / "_fine_config.py").read_text(
+        encoding="utf-8")
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Name) and t.id == "SUPERSEDED" for t in targets):
+                return ast.literal_eval(node.value)
+    raise AssertionError("_fine_config.py 里找不到 SUPERSEDED")
+
+
+def test_superseded_matches_vault_loader():
+    got = _vault_loader_superseded()
+    assert got, "解析出空表"                                    # 阳性对照：解析没失效
+    assert inv.SUPERSEDED == got
+
+
+def _vault_loader_literal(name: str):
+    """按源码取 vault-loader `_fine_config` 的模块级字面量（理由同 `_vault_loader_superseded`）。"""
+    src = (SKILL_ROOT.parent / "vault-loader" / "scripts" / "_fine_config.py").read_text(
+        encoding="utf-8")
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+                return ast.literal_eval(node.value)
+    raise AssertionError(f"_fine_config.py 里找不到 {name}")
+
+
+def test_panel_keys_are_not_privacy_knobs():
+    """mod 面板的「设为默认」（`prompt_submit_load._apply_persist`）调 `set_key` 时**不传** `privacy_ack`。
+    面板键一旦与隐私旋钮相交，那个键的 persist 会被 `set_key` 以「隐私旋钮需显式确认」拒掉，而 UPS 把它
+    记成 `write_failed`——用户看到的是「写入失败」，真实原因被埋掉。要把隐私旋钮放进面板，先给 persist
+    设计显式确认，再改这条。"""
+    panel = _vault_loader_literal("PANEL_KEYS")
+    assert panel, "解析出空表"                                  # 阳性对照：解析没失效
+    full = {k if k.startswith("user_prompt_submit.") else f"relevance.{k}" for k in panel}
+    assert full <= set(inv.flatten(inv.load_default_config())), full   # 映射成的全路径都是真实可配键
+    assert not (full & set(inv.PRIVACY_KNOBS)), full & set(inv.PRIVACY_KNOBS)
+
+
+def test_superseded_keys_are_flagged_and_still_effective(_isolate_home):
+    """旧键仍被兼容读取：清单里要显示「已被取代、仍生效」与当前值，且不可写。"""
+    _write_config(_isolate_home, {"relevance": {"session_pin_max": 3}})
+    items = inv.build_inventory(home=_isolate_home)
+    by_key = {it["key"]: it for it in items}
+    old = by_key["relevance.session_pin_max"]
+    assert old["status"] == "superseded" and old["writable"] is False
+    assert old["current"] == 3 and old["source"] == "explicit"
+    assert old["desc"].startswith("已由 `relevance.fine_pin_max` 取代，当前仍生效")
+    assert by_key["relevance.fine_pin_max"]["status"] == "active"
+    out = inv.render([old])
+    assert "↪ 已被取代（仍生效）" in out
+    assert "只读" not in out                                    # 不重复标「只读」
+
+
+def test_read_raw_config_accepts_bom(_isolate_home):
+    """PowerShell 5.1 与部分编辑器写出带 BOM 的 UTF-8；按 utf-8 读会被当成损坏、清单全显示默认值。"""
+    p = _isolate_home / ".context-vault" / "config.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"\xef\xbb\xbf" + json.dumps({"relevance": {"min_topical_score": 9}}).encode("utf-8"))
+    raw, _path, exists = inv.read_raw_config(_isolate_home)
+    assert exists and raw == {"relevance": {"min_topical_score": 9}}
+
+
+@pytest.mark.parametrize("text,readable", [("{not json", False), ("[1, 2]", False), ('{"a": 1}', True)])
+def test_strict_read_tells_unreadable_from_empty(_isolate_home, text, readable):
+    p = _isolate_home / ".context-vault" / "config.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    data, _p, exists, ok = inv.read_raw_config_strict(_isolate_home)
+    assert exists is True and ok is readable
+    assert data == ({"a": 1} if readable else {})
+
+
+def test_strict_read_of_missing_file_is_readable_and_empty(_isolate_home):
+    data, _p, exists, ok = inv.read_raw_config_strict(_isolate_home)
+    assert (data, exists, ok) == ({}, False, True)

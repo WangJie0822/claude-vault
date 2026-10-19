@@ -22,7 +22,7 @@ paths:
 
 - `MAX_TOPIC_SESSIONS` 的槽位数按落点粒度定：主题词改按项目根隔离后，同一仓库 24 小时内的全部会话共享这些槽位，槽位不够时新会话会挤掉旧会话、被挤掉的会话要重新付费提炼——改落点粒度时必须同步重算容量（2026-09-10 full-review 抓出的正是这一条）。
 - topics entry 的 ts 只经 `_topic._valid_ts` 判有效（有限、非 bool、不超前本机时钟 `_TS_SKEW_SEC`），读写两侧共用；写入时清掉无效的他会话条目，条数淘汰不淘汰本会话。只判 isinstance 时 inf / nan 永不过期，32 条伪造的未来条目能把刚写入的会话挤掉、spawn 门禁每轮重开（2026-10-12 full-review S-3）。代价：时钟回拨超过容差时多发起一次提炼。
-- topics entry 的 `state` / `fail`、`describe_session_topic`、`take_spawn_outcome` 与 `_LAST_FAIL` 的约束写在 `.claude/rules/mod.md`「现行补充」，改 `_topic.py` 这几处前先 Read 它。
+- topics entry 的 `state` / `fail`、`describe_session_topic` 与 `_LAST_FAIL` 的约束写在 `.claude/rules/mod.md`「现行补充」，改 `_topic.py` 这几处前先 Read 它。
 
 ## 迁移原文（基线 `3ac359f`）
 

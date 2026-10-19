@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import math
+import statistics
 import sys
 import time
 from collections import Counter
@@ -116,7 +117,12 @@ SUPPORTED_SCHEMAS = frozenset({1, 2})
 # 置 0 会把「这条记录写于加字段之前」和「它真的是 0」混成同一个值。
 _NUMERIC_TOP_FIELDS = ("n_admitted", "inj_chars", "n_excluded", "ts",
                        "n_topic_words", "pinned_injected", "n_topic_extracted",
-                       "n_pool", "n_pool_proj", "user_pinned_injected")
+                       "n_pool", "n_pool_proj", "user_pinned_injected",
+                       # 2.4.0 精排（spec 2026-10-13 §12）
+                       "n_supp_gen", "n_supp_drop_stale", "n_supp_drop_recheck", "n_supp_delivered",
+                       "n_supp_late_delivered", "bytes_sent", "n_fine_done", "n_fine_fail", "llm_none",
+                       "n_echo_mismatch", "n_catalog", "n_catalog_dropped", "n_summary_layer",
+                       "n_vault_reads", "n_vault_reads_injected", "fmt", "pin_max", "supp_max")
 
 
 def _drop_bad_numeric_fields(r: dict) -> int:
@@ -155,6 +161,10 @@ _LIST_TOP_FIELDS: dict[str, tuple] = {
     "llm_pinned_rank": (int, type(None)),
     "llm_pinned_dedup": (str, type(None)),
     "topic_extracted_h": (str,),
+    # 2.4.0 精排：本轮投递的补充、主模型 Read 过的 vault 笔记（相对路径）、降级枚举码
+    "supp_shown": (str,),
+    "vault_reads": (str,),
+    "degraded": (str,),
 }
 
 
@@ -219,7 +229,15 @@ class _Acc:
                  "pin_rank_top3", "pin_rank_top10", "pin_rank_missing",
                  "pin_field_n", "pin_off_n", "pin_dedup_n", "pin_user_excluded_n",
                  "pool_n", "pool_sum", "pool_proj_n", "pool_proj_sum", "pool_proj_rounds",
-                 "skip_on_n")
+                 "skip_on_n",
+                 "fine_field_n", "fine_off_n", "fine_done_sum", "llm_none_sum",
+                 "supp_gen_sum", "supp_drop_stale_sum", "supp_drop_recheck_sum",
+                 "supp_delivered_sum", "supp_late_sum", "echo_mismatch_sum",
+                 "catalog_n", "catalog_sum", "catalog_dropped_sum", "catalog_dropped_rounds",
+                 "summary_layer_sum", "vault_reads_sum", "vault_reads_injected_sum",
+                 "degraded", "fine_calls_by_session", "bytes_by_session",
+                 "fine_fail_sum", "fine_on_n", "fine_supp_only_n", "fine_noacct_n",
+                 "supp_on_n", "supp_off_n", "catalog_on_n", "catalog_off_n")
 
     def __init__(self) -> None:
         self.arm: Counter = Counter()
@@ -255,6 +273,25 @@ class _Acc:
         self.pin_field_n = self.pin_off_n = self.pin_dedup_n = self.pin_user_excluded_n = 0
         # 首轮候选池构成（1B-H-1）：只有触发提炼的那一轮带字段。
         self.pool_n = self.pool_sum = self.pool_proj_n = self.pool_proj_sum = self.pool_proj_rounds = 0
+        # LLM 精排（2.4.0，spec §12）。`fine_field_n` 是带精排字段的记录数；`fine_on=False` 的单独计、
+        # 不进分母（与 topic_on / pin_on 同一三态口径）。每会话调用次数与累计外发按 session 聚合，
+        # 规模随会话数有界，不物化 records。
+        self.fine_field_n = self.fine_off_n = self.fine_done_sum = self.llm_none_sum = 0
+        self.supp_gen_sum = self.supp_drop_stale_sum = self.supp_drop_recheck_sum = 0
+        self.supp_delivered_sum = self.supp_late_sum = self.echo_mismatch_sum = 0
+        self.catalog_n = self.catalog_sum = self.catalog_dropped_sum = self.catalog_dropped_rounds = 0
+        self.summary_layer_sum = self.vault_reads_sum = self.vault_reads_injected_sum = 0
+        self.degraded: Counter = Counter()
+        self.fine_calls_by_session: dict = {}
+        self.bytes_by_session: dict = {}
+        # `n_fine_done` 是并账的调用数、含失败的，失败数单独累加
+        self.fine_fail_sum = 0
+        # 带精排字段的记录按形态拆开：完整决策记录（`fine_on=true`）、2.4.0 开发期的旧 supp_only 记录（闸门轮投递
+        # 补充时的形态，无 `fine_on`，生产者已删除）；
+        # 完整记录里没有 `n_fine_done` 的（dry_run 轮、精排状态读取失败的轮不记精排计数）单独计
+        self.fine_on_n = self.fine_supp_only_n = self.fine_noacct_n = 0
+        # 补充 / 目录层两个子开关（记录自描述字段），用来把「已关闭」与「开着却没产生」分开
+        self.supp_on_n = self.supp_off_n = self.catalog_on_n = self.catalog_off_n = 0
 
 
 def _acc_gate_and_admitted(r: dict, a: _Acc) -> None:
@@ -491,6 +528,94 @@ def _acc_pool(r: dict, a: _Acc) -> None:
             a.pool_proj_rounds += 1
 
 
+# (记录字段, 累加器属性)：逐轮求和的精排计数
+_FINE_SUM_FIELDS = (
+    ("n_fine_done", "fine_done_sum"), ("n_fine_fail", "fine_fail_sum"), ("llm_none", "llm_none_sum"),
+    ("n_supp_gen", "supp_gen_sum"), ("n_supp_drop_stale", "supp_drop_stale_sum"),
+    ("n_supp_drop_recheck", "supp_drop_recheck_sum"), ("n_supp_delivered", "supp_delivered_sum"),
+    ("n_supp_late_delivered", "supp_late_sum"), ("n_echo_mismatch", "echo_mismatch_sum"),
+    ("n_summary_layer", "summary_layer_sum"), ("n_vault_reads", "vault_reads_sum"),
+    ("n_vault_reads_injected", "vault_reads_injected_sum"),
+)
+_FINE_MARK_FIELDS = tuple(k for k, _ in _FINE_SUM_FIELDS) + ("fine_on", "n_catalog", "supp_shown")
+
+
+def _finite(v) -> bool:
+    """类型守卫，不是第二套清洗：坏值清洗归 `_NUMERIC_TOP_FIELDS`（经 `load_records`）；
+    这里只挡「裸调 summarize、未经 load_records」时的 bool / 非数 / 非有限值（同 `_acc_pin` 惯例）。"""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _acc_fine(r: dict, a: _Acc) -> None:
+    """LLM 精排的调用、补充漏斗、目录层、vault 读取与降级码（spec §12）。
+
+    `fine_on` 只决定**轮数分母**：关闭的轮次计入 `fine_off_n`、不进 `fine_field_n`，但它带着的计数照常求和——
+    中途关闭的那一轮仍会并账此前在途调用的统计（外发字节、失败数、降级码），丢掉它们等于少报已发生的外发。"""
+    off = r.get("fine_on") is False
+    if off:
+        a.fine_off_n += 1
+    elif not any(k in r for k in _FINE_MARK_FIELDS):
+        return                      # 2.4.0 之前的旧记录：不进分母
+    else:
+        a.fine_field_n += 1
+        if r.get("fine_on") is True:
+            a.fine_on_n += 1
+            if not _finite(r.get("n_fine_done")):
+                a.fine_noacct_n += 1        # 没有精排计数：dry_run 轮、精排状态读取失败的轮（`_annotate_fine` 不跑）
+        elif "fine_on" not in r:
+            a.fine_supp_only_n += 1         # 2.4.0 开发期的旧 supp_only 记录：带补充字段、不带 `fine_on` 与调用统计
+        for flag, on_attr, off_attr in (("supp_on", "supp_on_n", "supp_off_n"),
+                                        ("catalog_on", "catalog_on_n", "catalog_off_n")):
+            v = r.get(flag)
+            if v is True:
+                setattr(a, on_attr, getattr(a, on_attr) + 1)
+            elif v is False:
+                setattr(a, off_attr, getattr(a, off_attr) + 1)
+    for src, dst in _FINE_SUM_FIELDS:
+        v = r.get(src)
+        if _finite(v):
+            setattr(a, dst, getattr(a, dst) + int(v))
+    v = r.get("n_catalog")
+    if _finite(v) and int(v) > 0:
+        # 只数「本轮并账了带目录层的调用」的轮次：真实完整记录在每个精排轮上都带 `n_catalog`，
+        # 没有统计出队的轮次落的是 0，计进分母会把「目录层均 N 篇」稀释成每轮均值而不是每次调用的量级
+        a.catalog_n += 1
+        a.catalog_sum += int(v)
+    v = r.get("n_catalog_dropped")
+    if _finite(v) and int(v) > 0:
+        a.catalog_dropped_sum += int(v)
+        a.catalog_dropped_rounds += 1
+    sess = r.get("session")
+    done = r.get("n_fine_done")
+    # 关闭的轮次只有带着在途调用统计时才进会话聚合：否则一个全程关着精排的会话会凭空多出一个「0 次」
+    if isinstance(sess, str) and sess and (not off or _finite(done)):
+        a.fine_calls_by_session[sess] = (a.fine_calls_by_session.get(sess, 0)
+                                         + (int(done) if _finite(done) else 0))
+        b = r.get("bytes_sent")         # 会话累计值：取每会话最大的那一轮
+        if _finite(b):
+            a.bytes_by_session[sess] = max(a.bytes_by_session.get(sess, 0), int(b))
+    deg = r.get("degraded")
+    if isinstance(deg, list):
+        for d in deg:
+            if isinstance(d, str) and d:
+                a.degraded[d] += 1
+
+
+_CALL_BUCKETS = ("0", "1", "2", "3-5", "6-10", "11-20", ">20")
+
+
+def _call_bucket(n: int) -> str:
+    if n <= 2:
+        return str(max(0, n))
+    if n <= 5:
+        return "3-5"
+    if n <= 10:
+        return "6-10"
+    if n <= 20:
+        return "11-20"
+    return ">20"
+
+
 def _acc_to_dict(a: _Acc) -> dict:
     return {
         "n_events": a.n, "n_ok": a.n_ok, "n_admitted": a.n_admitted,
@@ -530,6 +655,26 @@ def _acc_to_dict(a: _Acc) -> dict:
         "pool_proj_n": a.pool_proj_n,
         "pool_proj_sum": a.pool_proj_sum,
         "pool_proj_rounds": a.pool_proj_rounds,
+        "fine_field_n": a.fine_field_n, "fine_off_n": a.fine_off_n,
+        "fine_done_sum": a.fine_done_sum, "llm_none_sum": a.llm_none_sum,
+        "supp_gen_sum": a.supp_gen_sum, "supp_drop_stale_sum": a.supp_drop_stale_sum,
+        "supp_drop_recheck_sum": a.supp_drop_recheck_sum,
+        "supp_delivered_sum": a.supp_delivered_sum, "supp_late_sum": a.supp_late_sum,
+        "echo_mismatch_sum": a.echo_mismatch_sum,
+        "catalog_n": a.catalog_n, "catalog_sum": a.catalog_sum,
+        "catalog_dropped_sum": a.catalog_dropped_sum,
+        "catalog_dropped_rounds": a.catalog_dropped_rounds,
+        "summary_layer_sum": a.summary_layer_sum,
+        "vault_reads_sum": a.vault_reads_sum,
+        "vault_reads_injected_sum": a.vault_reads_injected_sum,
+        "fine_calls_dist": dict(Counter(_call_bucket(n) for n in a.fine_calls_by_session.values())),
+        "bytes_session_median": (statistics.median(a.bytes_by_session.values())
+                                 if a.bytes_by_session else None),
+        "degraded_dist": dict(a.degraded),
+        "fine_fail_sum": a.fine_fail_sum, "fine_on_n": a.fine_on_n,
+        "fine_supp_only_n": a.fine_supp_only_n, "fine_noacct_n": a.fine_noacct_n,
+        "supp_on_n": a.supp_on_n, "supp_off_n": a.supp_off_n,
+        "catalog_on_n": a.catalog_on_n, "catalog_off_n": a.catalog_off_n,
     }
 
 
@@ -562,6 +707,7 @@ def summarize(records: Iterable[dict]) -> dict:
         _acc_topic(r, a)
         _acc_pin(r, a)
         _acc_pool(r, a)
+        _acc_fine(r, a)
     return _acc_to_dict(a)
 
 
@@ -692,6 +838,133 @@ def _render_pool(s: dict) -> str:
             f"（{s.get('pool_proj_rounds', 0)}/{pj_n} 轮含项目笔记）")
 
 
+# 关闭的轮次也可能带着此前在途调用的统计（`_acc_fine` 照常求和）：只要这些里有任一非零，就不能只报「已关闭」
+_FINE_COUNT_KEYS = ("fine_done_sum", "supp_gen_sum", "supp_drop_stale_sum", "supp_drop_recheck_sum",
+                    "supp_delivered_sum", "echo_mismatch_sum", "catalog_sum", "catalog_dropped_sum",
+                    "summary_layer_sum", "vault_reads_sum", "degraded_dist", "bytes_session_median")
+
+
+def _fine_zero_calls_line(s: dict, tail: str) -> str:
+    """并账调用数为 0 的那一行。失败的调用同样会计进 `n_fine_done`，所以「连续失败停用」不是 N=0 的原因；
+    窗口里只有 2.4.0 开发期的旧 supp_only 记录时它们本就不带调用统计，不能当成「没发出调用」。"""
+    full, so, noacct = s.get("fine_on_n", 0), s.get("fine_supp_only_n", 0), s.get("fine_noacct_n", 0)
+    if not full:
+        return (f"LLM 精排调用：窗口里只有 2.4.0 开发期的旧 supp_only 记录（{so} 条），它们不带调用统计，"
+                f"无从统计调用次数{tail}")
+    head = f"LLM 精排调用：{full} 轮完整记录里没有并账到任何调用"
+    if noacct:
+        head += (f"；其中 {noacct} 轮没有精排计数（dry_run 轮、精排状态读取失败的轮不记），"
+                 "这些轮不能据此判断精排是否在工作")
+    if noacct < full:
+        head += ("；其余轮的可能原因：找不到 claude 命令（调用没发出去就停用）、"
+                 "relevance.fine_session_max_bytes 为 0、子进程连续失联（没有写回统计）、首批调用尚在途中。"
+                 "先看下方降级码分布与面板里的停用原因")
+    return head + tail
+
+
+def _render_fine(s: dict) -> list:
+    """LLM 精排段（spec §12）。「开着却一次都没投递 / 一次都没并账到调用」必须点破，与 `_render_topic` 同构。
+
+    口径：`fine_field_n` 是带精排字段的记录数，含 2.4.0 开发期的旧 supp_only 记录（它们没有 `fine_on`、也不带
+    调用统计）；调用类文案只数完整记录（`fine_on_n`）。"""
+    n, off = s.get("fine_field_n", 0), s.get("fine_off_n", 0)
+    lines: list = []
+    if not n and not off:
+        if not s.get("n_ok", 0):
+            return ["LLM 精排：窗口里没有走到打分的轮次（只有闸门轮记录），无从判断"]
+        return ["LLM 精排：无记录携带该字段（2.4.0 之前的旧记录）"]
+    if not n:
+        lines.append(f"LLM 精排：{off} 轮处于关闭状态"
+                     "（relevance.fine_rank=false 或旧键 relevance.session_topic=false），不计")
+        if not any(s.get(k) for k in _FINE_COUNT_KEYS):
+            return lines
+    tail = (f"；另有 {off} 轮记录时精排已关闭（不进上面的轮数，其中在途调用的统计仍计入）"
+            if (off and n) else "")
+    done, fail, none = s.get("fine_done_sum", 0), s.get("fine_fail_sum", 0), s.get("llm_none_sum", 0)
+    ok_n = max(done - fail, 0)
+    dist = s.get("fine_calls_dist") or {}
+    dist_s = "、".join(f"{k} 次的 {dist[k]} 个" for k in _CALL_BUCKETS if dist.get(k))
+    if done:
+        none_s = (f"NONE {none} 次（占成功 {ok_n} 次的 {none / ok_n:.1%}）" if ok_n
+                  else "无成功调用，不计 NONE 率")
+        lines.append(f"LLM 精排调用：已并账调用 {done} 次（其中失败 {fail} 次）；{none_s}；"
+                     f"每会话调用次数：{dist_s or '无'}{tail}")
+        if fail:
+            lines.append(f"  失败 {fail} 次 —— 连续失败会停用本会话的精排，失败原因看面板里的 llm.fail "
+                         "与下方降级码分布")
+    elif n:
+        lines.append(_fine_zero_calls_line(s, tail))
+    med = s.get("bytes_session_median")
+    if med is not None:
+        lines.append(f"  每会话累计外发：中位 {med:,.0f} 字节（上限 relevance.fine_session_max_bytes）")
+    if s.get("echo_mismatch_sum"):
+        lines.append(f"  回显不一致丢弃 {s['echo_mismatch_sum']} 篇（编号与文件名对不上，或缺回显）")
+    gen = s.get("supp_gen_sum", 0)
+    stale, rech = s.get("supp_drop_stale_sum", 0), s.get("supp_drop_recheck_sum", 0)
+    deliv, late = s.get("supp_delivered_sum", 0), s.get("supp_late_sum", 0)
+    # 指代型与关键词不足的闸门轮不认领补充，留给下一个过闸轮照时效判、计数（`_fine_flow.release_supp_claim`）；
+    # 索引为空（cache_empty）的闸门轮仍会读到并消耗到期的补充，而闸门记录恰好五个键、记不下来：凡写到时效丢弃
+    # 的文案都要点明，否则读者会把它当全量
+    gate_blind = "时效丢弃不含索引为空的闸门轮（那种记录不带该计数）"
+    if gen and not deliv:
+        lines.append(f"逐轮补充：产生 {gen} 份、**一次都没投递**（时效丢弃 {stale} 篇、复核丢弃 {rech} 篇）；"
+                     f"{gate_blind}"
+                     " —— 时效丢弃多说明提问间隔短于一次精排耗时；复核丢弃多说明补充与下一轮提问对不上")
+    elif gen:
+        lines.append(f"逐轮补充：产生 {gen} 份 → 时效丢弃 {stale} 篇、复核丢弃 {rech} 篇、"
+                     f"投递 {deliv} 篇（其中放宽档 {late} 篇）；{gate_blind}")
+    else:
+        # 记录自带 `supp_on`：「已关闭」与「开着却没产生」是两回事，不能写成一句话里的两个可能
+        s_off, s_on = s.get("supp_off_n", 0), s.get("supp_on_n", 0)
+        if s_off and not s_on:
+            lines.append("逐轮补充：已关闭（relevance.fine_supplement=false）")
+        else:
+            lines.append("逐轮补充：未产生（首轮之后的补充调用都没选出笔记，或没有完成的补充调用）"
+                         + (f"；另有 {s_off} 轮补充已关闭" if s_off else ""))
+    # 候选行：均值只计带目录层的轮，丢弃数与摘要层各自独立——预算把目录层吃光（n_catalog=0、丢弃数 >0）或目录层
+    # 关闭时，后两项不能被均值那一半挡掉
+    cat_n, cat_drop, summ = s.get("catalog_n", 0), s.get("catalog_dropped_sum", 0), s.get("summary_layer_sum", 0)
+    c_off, c_on = s.get("catalog_off_n", 0), s.get("catalog_on_n", 0)
+    cat_parts = []
+    if cat_n:
+        cat_parts.append(f"目录层均 {s['catalog_sum'] / cat_n:.0f} 篇（只计带目录层的轮）")
+    if c_off:
+        cat_parts.append("目录层已关闭（relevance.fine_catalog=false）" if not c_on
+                         else f"另有 {c_off} 轮目录层已关闭")
+    if cat_drop:
+        cat_parts.append(f"超预算丢弃 {cat_drop} 篇（{s.get('catalog_dropped_rounds', 0)} 轮）")
+    if cat_parts or summ:
+        line = "  候选：" + "，".join(cat_parts)
+        if summ:
+            line += ("；" if cat_parts else "") + f"摘要层累计 {summ} 篇"
+        lines.append(line)
+    reads, rinj = s.get("vault_reads_sum", 0), s.get("vault_reads_injected_sum", 0)
+    if reads:
+        lines.append(f"主模型读取 vault 笔记 {reads} 次，其中读的是本会话已注入篇 {rinj} 次（{rinj / reads:.1%}）")
+    else:
+        lines.append("主模型读取 vault 笔记：0 次（只在 mod 在场时记录，claude -p 与 VS Code 面板里不记）")
+    ann = s.get("supp_ann") or {}
+    rel, irr = ann.get("relevant", 0), ann.get("irrelevant", 0)
+    if rel + irr:
+        lines.append(f"补充标注：相关 {rel} / 不相关 {irr}（无关率 {irr / (rel + irr):.1%}，"
+                     f"另有「不确定」{ann.get('unsure', 0)} 条不计）")
+    deg = s.get("degraded_dist") or {}
+    if deg:
+        lines.append(f"降级码分布：{dict(sorted(deg.items()))}")
+    return lines
+
+
+def supp_annotation_counts(home: Path, runtimes) -> dict:
+    """精排补充（kind=llm_supplement）人工标注的判断分布，按命名空间合并。只读。"""
+    c: Counter = Counter()
+    for runtime in runtimes:
+        _metrics.configure_context(runtime)
+        for (kind, _path), verdict in load_annotations(home).items():
+            if kind == "llm_supplement":
+                c[verdict] += 1
+    return dict(c)
+
+
 def _render_span(s: dict) -> str:
     """「实际渲染几篇」的文案 —— 按记录里落盘的 `max_notes` 真值，不硬编码默认值。
 
@@ -749,6 +1022,7 @@ def render_report(s: dict, show_paths: bool = False) -> str:
     lines.append(_render_topic(s))
     lines.append(_render_pin(s))
     lines.append(_render_pool(s))
+    lines.extend(_render_fine(s))
     if inj_n:
         # 标明「UPS」：SessionStart 通道完全不落 metrics（该文件对 _metrics 引用数为 0），
         # 不标注的话读者会把这个数当成 vault-loader 的注入开销总量。
@@ -857,6 +1131,7 @@ _KIND_HIT = {
     "admitted_list": lambda r, p: any(isinstance(a, dict) and a.get("path") == p
                                       for a in (r.get("admitted") or [])),
     "llm_pinned": lambda r, p: p in (r.get("llm_pinned") or []),
+    "llm_supplement": lambda r, p: p in (r.get("supp_shown") or []),
     "near_miss": lambda r, p: any(isinstance(nm, dict) and nm.get("path") == p
                                   for nm in (r.get("near_miss_scorelow") or [])),
 }
@@ -864,6 +1139,7 @@ _KIND_HIT = {
 _KIND_BUCKET = {
     "admitted_fulltext": "fulltext",
     "llm_pinned": "pinned",
+    "llm_supplement": "supp",
     "admitted_list": "list",
     "near_miss": "list",
 }
@@ -1514,29 +1790,47 @@ def sample_admitted(records: Iterable[dict], k: int = 20) -> list[dict]:
             # 的 ft 不在落盘样本内 ⇒ 取不到 topical 时按 0 记，不要假定能 join 上
             _bump("admitted_fulltext", ft_path,
                   (by_path.get(ft_path) or {}).get("topical") or 0)
+        # 2.4.0 起记录自带渲染层落盘的权威清单 `shown`，直接取它；下面按 admitted 重建只服务于没有该键的旧记录。
         # 清单侧取多少条，必须与渲染层一致 —— 本函数的 docstring 明写「评判对象是
         # 用户**实际看到的**」。
         # ⚠️ 此前硬编码取 3「以覆盖有/无全文两种形态」，那是错的：有全文时渲染层是
         # `rest = [...][: max_notes - 1]`（全文计入 max_notes 之内），只渲染 2 条清单，
         # 于是每个 ft 轮次都会有 1 条**从未进过模型上下文**的条目混进标注池——
         # 而人工标注是这套机制里唯一不可再生的数据。用户把 max_notes 调成 1 时偏差扩大到 2。
-        mn = r.get("max_notes")
-        if not (isinstance(mn, int) and not isinstance(mn, bool) and mn > 0):
-            mn = 3                       # 旧记录未落该字段，回退到当时的默认值
-        limit = mn - 1 if ft_path else mn
-        shown = 0
-        for a in admitted:
-            if shown >= limit:
-                break
-            if not isinstance(a, dict) or a.get("path") == ft_path:
-                continue
-            _bump("admitted_list", a.get("path") or "", a.get("topical") or 0)
-            shown += 1
+        shown_paths = r.get("shown")
+        if isinstance(shown_paths, list):
+            # 2.4.0（F31）：渲染层落盘的「用户实际看到的」清单就是评判对象；粗排关时它是 []，
+            # 此时不抽清单侧——按 admitted 截取会把从未渲染的条目混进不可再生的标注池
+            for p in shown_paths:
+                if isinstance(p, str) and p and p != ft_path:
+                    _bump("admitted_list", p, (by_path.get(p) or {}).get("topical") or 0)
+        else:
+            mn = r.get("max_notes")
+            if isinstance(mn, int) and not isinstance(mn, bool) and mn == 0:
+                limit = 0                    # `max_notes=0`：渲染层不展示清单（合法配置值），不能当缺失回落到 3
+            else:
+                if not (isinstance(mn, int) and not isinstance(mn, bool) and mn > 0):
+                    mn = 3                   # 旧记录未落该字段，回退到当时的默认值
+                limit = mn - 1 if ft_path else mn
+            shown = 0
+            for a in admitted:
+                if shown >= limit:
+                    break
+                if not isinstance(a, dict) or a.get("path") == ft_path:
+                    continue
+                _bump("admitted_list", a.get("path") or "", a.get("topical") or 0)
+                shown += 1
         # LLM 点名强制入选的条目不参与常规打分，没有 topical 可言，记 0——
         # 标注问的是「点名点对了没有」，不是「打分打得对不对」。
         for p in (r.get("llm_pinned") or []):
             if isinstance(p, str) and p:
                 _bump("llm_pinned", p, 0)
+        # 精排补充（2.4.0）：只在投递那一轮出现，同 llm_pinned 不参与机械打分，topical 记 0。
+        # 先判 list：坏记录里是字符串时 `or []` 挡不住，会逐字符迭代出一批单字符「路径」
+        supp = r.get("supp_shown")
+        for p in (supp if isinstance(supp, list) else []):
+            if isinstance(p, str) and p:
+                _bump("llm_supplement", p, 0)
     ranked = sorted(agg.values(),
                     key=lambda x: (-x["count"], -x["topical_max"]))
     return _apply_kind_quota(ranked, k)
@@ -1562,27 +1856,35 @@ def _apply_kind_quota(ranked: list[dict], k: int) -> list[dict]:
     `topical` 恒记 0，count 几乎恒为 1，与清单侧同桶按 `(-count, -topical_max)`
     竞争必被压死——真实数据实测（3315 条记录、1 条含 `llm_pinned`）
     `sample_admitted(k=10/20/40)` 一条都进不了池，spec §2.5「否则 pinned 永不进
-    标注池」的目的没有兑现。故单独切一个桶，其余两侧照旧互相回填，三侧都不足时
-    互相补齐。
+    标注池」的目的没有兑现。故单独切一个桶，其余两侧照旧互相回填，各桶都不足时
+    互相补齐。2.4.0 起精排补充（`llm_supplement`）同理另切一桶，共四个桶。
     """
     # 桶按 `_KIND_BUCKET` **显式**分派（1B-M-5）：此前 lists 用 `not in (...)` 排除法取，下一个新
     # kind 会静默掉进清单桶按 count 竞争（I-1 的形态）。未登记的 kind 在这里 KeyError——宁可响。
-    buckets: dict[str, list] = {"fulltext": [], "pinned": [], "list": []}
+    buckets: dict[str, list] = {"fulltext": [], "pinned": [], "supp": [], "list": []}
     for x in ranked:
         buckets[_KIND_BUCKET[x["kind"]]].append(x)
     fts, pins, lists = buckets["fulltext"], buckets["pinned"], buckets["list"]
+    supps = buckets["supp"]
     # llm_pinned 每会话只记一次、topical 恒 0，与清单侧同桶必被 count 压死（终审 I-1 实测
     # 3315 条真实记录一条都进不了池）；给它独立配额 k//4（至少 1，否则 k<4 时永远进不了池——
     # k ≤ 4 时 pinned 优先于全文是刻意的），余下全文 / 清单对半；回填顺序 清单 ← 全文缺口、
-    # 全文 ← 清单缺口、pinned ← 两侧缺口。下面四行的取值与顺序是承重的（1A-L6：读起来像两次
-    # 重赋值，其实是「先切上限、再按序回填」），别为了「一次算清」改顺序。
+    # 全文 ← 清单缺口、pinned ← 两侧缺口、补充 ← 其余缺口。下面各行的取值与顺序是承重的（1A-L6：读起来像
+    # 重赋值，其实是「先切上限、再按序回填」），别为了「一次算清」改顺序。已知：k ≤ 1 且点名与补充同时
+    # 存在时，那一个名额给了补充（pinned 回填扣掉了补充的保底名额），与上面「pinned 优先」的说法不同。
     n_pin = min(len(pins), max(1, k // 4)) if pins else 0
-    rest = max(0, k - n_pin)
+    # 精排补充（2.4.0）与点名同理：每篇只在投递那一轮出现、topical 恒 0，同桶必被清单压死，给独立配额
+    # k//4（至少 1）。没有补充条目时 n_supp 恒 0，下面每一行的取值与 2.3.0 逐条相同（守卫
+    # test_quota_without_supp_items_is_unchanged）；回填两行加 max(0, …)，防 k 小于两个保底名额之和时
+    # 出现负数切片（`pins[:-1]` 会取走几乎全部）。
+    n_supp = min(len(supps), max(1, k // 4)) if supps else 0
+    rest = max(0, k - n_pin - n_supp)
     n_ft = min(len(fts), rest // 2)
     n_list = min(len(lists), rest - n_ft)      # 清单 ← 全文缺口
     n_ft = min(len(fts), rest - n_list)        # 全文 ← 清单缺口
-    n_pin = min(len(pins), k - n_ft - n_list)  # pinned ← 两侧缺口
-    return fts[:n_ft] + pins[:n_pin] + lists[:n_list]
+    n_pin = max(0, min(len(pins), k - n_ft - n_list - n_supp))   # pinned ← 两侧缺口
+    n_supp = max(0, min(len(supps), k - n_ft - n_list - n_pin))  # 补充 ← 其余缺口
+    return fts[:n_ft] + pins[:n_pin] + supps[:n_supp] + lists[:n_list]
 
 
 def _distinct_runtimes(runtimes: tuple[str, ...], home: Path) -> tuple[str, ...]:
@@ -1684,6 +1986,14 @@ def main() -> int:
             n_live = _session_ops.purge_live(home)
         except Exception as exc:  # noqa: BLE001
             print(f"会话快照清理失败：{exc}", file=sys.stderr)
+        n_fine = 0
+        try:
+            # 2.4.0 的 per-session 精排状态（spec 2026-10-13 §7 F57）：含本会话已注入的笔记路径，
+            # 「一键清空」不能留它
+            from scripts import _fine_state
+            n_fine = _fine_state.purge_fine(home)
+        except Exception as exc:  # noqa: BLE001
+            print(f"精排状态清理失败：{exc}", file=sys.stderr)
         # 把实际扫过的目录打出来：这是不可逆删除，用户必须能看出「漏了哪一个」。
         # 只报一个总数时，「清了 0 个」与「压根没扫到那个目录」完全不可区分。
         msg = f"已清空 {n} 个数据文件（扫描目录：{'、'.join(scanned)}）"
@@ -1696,6 +2006,8 @@ def main() -> int:
                     f"含 near-miss 与精度两类，未去重）")
         if n_live:
             msg += f"（另清除会话快照 {n_live} 个）"
+        if n_fine:
+            msg += f"（另清除精排状态 {n_fine} 个）"
         print(msg)
         return 0
     if args.review_web:
@@ -1796,9 +2108,17 @@ def main() -> int:
                 saved += 1
         print(f"已标注，结果在 {annotations_path(home)}")
         return 0
-    print(render_report(summarize(all_records()), show_paths=args.show_paths))
+    summary = summarize(all_records())
+    summary["supp_ann"] = supp_annotation_counts(home, runtimes)
+    print(render_report(summary, show_paths=args.show_paths))
     return 0
 
 
 if __name__ == "__main__":
+    # 报表首行是 📊，--purge 的输出含中文：控制台编码不是 UTF-8（中文 Windows 默认 GBK）时 print 会崩（同 migrate_config）
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 — 被替换成不支持 reconfigure 的流时保持原样
+            pass
     raise SystemExit(main())

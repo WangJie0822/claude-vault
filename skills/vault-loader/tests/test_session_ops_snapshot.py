@@ -120,6 +120,9 @@ def test_snapshot_new_keys_default_to_unknown(tmp_path):
     snap = json.loads(ops_mod.snapshot_path(SID, tmp_path).read_text(encoding="utf-8"))
     assert snap["llm"] is None and snap["thresholds"] is None     # 未计算：mod 显示「未知」
     assert isinstance(snap["ts"], int) and abs(snap["ts"] - time.time()) < 60
+    # 2.4.0 增量键：没人填时也恒在（mod 按「缺键 = 旧快照」区别对待）
+    assert snap["supps"] == [] and snap["settings"] is None
+    assert snap["persisted"] == [] and snap["vault_root"] is None
 
 
 def test_reject_annotations_records_reason(tmp_path):
@@ -307,3 +310,181 @@ def test_llm_and_dedup_enums_match_mod():
     # mod 的白名单从文案表派生，不再手抄一份
     assert "const LLM_STATES = new Set(Object.keys(LLM_TEXT))" in src
     assert "const LLM_FAILS = new Set(Object.keys(FAIL_TEXT))" in src
+
+
+# ── 契约 v1 增量（spec 2026-10-13 §10.6）──────────────────────────────────────────────
+
+def test_max_rejected_counts_settings_and_persist():
+    # 每类逐条至多一条再加一条 over_cap：exclude 51 + pin 9 + unpin 9 + 标注 51 + settings 11 + persist 11
+    assert ops_mod.MAX_REJECTED == 142
+
+
+def test_supp_item_matches_fixture_and_whitelists_values():
+    fixture = json.loads(SNAP_FIXTURE.read_text(encoding="utf-8"))
+    it = ops_mod.supp_item("项目笔记/demo/f" + chr(0x202E) + "x.md", 3, "passed", True)
+    assert set(it) == set(fixture["supps"][0])
+    assert it["title"] == "fx" and it["src_seq"] == 3 and it["recheck"] == "passed"
+    assert it["rendered"] is True
+    assert ops_mod.supp_item("a.md", True, "passed", True)["src_seq"] is None    # bool 不是轮次
+    assert ops_mod.supp_item("a.md", 2, "maybe", True)["recheck"] is None
+    assert ops_mod.supp_item("a.md", 2, "skipped", 1)["rendered"] is False      # 只认 True
+    assert set(ops_mod.SUPP_RECHECKS) == {"passed", "skipped", "failed"}
+
+
+def test_settings_snapshot_shape_matches_fixture_and_cleans_values():
+    from scripts._fine_config import PANEL_KEYS
+    fixture = json.loads(SNAP_FIXTURE.read_text(encoding="utf-8"))
+    assert tuple(fixture["settings"]["effective"]) == tuple(PANEL_KEYS)
+    eff = dict(fixture["settings"]["effective"])
+    eff["fine_model"] = "son" + chr(0x202E) + "net"
+    eff["fine_pin_max"] = float("inf")
+    snap = ops_mod.settings_snapshot(dict(eff, extra=1), {"fine_max_notes": 2, "bogus": 1},
+                                     ["fine_rank", "bogus"],
+                                     {"fine_rank": "config", "fine_model": "elsewhere"})
+    assert set(snap) == set(fixture["settings"])
+    assert tuple(snap["effective"]) == tuple(PANEL_KEYS)
+    assert snap["effective"]["fine_model"] == "sonnet"
+    assert snap["effective"]["fine_pin_max"] is None
+    assert snap["session"] == {"fine_max_notes": 2}
+    assert snap["locked"] == ["fine_rank"]
+    assert snap["source"]["fine_rank"] == "config" and snap["source"]["fine_model"] is None
+    json.dumps(snap, allow_nan=False)          # mod 的 JSON.parse 不认非有限数
+
+
+def test_settings_snapshot_keeps_bools_caps_strings_and_orders_locked():
+    from scripts._fine_config import PANEL_KEYS
+    eff = dict(json.loads(SNAP_FIXTURE.read_text(encoding="utf-8"))["settings"]["effective"])
+    eff.update(fine_rank=True, fine_supplement=False, fine_model="m" * 70)
+    snap = ops_mod.settings_snapshot(eff, {"fine_model": "n" * 70},
+                                     ["fine_supplement", "fine_rank"], {})
+    # bool 原样：开关值被丢成 None，面板会把五个开关全显示成「未知」
+    assert snap["effective"]["fine_rank"] is True
+    assert snap["effective"]["fine_supplement"] is False
+    # 字符串按 64 字符截（硬编码，不从 MAX_SETTING_STR_CHARS 反算），有效值与会话值都截
+    assert snap["effective"]["fine_model"] == "m" * 64
+    assert snap["session"]["fine_model"] == "n" * 64
+    # locked 按 PANEL_KEYS 的顺序输出，不按入参顺序
+    assert PANEL_KEYS.index("fine_rank") < PANEL_KEYS.index("fine_supplement")
+    assert snap["locked"] == ["fine_rank", "fine_supplement"]
+
+
+def test_settings_snapshot_huge_int_becomes_none():
+    # finite_num 内部的 math.isfinite 对超大 int 抛 OverflowError；快照值不能因此让整轮出错
+    snap = ops_mod.settings_snapshot({"fine_pin_max": 10 ** 400}, {"fine_max_notes": 10 ** 400}, [], {})
+    assert snap["effective"]["fine_pin_max"] is None
+    assert snap["session"]["fine_max_notes"] is None
+    json.dumps(snap, allow_nan=False)
+
+
+def test_vault_root_keeps_long_paths():
+    assert ops_mod.MAX_ROOT_CHARS == 1024
+    long = "/v/" + "目录" * 200                # 403 字，超过标题上限 120
+    assert ops_mod.vault_root_text(long) == long
+    assert ops_mod.vault_root_text("/v/" + "x" * 1021) == "/v/" + "x" * 1021   # 恰好 1024 字照发
+    assert ops_mod.vault_root_text("/v/" + "x" * 2000) is None                 # 超长不发，不截断
+    assert ops_mod.vault_root_text("/v/a" + chr(0x202E) + "b") == "/v/ab"
+    assert ops_mod.vault_root_text(None) is None
+    assert ops_mod.vault_root_text("") is None
+
+
+def test_snapshot_carries_filled_new_keys(tmp_path):
+    _write_request(tmp_path, {"v": 1})
+    rep = ops_mod.TurnReport.for_ups(_hook(), tmp_path)
+    rep.take_ops()
+    rep.status = "gate:deictic_only"
+    rep.supps = [ops_mod.supp_item("a.md", 4, "skipped", True)]
+    rep.persisted = ["fine_max_notes"]
+    rep.vault_root = ops_mod.vault_root_text("/v")
+    rep.finalize()
+    snap = json.loads(ops_mod.snapshot_path(SID, tmp_path).read_text(encoding="utf-8"))
+    assert snap["status"] == "gate:deictic_only"
+    assert snap["supps"] == [{"path": "a.md", "title": "a", "src_seq": 4, "recheck": "skipped",
+                              "rendered": True}]
+    assert snap["persisted"] == ["fine_max_notes"] and snap["vault_root"] == "/v"
+
+
+def test_snapshot_caps_new_list_keys(tmp_path):
+    assert ops_mod.MAX_LIST_ITEMS == 50 and ops_mod.MAX_PERSIST == 10
+    _write_request(tmp_path, {"v": 1})
+    rep = ops_mod.TurnReport.for_ups(_hook(), tmp_path)
+    rep.take_ops()
+    rep.status = "gate:deictic_only"
+    rep.supps = [ops_mod.supp_item(f"n{i}.md", i, "passed", True) for i in range(60)]
+    rep.persisted = [f"k{i}" for i in range(15)]
+    rep.finalize()
+    snap = json.loads(ops_mod.snapshot_path(SID, tmp_path).read_text(encoding="utf-8"))
+    assert [s["path"] for s in snap["supps"]] == [f"n{i}.md" for i in range(50)]
+    assert snap["persisted"] == [f"k{i}" for i in range(10)]
+
+
+def test_mod_setting_rows_match_panel_keys():
+    """mod 面板「设置」节的键与 Python `_fine_config.PANEL_KEYS` 逐一相同、同序（spec §10.3）。"""
+    from scripts._fine_config import PANEL_KEYS
+    src = MOD_JS.read_text(encoding="utf-8")
+    m = re.search(r"const SETTING_ROWS = \[(.*?)\n\]", src, re.S)
+    assert m, "找不到 SETTING_ROWS"
+    keys = re.findall(r"\['([a-z_.]+)', '(?:bool|int|model)'", m.group(1))
+    assert keys, "SETTING_ROWS 解析出空表"
+    assert tuple(keys) == tuple(PANEL_KEYS)
+
+
+def test_mod_disabled_and_recheck_enums_match_python():
+    from scripts._fine_state import DISABLED_REASONS
+    src = MOD_JS.read_text(encoding="utf-8")
+    assert _js_object_keys(src, "DISABLED_TEXT") == set(DISABLED_REASONS)
+    assert _js_object_keys(src, "RECHECK_TEXT") == set(ops_mod.SUPP_RECHECKS)
+    assert "const LLM_DISABLED = new Set(Object.keys(DISABLED_TEXT))" in src
+
+
+def _js_int(src: str, name: str) -> int:
+    m = re.search(r"const %s = (\d+)\b" % name, src)
+    assert m, f"找不到 {name}"
+    return int(m.group(1))
+
+
+def _js_set_words(src: str, name: str) -> tuple:
+    """取 `const NAME = new Set(['a', 'b'])` 里的字符串，保持出现顺序。"""
+    m = re.search(r"const %s = new Set\(\[(.*?)\]\)" % name, src, re.S)
+    assert m, f"找不到 {name}"
+    words = tuple(re.findall(r"'([^']*)'", m.group(1)))
+    assert words, f"{name} 解析出空集"                               # 阳性对照：解析没失效
+    return words
+
+
+def test_mod_limits_and_caps_match_python():
+    """mod 的上限常量与 `_session_ops` 的 MAX_* 逐一相同（此前只在 `_session_ops.py` 的注释里写着「两侧镜像」）。"""
+    src = MOD_JS.read_text(encoding="utf-8")
+    m = re.search(r"const LIMITS = \{(.*?)\}", src, re.S)
+    assert m, "找不到 LIMITS"
+    limits = {k: int(v) for k, v in re.findall(r"(\w+): (\d+)", m.group(1))}
+    assert limits == {"exclude": ops_mod.MAX_EXCLUDE, "pin": ops_mod.MAX_PIN, "unpin": ops_mod.MAX_UNPIN,
+                      "annotations": ops_mod.MAX_ANNOTATIONS, "settings": ops_mod.MAX_SETTINGS,
+                      "persist": ops_mod.MAX_PERSIST, "reads": ops_mod.MAX_READS}
+    assert _js_int(src, "MAX_ITEM_CHARS") == ops_mod.MAX_ITEM_CHARS
+
+
+def test_mod_sources_and_modes_match_python():
+    from scripts import _topic
+    src = MOD_JS.read_text(encoding="utf-8")
+    assert set(_js_set_words(src, "SOURCES")) == set(ops_mod.SETTING_SOURCES)
+    assert _js_object_keys(src, "MODE_TEXT") == set(_topic._MODES)
+    assert "const LLM_MODES = new Set(Object.keys(MODE_TEXT))" in src
+
+
+def test_mod_setting_row_types_and_int_bounds_match_fine_config():
+    """`SETTING_ROWS` 的类型列与 `_fine_config.BOOL_KEYS` / `INT_RANGES` 一致；整数项 mod 夹到 [0, INT_MAX]，
+    与 Python 区间的两端相同，否则 mod 允许按出的值会被 Python 当 bad_value 拒收。"""
+    from scripts._fine_config import BOOL_KEYS, INT_RANGES, PANEL_KEYS
+    src = MOD_JS.read_text(encoding="utf-8")
+    m = re.search(r"const SETTING_ROWS = \[(.*?)\n\]", src, re.S)
+    assert m, "找不到 SETTING_ROWS"
+    rows = re.findall(r"\['([a-z_.]+)', '(bool|int|model)'", m.group(1))
+    assert tuple(k for k, _ in rows) == tuple(PANEL_KEYS)
+    for key, kind in rows:
+        want = "bool" if key in BOOL_KEYS else "int" if key in INT_RANGES else "model"
+        assert kind == want, (key, kind, want)
+    ints = [k for k, kind in rows if kind == "int"]
+    assert ints, "SETTING_ROWS 里没有整数项"                         # 阳性对照：下面的循环不是空转
+    int_max = _js_int(src, "INT_MAX")
+    for key in ints:
+        assert INT_RANGES[key] == (0, int_max), (key, INT_RANGES[key], int_max)

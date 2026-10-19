@@ -25,10 +25,40 @@ except ImportError:
 # 文件锁实现已提取到 _fs.py 公共模块（沿用与 _frontmatter/_fs 一致的同目录 import 风格）
 from _fs import _acquire_lock, _release_lock, LOCK_TIMEOUT, atomic_write_text, atomic_write_json  # noqa: F401
 from _summary import GAP_KINDS, OPTIMIZE_KINDS, applicable, classify, is_worklog  # noqa: E402
-from _frontmatter_field import split_frontmatter  # noqa: E402
+from _frontmatter_field import is_fm_open, split_frontmatter  # noqa: E402
 
 
 _BLOCK_SCALAR_RE = re.compile(r'^[|>](?:[1-9][+-]?|[+-][1-9]?)?$')
+# YAML 块序列的一个条目行:`- 值`、单独的 `-`;缩进任意(含不缩进)
+_SEQ_ITEM_RE = re.compile(r'^[ \t]*-(?:[ \t]+(.*))?$')
+
+
+def _take_seq(lines, i):
+    """YAML 块序列(`key:` 之后若干 `- 条目` 行)。返回 (条目列表, 最后一个条目行之后的下标);
+    一个条目行都没有时下标原样返回 i。
+
+    与 PyYAML 一致的部分(skills/summarize-session/tests/test_rebuild_index_block_seq.py 对拍):
+    条目可不缩进或任意缩进,条目之间的空行与整行注释跳过,CRLF 行尾容忍,条目值的取法与内联数组
+    同口径(去首尾空白与成对引号)。刻意不一致的两处:`- #x` 在 YAML 里是注释(PyYAML 得 None、
+    写端再转成字符串 'None'),这里按 '#x' 收下——回落解析器对标量里的 `#` 本来就不当注释
+    (`tags: #x` 读成 '#x'),块序列保持同一口径,失败方向是多认一个 tag(多排除)而不是少认;
+    空条目(`-`)跳过,不产出 'None'。"""
+    items, end, j = [], i, i
+    while j < len(lines):
+        s = lines[j].rstrip('\r')
+        st = s.strip()
+        if not st or st.startswith('#'):
+            j += 1
+            continue
+        m = _SEQ_ITEM_RE.match(s)
+        if not m:
+            break
+        v = (m.group(1) or '').strip().strip('"').strip("'")
+        if v:
+            items.append(v)
+        j += 1
+        end = j
+    return items, end
 
 
 def _take_block(lines, i):
@@ -75,7 +105,7 @@ def _fold_block(indicator, block):
 def parse_frontmatter(text):
     """从 markdown 文本中解析 YAML frontmatter。
 
-    优先使用 PyYAML 完整解析；未安装时降级到仅支持标量和内联数组的手写解析器。
+    优先使用 PyYAML 完整解析；未安装时降级到手写解析器（标量、内联数组、块序列、块标量）。
     """
     parts = split_frontmatter(text)
     if parts is None:
@@ -100,7 +130,7 @@ def parse_frontmatter(text):
         except yaml.YAMLError:
             pass  # 降级到手写解析器
 
-    # 手写降级解析器:处理标量、内联数组与块标量(| / > 及其修饰符)
+    # 手写降级解析器:处理标量、内联数组、块序列与块标量(| / > 及其修饰符)
     result = {}
     i, n = 0, len(fm_lines)
     while i < n:
@@ -125,6 +155,12 @@ def parse_frontmatter(text):
             continue
 
         if not value:
+            # 块序列(`tags:` 换行接 `  - private`):不认时整个键被丢掉,`- private` 不进 cache,
+            # 读端的排除判定就看不到它(2.4.0 full-review S-H1)
+            items, j = _take_seq(fm_lines, i)
+            if j > i:
+                result[key] = items
+                i = j
             continue
 
         # 内联数组: [item1, item2]
@@ -214,6 +250,25 @@ def scan_vault(vault, exclude_dirs):
             continue
 
     return files
+
+
+# 写端解析器修订号,记在 cache 顶层 `_parser`。读端(vault-loader)只读 `_version` 与 `entries`,不读它,
+# 所以加它不动读写两端的契约。解析口径变了、同一篇笔记会解析出不同结果时 +1:rebuild 读到缺失、更小或
+# 类型不对的值,就忽略 mtime 全量重解析一次,写回时带上当前值,之后照常增量。
+# 2:降级解析器(未装 PyYAML)认 YAML 块序列(2.4.0 full-review S-H1)。之前建的 cache 里块序列写的 tags
+#    是空的,而文件不改时增量重建不会重读它们。
+# 3:frontmatter 读到闭合行为止(上限 FM_SCAN_CHARS),读满仍未闭合记 FM_TRUNCATED_KEY(2.4.0 full-review
+#    D-M1)。此前只读前 2000 字符,闭合行在窗口外的笔记 tags 为空。
+# 另外两个写 cache 的出口(keywords_gap._sync_cache_entry、_summary_store.sync_cache_summary)只改单条
+# entry、整份写回,必须原样保留这个键,也不得自己补上(没重解析过的旧 cache 不能冒充成新的)。
+PARSER_REV = 3
+PARSER_KEY = '_parser'
+
+
+def needs_full_reparse(cache) -> bool:
+    """cache 是不是更早的解析口径写的(修订号缺失、类型不对或小于 PARSER_REV)。"""
+    rev = cache.get(PARSER_KEY) if isinstance(cache, dict) else None
+    return isinstance(rev, bool) or not isinstance(rev, int) or rev < PARSER_REV
 
 
 def load_cache(cache_path):
@@ -411,17 +466,52 @@ def _emit_category_index(entries, max_log_days=7):
     return result
 
 
+# 文件头先读这么多字符:绝大多数笔记的 frontmatter 在这里就闭合了
+HEAD_CHARS = 2000
+# frontmatter 已开、在 HEAD_CHARS 内未闭合时,继续读到闭合行为止,最多读到这么多字符(2.4.0 full-review D-M1)。
+# 此前只读 2000 字符:闭合行落在窗口外时整段 frontmatter 判为未闭合、tags 为空,带 private 的笔记照样外发。
+# 取 64 Ki 字符:作者 vault 实测 1320 篇有 frontmatter 的笔记,闭合行最远在第 1704 个字符(p99 1121,
+# 2026-10-19),上限是它的约 38 倍;同时给「首行是 --- 却从不闭合」的大文件(如以分隔线开头的长文)
+# 封顶,多读的只有这类文件。读到上限仍未闭合时 entry 记 FM_TRUNCATED_KEY,读端据此按 tag 判不全处理。
+FM_SCAN_CHARS = 64 * 1024
+FM_TRUNCATED_KEY = 'fm_truncated'
+
+
+def _fm_opened(head: str) -> bool:
+    """文件头是否开了 frontmatter(首行 `---`、无 BOM;与 split_frontmatter 同口径)。"""
+    return not head.startswith('﻿') and is_fm_open(head.split('\n', 1)[0])
+
+
+def _read_head(filepath):
+    """读文件头,返回 (head, truncated)。frontmatter 已开而 HEAD_CHARS 内未闭合时继续读,直到闭合、
+    文件结束或 FM_SCAN_CHARS;truncated 只在读满上限仍未闭合时为 True(读到文件结束说明没有闭合行,
+    按无 frontmatter 处理,与此前相同)。"""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        head = f.read(HEAD_CHARS)
+        if split_frontmatter(head) is not None or not _fm_opened(head):
+            return head, False
+        while len(head) < FM_SCAN_CHARS:
+            chunk = f.read(min(8192, FM_SCAN_CHARS - len(head)))
+            if not chunk:
+                return head, False
+            head += chunk
+            if split_frontmatter(head) is not None:
+                return head, False
+        return head, True
+
+
 def _read_entry(vault: Path, rel: str, mtime: int):
     """读取单个笔记 frontmatter,返回 entry dict(含 summary 兜底)。"""
     filepath = vault / rel
-    with open(filepath, 'r', encoding='utf-8') as f:
-        head = f.read(2000)
+    head, truncated = _read_head(filepath)
     fm = parse_frontmatter(head)
     entry = {'mtime': mtime}
     for field in ('tags', 'category', 'subcategory', 'status', 'summary', 'updated', 'created', 'project', 'keywords'):
         if field in fm:
             entry[field] = fm[field]
     entry['_has_frontmatter'] = bool(fm)
+    if truncated:
+        entry[FM_TRUNCATED_KEY] = True
     if 'summary' in entry:
         entry['summary_src'] = 'fm'
     else:
@@ -744,11 +834,12 @@ def main():
     # 2. 扫描文件
     all_files = scan_vault(vault, exclude_dirs)
 
-    # 3. 比对变更
+    # 3. 比对变更(cache 是更早的解析口径写的:忽略 mtime 全量重解析一次,见 PARSER_REV)
+    full_reparse = needs_full_reparse(cache)
     to_read = []
     for rel, mtime in all_files.items():
         cached = entries.get(rel)
-        if not cached or cached.get('mtime') != mtime:
+        if full_reparse or not cached or cached.get('mtime') != mtime:
             to_read.append(rel)
 
     # 删除已不存在的文件
@@ -853,8 +944,9 @@ def main():
         index_files_written.append(
             str(idx_path.relative_to(vault)).replace('\\', '/'))
 
-    # 7. 写回缓存（并发安全：锁 + 原子写入）
+    # 7. 写回缓存（并发安全：锁 + 原子写入）；带上当前解析器修订号
     cache['entries'] = entries
+    cache[PARSER_KEY] = PARSER_REV
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_lock = str(cache_path) + '.lock'
     cache_written = False

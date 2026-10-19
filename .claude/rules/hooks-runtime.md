@@ -56,6 +56,10 @@ paths:
 - Windows 守卫随之改写（`tests/test_hook_command_claude.py`）：按 Claude Code 的方式把插值后的完整 `command` 交给 Git Bash 执行，核对 stdin 到达脚本，覆盖「有 / 没有 `CLAUDE_PLUGIN_ROOT`」两种形态。上文「只有 `PLUGIN_ROOT` / 两者都无 / 两者不一致」三种形态里有两种依赖 `PLUGIN_ROOT`，随它一起退役。依据的实测（2026-10-08，Git for Windows 2.55.0，GNU bash 5.3.15）：Git Bash 把 `.cmd` 交给 cmd.exe 执行，polyglot 探针只输出 batch 段的标记，所以 Windows 上覆盖的是 batch 段、macOS / Linux 上覆盖的是 sh 段。守卫取 bash 必须从 git 的安装位置推出 Git Bash，不能取 PATH 上第一个 bash：Windows 常规终端里那是 System32 的 WSL 启动器（同日实测：用它执行插值后的命令串 rc=127、`No such file or directory`），整组用例会误报红。没装 Git Bash 的 Windows 上 Claude Code 改用 PowerShell 执行同一条命令串，当前命令串在那里解析失败、脚本没被执行（1.x 起既有，不是 2.0.0 引入），守卫不覆盖这一形态。
 - 订正一处实测：上文「`CLAUDE_PLUGIN_ROOT` 不在 hook 子进程环境里」未标注测量版本；Claude Code 2.1.293 的 `claude -p` 探针实测 hook 子进程环境里有该变量。wrapper 仍保留「取不到就回落自身位置」。
 
+## 历史订正（精排 stdin 交接）
+
+- 迁移原文称 stdin 是 best-effort 通道，已失效：`spawn_fine` 先把 payload 写进临时文件再作 stdin，写失败即 spawn 失败（2.4.0 P-H1）；runtime 仍走 argv。
+
 ## 历史订正（hook 命令串改为 `/bin/sh` 执行）
 
 - 上文三处随之失效：迁移原文「单文件而非 `.cmd`+`.sh` 两份」的理由（宿主现在显式以 `/bin/sh` 执行 wrapper，不再直接执行它）；2.0.0 订正里「Windows 上覆盖的是 batch 段」与「没装 Git Bash 的 Windows 改用 PowerShell 执行同一条命令串」（现状见「现行补充」）。迁移原文的 `run-hook.cmd:12-13` 指 batch 段两条 `if exist` 择根判断，行号已漂移。

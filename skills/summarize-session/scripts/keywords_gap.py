@@ -134,6 +134,7 @@ def _sync_cache_entry(vault: pathlib.Path, rel: str, kws: list[str]) -> bool:
         except OSError:
             pass
         from _fs import atomic_write_text
+        # 整份写回：顶层的 `_parser`（rebuild_index.PARSER_REV）原样保留，不补写也不丢
         atomic_write_text(str(cp), json.dumps(data, ensure_ascii=False))
     except (OSError, ValueError, ImportError):
         return False

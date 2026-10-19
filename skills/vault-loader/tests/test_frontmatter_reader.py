@@ -6,7 +6,46 @@ from pathlib import Path
 
 import pytest
 
-from scripts._frontmatter_reader import Entry, load_cache
+from scripts._frontmatter_reader import CacheStatus, Entry, load_cache, load_cache_status
+
+
+def test_cache_rejects_unsafe_keys(tmp_vault: Path, write_frontmatter_cache, capsys) -> None:
+    """spec 2.4.0 §8.3：cache 键在入口处按纯字符串判据拒收，下游（注入、精排目录、补充投递）
+    拿到的键恒可安全拼到 vault 下。被拒的计入「跳过 N 条」，其余照常加载（爆炸半径收敛到单条）。"""
+    good = {"summary": "s", "mtime": 1}
+    write_frontmatter_cache({
+        "ok/a.md": good,
+        "../x.md": good,
+        "C:/x.md": good,
+        "//192.0.2.1/s/x.md": good,
+        "b.txt": good,
+        "c:stream.md": good,
+    })
+    entries, status = load_cache_status(tmp_vault)
+    assert list(entries) == ["ok/a.md"]
+    assert status is CacheStatus.OK
+    assert "跳过 5 条" in capsys.readouterr().err
+
+
+def test_category_list_is_kept_as_categories(tmp_vault: Path, write_frontmatter_cache) -> None:
+    """cache 的 category 可以是列表；`categories` 按写端 `_summary._as_list` 的口径展开，
+    `category` 字段保持原样（不改变既有消费方看到的值）。"""
+    write_frontmatter_cache({
+        "a.md": {"category": ["技术笔记", "工作日志"], "mtime": 1},
+        "b.md": {"category": "工作日志", "mtime": 1},
+        "c.md": {"category": "", "mtime": 1},
+        "d.md": {"category": 123, "mtime": 1},
+        "e.md": {"mtime": 1},
+        "f.md": {"category": [1, "x"], "mtime": 1},
+    })
+    entries, _ = load_cache_status(tmp_vault)
+    assert entries["a.md"].categories == ("技术笔记", "工作日志")
+    assert entries["b.md"].categories == ("工作日志",)
+    assert entries["c.md"].categories == ()
+    assert entries["d.md"].categories == ()
+    assert entries["e.md"].categories == ()
+    assert entries["f.md"].categories == ("1", "x")
+    assert entries["b.md"].category == "工作日志"
 
 
 def test_load_normal(tmp_vault: Path, write_frontmatter_cache) -> None:

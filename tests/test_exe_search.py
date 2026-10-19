@@ -166,8 +166,8 @@ _BARE_WHICH_ALLOWED = {
     ("skills/summarize-session/scripts/obsidian_cli.py", "probe"):
         "tasklist / pgrep 只判存在，按名执行走 CreateProcess（受 harden_exe_search 约束）",
     ("skills/vault-loader/scripts/_topic.py", "_call_model"):
-        "提炼子进程的 cwd 固定为插件目录（spawn_topic_extraction），且不得导入 context_vault",
-    ("skills/vault-loader/scripts/_topic.py", "spawn_topic_extraction"): "只判 claude 是否存在，结果不被执行",
+        "精排子进程的 cwd 固定为插件目录（spawn_fine），且不得导入 context_vault",
+    ("skills/vault-loader/scripts/_topic.py", "spawn_fine"): "只判 claude 是否存在，结果不被执行",
 }
 
 

@@ -95,21 +95,28 @@ def test_scalar_tags_not_iterated_per_char(tmp_path: Path) -> None:
 
     这不只是脏数据：假 tag 会进 build_tag_df 参与 IDF 统计，而 tag-IDF 加权正是
     0.5.0 的核心特性——三个各出现一次的单字符 tag 会被算成高信息量的精确信号。
+    2.4.0 起标量按逗号或空白切开（写端把 `tags: private` 存成字符串，整个丢弃会让 private 排除失效，
+    full-review S-H1）。
     """
-    v = _vault(tmp_path, _payload({"n.md": _ok_entry(tags="foo")}))
+    v = _vault(tmp_path, _payload({"n.md": _ok_entry(tags="foo"),
+                                   "m.md": _ok_entry(tags="#a, b  c,,")}))
     entries, status = load_cache_status(v)
     assert status is CacheStatus.OK
-    assert entries["n.md"].tags == (), f"标量 tags 被迭代成了 {entries['n.md'].tags}"
+    assert entries["n.md"].tags == ("foo",), f"标量 tags 被迭代成了 {entries['n.md'].tags}"
+    assert entries["m.md"].tags == ("a", "b", "c")
+    assert not entries["n.md"].tags_unknown and not entries["m.md"].tags_unknown
 
 
 @pytest.mark.parametrize(
     "bad", [123, {"a": 1}, True], ids=["int", "dict", "bool"]
 )
 def test_non_list_tags_degrade_to_empty(tmp_path: Path, bad) -> None:
+    """既不是 str 也不是 list：tags 当空（粗排行为不变），并标记判不全（精排外发据此 fail-closed）。"""
     v = _vault(tmp_path, _payload({"n.md": _ok_entry(tags=bad)}))
     entries, status = load_cache_status(v)
     assert status is CacheStatus.OK
     assert entries["n.md"].tags == ()
+    assert entries["n.md"].tags_unknown is True
 
 
 def test_keywords_guard_still_holds(tmp_path: Path) -> None:

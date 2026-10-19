@@ -169,7 +169,9 @@ def test_skill_md_documents_session_topic_ttl_coupling():
     `relevance.session_topic` 的主题词与提炼失败标记的有效期——`prompt_submit_load.py`
     的 `load_session_topic`/`has_recent_topic_attempt` 都直接读同一个
     `ups_cfg["state_ttl_hours"]`，不写清楚这个耦合，用户改这个值时不知道它还会
-    影响主题预热多久重试一次。"""
+    影响主题预热多久重试一次。2.4.0 起这一行讲的是：同一个值约束 LLM 精排（旧键
+    `session_topic` 同理）的主题词、首轮点名与精排状态文件；「提炼失败标记」的负缓存已退役，
+    判据仍是该行要点名 `session_topic`。"""
     text = _skill_text()
     rows = [line for line in text.splitlines()
             if "user_prompt_submit.state_ttl_hours" in line]

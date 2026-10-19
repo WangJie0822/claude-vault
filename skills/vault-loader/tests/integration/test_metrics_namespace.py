@@ -72,8 +72,11 @@ def _records(root: Path) -> list[dict]:
 def _write_config(home: Path, vault: Path) -> None:
     cfg_dir = home / ".context-vault"
     cfg_dir.mkdir(parents=True, exist_ok=True)
+    # 关精排：本文件只验 metrics 落点。精排默认开，而 `_run` 复制的是全量环境（真实 PATH，可能还有注入的
+    # provider 令牌），UPS 用例会真起一条 detached 的付费 `claude -p`（2.4.0 起无命中的首轮也发起点名）。
     (cfg_dir / "config.json").write_text(
-        json.dumps({"vault_path": str(vault), "metrics": {"enabled": True}}),
+        json.dumps({"vault_path": str(vault), "metrics": {"enabled": True},
+                    "relevance": {"fine_rank": False}}),
         encoding="utf-8")
 
 

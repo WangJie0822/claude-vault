@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -43,7 +44,7 @@ def _assert_same_shape(a, b, where="$"):
 
 
 def _preset_topic(repo: Path, words, pinned, state="ok") -> None:
-    """在 canonical 命名空间预置本会话的 topics entry：has_recent_topic_attempt 为真，不会 spawn。"""
+    """在 canonical 命名空间预置本会话的 topics entry（state 默认 ok）：首轮点名视为已完成（`first_round_done` 为真）。"""
     from scripts import _state, _topic
     _state.configure_context("claude")
     try:
@@ -86,7 +87,10 @@ def _config(home: Path, vault: Path, **extra) -> None:
     (d / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
 
 
-def _seed(vault: Path, write_frontmatter_cache) -> None:
+def _seed(vault: Path, write_frontmatter_cache, spare: bool = False) -> None:
+    """三篇都命中默认提问、本轮全部注入。`spare=True` 再加一篇不命中的：2.4.0 的精排发起门禁是「排除本轮
+    已注入之后还有候选」（spec 2026-10-13 F62），要让本轮真走到发起就得留一篇。只在把 PATH 指向空目录的
+    用例里用——否则会真起付费的 claude 子进程。"""
     (vault / "笔记").mkdir(parents=True, exist_ok=True)
     entries = {}
     for name in ("alpha", "beta", "gamma"):
@@ -95,6 +99,10 @@ def _seed(vault: Path, write_frontmatter_cache) -> None:
                                        "keywords": ["注入设计", "hook 注入"],
                                        "summary": f"{name} 的 hook 注入设计说明，足够长",
                                        "mtime": 1900000000}
+    if spare:
+        (vault / "笔记" / "spare.md").write_text("# spare", encoding="utf-8")
+        entries["笔记/spare.md"] = {"tags": ["烹饪"], "category": "笔记", "keywords": [],
+                                     "summary": "红烧肉的做法与火候控制要点，足够长", "mtime": 1900000000}
     write_frontmatter_cache(entries)
 
 
@@ -143,7 +151,8 @@ def test_exclude_removes_note(tmp_home, tmp_vault, tmp_git_repo, write_frontmatt
     _seed(tmp_vault, write_frontmatter_cache)
     _req(tmp_home, PID1, {"v": 1, "exclude": ["笔记/alpha.md"]})
     out = _run(tmp_home, tmp_git_repo, PID1)
-    assert "笔记/alpha.md" not in _ctx(out)
+    # 统一行只出标题与平台原生分隔符的绝对路径：按 `笔记/alpha.md` 判否定在 Windows 上恒真
+    assert "「alpha」" not in _ctx(out)
     snap = _snap(tmp_home)
     assert "笔记/alpha.md" not in [i["path"] for i in snap["injected"]]
     assert [e["path"] for e in snap["excluded"]] == ["笔记/alpha.md"]
@@ -311,7 +320,7 @@ def test_unpin_llm_removes_pin_and_records_user_excluded(tmp_home, tmp_vault, tm
     _state.configure_context("unknown")
     _req(tmp_home, PID1, {"v": 1, "unpin_llm": ["笔记/beta.md"]})
     out = _run(tmp_home, tmp_git_repo, PID1)
-    assert PIN_HEADER not in _ctx(out) and "笔记/beta.md" not in _ctx(out)
+    assert PIN_HEADER not in _ctx(out) and "「beta」" not in _ctx(out)
     recs = [json.loads(x) for f in (tmp_home / ".context-vault" / "metrics").rglob(f"{SID}.jsonl")
             for x in f.read_text(encoding="utf-8").splitlines() if x.strip()]
     assert any(r.get("llm_pinned_dedup") == ["user_excluded"] for r in recs)
@@ -381,9 +390,16 @@ def test_metrics_off_snapshot_still_has_hits(tmp_home, tmp_vault, tmp_git_repo,
 
 
 def test_gate_turn_reports_llm_state(tmp_home, tmp_vault, tmp_git_repo, write_frontmatter_cache):
+    """闸门轮的快照只有召回闸门之前那一次 `_report_llm`。2.4.0 起生产代码不再往 topics 写 pending 占位，
+    「提炼中」只来自在飞标记，所以这里预置在飞标记（真子进程入口，落点与生产一致）。"""
+    from scripts import _fine_state, _state
     _config(tmp_home, tmp_vault, relevance={"session_topic": True})
     _seed(tmp_vault, write_frontmatter_cache)
-    _preset_topic(tmp_git_repo, [], [], state="pending")
+    _state.configure_context("claude", SID)
+    try:
+        assert _fine_state.claim_inflight(SID, "0123456789abcdef", 120, time.time())
+    finally:
+        _state.configure_context("unknown")
     _req(tmp_home, PID1, {"v": 1})
     _run(tmp_home, tmp_git_repo, PID1, prompt="继续")
     snap = _snap(tmp_home)
@@ -397,7 +413,7 @@ def test_unavailable_when_claude_not_on_path(tmp_home, tmp_vault, tmp_git_repo,
     """PATH 上没有 claude：spawn 不落盘，状态必须是「无法发起」而不是一直「尚未发起」（节点 1 T7）。
     PATH 指向空目录同时保证本用例绝不会真起付费的 claude 子进程。"""
     _config(tmp_home, tmp_vault, relevance={"session_topic": True})
-    _seed(tmp_vault, write_frontmatter_cache)
+    _seed(tmp_vault, write_frontmatter_cache, spare=True)
     empty = tmp_home / "emptybin"
     empty.mkdir()
     _req(tmp_home, PID1, {"v": 1})
@@ -434,7 +450,7 @@ def test_unreadable_topic_ts_does_not_cost_recall(tmp_home, tmp_vault, tmp_git_r
     from scripts import _state
     from scripts._state import session_topics_path
     _config(tmp_home, tmp_vault, relevance={"session_topic": True})
-    _seed(tmp_vault, write_frontmatter_cache)
+    _seed(tmp_vault, write_frontmatter_cache, spare=True)
     _state.configure_context("claude")
     try:
         p = session_topics_path(tmp_git_repo)

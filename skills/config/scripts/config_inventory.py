@@ -53,12 +53,27 @@ DEPRECATED: dict[str, str] = {
         "`session_start.enabled`",
 }
 
+# 已被新键取代、仍兼容读取的旧键（spec 2026-10-13 §5.3）。与 vault-loader `_fine_config.SUPERSEDED`
+# 逐一相同（守卫 tests/test_inventory.py::test_superseded_matches_vault_loader）。
+# 与 DEPRECATED 的区别：废弃键运行时不读；被取代的键仍然生效（新键没有显式写时取它的值），
+# 所以清单照常显示当前值，只是不可写——写入要改写新键，config_set 会一并删掉旧键。
+SUPERSEDED: dict[str, str] = {
+    "relevance.session_topic": "relevance.fine_rank",
+    "relevance.session_pin_max": "relevance.fine_pin_max",
+}
+
 # 控制「多少篇笔记被发往外部模型端点」的旋钮。类型都是普通 int，类型校验对它们
 # 完全无效 —— 不标记就没有任何东西提醒用户「调大这个值等于多外发」。
 PRIVACY_KNOBS = frozenset({
     "relevance.session_topic_top_n",
     "relevance.session_topic_project_top_k",
     "relevance.session_topic_pool_max",
+    # 2.4.0 精排（spec fine-rank-per-turn §5.1「隐私旋钮」列）：决定每次调用送多少、送不送、送哪些
+    "relevance.fine_catalog",
+    "relevance.fine_catalog_max_chars",
+    "relevance.fine_recent_prompts",
+    "relevance.fine_session_max_bytes",
+    "relevance.fine_exclude_tags",
 })
 
 # 首版只读：不在 DEFAULT_CONFIG 里（无默认值、无类型判据），且 obsidian_cli 只认
@@ -121,19 +136,32 @@ def _config_path(home: Path | None) -> Path:
     return path
 
 
-def read_raw_config(home: Path | None = None) -> tuple[dict, Path, bool]:
-    """读原始配置。**绝不创建文件**；不存在或损坏一律返回空 dict。
+def read_raw_config_strict(home: Path | None = None) -> tuple[dict, Path, bool, bool]:
+    """读原始配置，并分清「读不出」与「空」。返回 (原始 dict, 路径, 文件是否存在, 是否读出了 JSON 对象)。
 
-    返回 (原始 dict, 路径, 文件是否存在)。
+    `utf-8-sig`：PowerShell 5.1 的 `Out-File -Encoding utf8` 与部分编辑器写出带 BOM 的 UTF-8，按
+    `utf-8` 读会在首字符失败、被当成损坏（vault-loader 的 `_config_loader` 早已用 utf-8-sig）。
+    写端（config_set）据第四项拒绝覆盖读不出的文件。**绝不创建文件。**
     """
     path = _config_path(home)
     if not path.is_file():
-        return {}, path, False
+        return {}, path, False, True
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return (data if isinstance(data, dict) else {}), path, True
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return {}, path, True
+        return {}, path, True, False
+    if not isinstance(data, dict):
+        return {}, path, True, False
+    return data, path, True, True
+
+
+def read_raw_config(home: Path | None = None) -> tuple[dict, Path, bool]:
+    """读原始配置。**绝不创建文件**；不存在或读不出一律返回空 dict（要分清两者用 read_raw_config_strict）。
+
+    返回 (原始 dict, 路径, 文件是否存在)。
+    """
+    data, path, exists, _readable = read_raw_config_strict(home)
+    return data, path, exists
 
 
 def _descriptions() -> dict[str, str]:
@@ -170,15 +198,20 @@ def build_inventory(home: Path | None = None) -> list[dict]:
     items: list[dict] = []
     for key in sorted(flat_default):
         deprecated = key in DEPRECATED
+        superseded = key in SUPERSEDED
+        text = DEPRECATED[key] if deprecated else (desc.get(key) or _UNDOCUMENTED)
+        if superseded:
+            text = (f"已由 `{SUPERSEDED[key]}` 取代，当前仍生效"
+                    f"（新键没有显式写时取这里的值）。{text}")
         items.append({
             "key": key,
             "current": flat_current.get(key, flat_default[key]),
             "default": flat_default[key],
             "source": "explicit" if key in flat_explicit else "default",
-            "desc": DEPRECATED[key] if deprecated else (desc.get(key) or _UNDOCUMENTED),
-            "status": "deprecated" if deprecated else "active",
+            "desc": text,
+            "status": "deprecated" if deprecated else "superseded" if superseded else "active",
             "privacy": key in PRIVACY_KNOBS,
-            "writable": not deprecated,
+            "writable": not deprecated and not superseded,
             "config_file": str(path),
         })
 
@@ -226,11 +259,13 @@ def render(items: list[dict], keyword: str | None = None, only_diff: bool = Fals
             mark.append("已显式设置")
         if r["status"] == "deprecated":
             mark.append("⚠️ 已废弃")
+        if r["status"] == "superseded":
+            mark.append("↪ 已被取代（仍生效）")
         if r["status"] == "external":
             mark.append("外部键·只读")
         if r["privacy"]:
             mark.append("🔒 隐私旋钮（控制外发篇数）")
-        if not r["writable"] and r["status"] != "deprecated":
+        if not r["writable"] and r["status"] not in ("deprecated", "superseded"):
             mark.append("只读")
         tag = f"  [{' · '.join(mark)}]" if mark else ""
         out.append(f"- {r['key']}{tag}")
@@ -261,4 +296,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # 输出含 🔒、− 与中文路径：控制台编码不是 UTF-8（中文 Windows 默认 GBK）时 print 会崩（同 vault-loader migrate_config）
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 — 被替换成不支持 reconfigure 的流时保持原样
+            pass
     sys.exit(main())

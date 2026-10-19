@@ -1,5 +1,50 @@
 # Context Vault 迁移指南
 
+## 2.3.0 → 2.4.0（LLM 精排逐轮化，默认外发范围扩大）
+
+配置、Vault、state、metrics 的路径不变。新增的落盘内容：每会话的精排状态在 `~/.context-vault/state/claude/fine/`
+（未迁移的旧安装在 `~/.claude/vault-loader-fine/`）；`<vault>/.meta/frontmatter-cache.json` 顶层新增 `_parser`、
+entry 新增可选键 `fm_truncated`，`_version` 仍是 1。
+
+### 默认外发范围扩大（升级前请读）
+
+升级时没有任何提示，config 里没写相关键的，升级后直接按新默认运行：
+
+- 2.3.0 每会话只在首轮外发一次；2.4.0 每个通过闸门的提问都可能发起一次精排（`relevance.fine_max_calls`，默认每会话
+  至多 20 次；这不是硬上限，例外见 vault-loader SKILL.md「频率与上限」）。
+- 外发内容另有目录层（全部未归档、未排除笔记的文件名，`relevance.fine_catalog`）、最近几轮手输的提问
+  （`fine_recent_prompts`）与本项目近期工作日志的条目标题。完整清单见 README「2.4.0 起外发给模型的内容」。
+- 收窄：`fine_catalog: false`（不送目录）、`fine_recent_prompts: 0`、`fine_supplement: false`（只保留首轮）、
+  `fine_rank: false`（全关）；逐篇控制给笔记打 `private` tag。
+
+### 升级后第一次重建索引之前，按旧索引外发
+
+`private` 等排除 tag 读的是 `/summarize-session` 写的索引。没装 PyYAML、用块序列写 tags 的旧笔记，以及 frontmatter
+超过 2000 字符的旧笔记，旧索引里 tags 是空的，要等 `rebuild_index` 全量重解析一次（升级后第一次 `/summarize-session`
+会做）才生效；在那之前的提问已经会按旧索引发起精排。直接在新会话里跑 `/summarize-session` 不够：那一轮提问本身也过闸，
+精排在 skill 重建索引之前就已发起。要避开这个窗口，任选其一：
+
+1. 升级后第一次提问之前，用 `/config` 或手改 config 把 `relevance.fine_rank` 设为 `false`，跑一次
+   `/summarize-session`，之后再改回 `true`（关着时那一轮不发起精排）；
+2. 开会话之前在终端跑一次重建：
+
+   ```bash
+   SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)
+   python3 "$SS/rebuild_index.py" --vault <vault 路径>
+   ```
+
+### 回退到 2.3.0
+
+1. **回退会静默重新打开 LLM 外发。** 2.3.0 只认 `relevance.session_topic`；在 2.4.0 里经 `/config` 或面板
+   「设为默认」写过 `fine_rank` 的，`session_topic` 已被删掉，回退后精排按 2.3.0 的默认开启。想在回退后保持关闭，
+   回退前手工在 config 的 `relevance` 段写上 `"session_topic": false`（`/config` 拒写这个旧键）。
+2. 2.3.0 没有 `fine_exclude_tags`：回退后首轮精排的候选不再排除带 `private` 的笔记。
+3. 回退期间 2.3.0 的 `rebuild_index` 原样保留 cache 顶层的 `_parser`，但按 2.3.0 的口径重读改动过的笔记（不认块序列、
+   只读前 2000 字符、不记 `fm_truncated`）。再升级回 2.4.0 时 `_parser` 已是当前值，**不会全量重解析**，这些笔记要等
+   文件再次被修改才按新口径读。想立刻恢复，再升级后删掉 `<vault>/.meta/frontmatter-cache.json`，再按上一节的做法重建。
+4. 删除插件 cache 里 2.4.0 的版本目录（skill 按最高版本号定位脚本，理由同「回退到 2.0.0」第 2 条）。
+5. 2.3.0 默认自动注入全文；它不读也不清理精排状态目录（见本节开头），需要时手工删除。
+
 ## 2.0.0 → 2.1.0（hook 命令串改为 `/bin/sh` 执行；新增注入可见与可控 mod）
 
 配置、Vault、state、metrics 的路径不变，格式只做加性扩展（state 下新增 `live/`；metrics 记录与
@@ -201,6 +246,8 @@ python3 "$VL/migrate_config.py" --restore ~/.claude/projects/vault-loader-backup
 ```
 
 `--restore` 覆盖前同样会先把**当前**内容备份出去，所以 apply 之后手工做的调参也有恢复路径。`--restore` 只接受顶层键属于 vault-loader schema 的备份文件（防止把任意 JSON 还原成 config）。`--apply` 与 `--restore` 互斥，同时传会直接报 usage 错误。
+
+不带 `--path` 时，dry-run、`--apply`、`--restore` 与 `--doctor` 操作的都是 hook 实际读取的那份 config：`~/.context-vault/config.json` 存在时用它，否则用 `~/.claude/skills/vault-loader/config.json`。2.4.0 之前的版本不带 `--path` 时恒操作后者，1.0 起使用 `~/.context-vault/config.json` 的用户照做会改错文件：`--restore` 报「已还原」却没有生效，在没有迁移完成标记的机器上还会把 state 与 metrics 切回旧目录；`--doctor` 报「config 不存在」。请先升级到 2.4.0 再用。
 
 指定非默认 config 路径用 `--path <路径>`。若 config 路径经符号链接 / NTFS junction 重定向，脚本为防越权写入会整体放弃；确属你自己的 dotfiles 软链布局时可加 `--force`（`-y`）放行。
 

@@ -146,6 +146,7 @@ def sync_cache_summary(vault: Path, rel: str, value) -> bool:
             entry["mtime"] = int((Path(vault) / rel).stat().st_mtime)
         except OSError:
             pass
+        # 整份写回：顶层的 `_parser`（rebuild_index.PARSER_REV）原样保留，不补写也不丢
         atomic_write_text(str(cp), json.dumps(data, ensure_ascii=False))
         return True
     except (OSError, ValueError):

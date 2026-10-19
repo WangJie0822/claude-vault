@@ -624,4 +624,10 @@ def main() -> None:
 if __name__ == "__main__":
     from _exe_search import harden_exe_search
     harden_exe_search()
+    # 输出含笔记正文与文件名（常有 emoji）：控制台编码不是 UTF-8 时 print 会崩（同 rebuild_index）
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 — 被替换成不支持 reconfigure 的流时保持原样
+            pass
     main()

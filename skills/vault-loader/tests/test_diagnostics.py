@@ -238,8 +238,9 @@ def test_near_miss_nudge_caps_shown_paths_and_notes_the_rest() -> None:
 @pytest.mark.parametrize("sep", ["\r", "\n", "\r\n", "\x85", " ", " "])
 def test_near_miss_nudge_folds_newlines_in_path(sep: str) -> None:
     """回归测试（fix round 1，Critical）：path 是外部可控数据（frontmatter-cache.json
-    的 dict key，`_frontmatter_reader.py` 只校验 isinstance(str) 与长度上限，不校验
-    内容），嵌入换行即可在 systemMessage 里伪造第二行、冒充 Claude Code 自身的提示。
+    的 dict key，`_frontmatter_reader.py` 只按 safe_rel_note_path 拒掉 C0 控制字符等形态，
+    U+0085 / U+2028 这类行分隔符仍能进来），嵌入换行即可在 systemMessage 里伪造第二行、
+    冒充 Claude Code 自身的提示。
 
     早期实现用 `sanitize_for_display`（按设计保留 \\r \\n，职责是显示侧转义防护而非
     换行折叠）——与本文件其余五个诊断构造器统一用的 `safe_field` 不是同一套净化，

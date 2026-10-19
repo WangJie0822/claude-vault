@@ -31,7 +31,7 @@ paths:
 - 面板 Button 的 key 一律由 path 的 FNV-1a 短哈希派生（`row:<节>:<h>`、`ex:<h>` 等），不得用序号或文案：新快照换了顺序时，按序号的 key 会把操作打到另一篇上。展开态单独存 `ui` atom，切换后 `$.ui.focus` 把焦点放回该行；新快照里展开的那篇不在了即收起。`claude plugin test` 2.1.296 不实现插件发起的 `$.ui.focus`（`HooksError: no implementation for ui.focus`，测试挂的 hook 也收不到），焦点回位只能静态守卫加交互验证。
 - band 不渲染 LLM 主题词与命中词（只在面板展开区出现）；`marginTop` 只在宿主给的 `maxRows >= 3` 时加。
 - 渲染读 VIEW 里的条目字段一律按类型判断（`Array.isArray` / `typeof === 'number'`），不按 `=== null`：`$.state` 跨代码热重载保留（d.ts 原文「survives a hot reload」），新代码会读到旧版写的条目（2026-10-12 full-review BP-M1：`undefined.join` 让面板画不出来）。刻意不给 VIEW 加 `shape`：旧值被拒后 `enterSession` 会连带清掉本会话的排除与钉住（用户决定）。
-- topics entry 的 `state`（`pending` / `ok` / `failed`）与 `fail`（`no_claude` / `timeout` / `exit_nonzero` / `error`）由占位与子进程显式写入，**不继承**旧值；`_topic.describe_session_topic` 读取时按白名单校验，任何 `pending` 超过 `TOPIC_TIMEOUT_SEC + PENDING_GRACE_SEC` 判 `failed` / `lost`。spawn 门禁不读 `state` / `fail`（topics 侧只看 `load_session_topic` 的词与 `has_recent_topic_attempt`），改这两个字段不改变是否发起；这不等于篡改 topics 文件不会重复付费——伪造的 ts 由 `_valid_ts` 与淘汰保护挡住（见 `vault-loader.md`）。`_call_model` 签名不变，失败原因经模块级 `_LAST_FAIL` 旁路传出；`spawn_topic_extraction` 的本轮结果经 `take_spawn_outcome()` 在进程内交给快照，不落盘。
+- topics entry 的 `state` / `fail` 只由精排子进程写、**不继承**旧值（2.4.0 起不再有 `pending` 占位）；「提炼中」来自 fine 在飞标记，失败原因来自 fine 状态的 `last_fail`。spawn 门禁见 `fine-rank.md`。伪造的 ts 由 `_valid_ts` 与淘汰保护挡住（见 `vault-loader.md`）。`_call_model` 签名不变，失败原因经模块级 `_LAST_FAIL` 旁路传出。
 - 门禁实测（2026-10-10，Windows 11）：
   - 旧版本对 manifest 新字段：Claude Code 2.1.286、2.1.250、2.1.220 都不因 `hooks.json` 的 `modules` 或 `plugin.json` 的 `types` / `userConfig` 拒绝插件，命令 hook 照常执行；mod 只在 2.1.286 上加载，2.1.250 与 2.1.220 上没有 band 与 `/vault-injected`，召回不受影响。
   - 2.1.293：`$.env.get('OS')` 为 `Windows_NT`；`$.fs.write` 自动创建多级目录；`claude -p` 下 `$.session.surfaces()` 为 `[]`（所以 `-p` 不写请求）。
@@ -41,11 +41,11 @@ paths:
 
 ## 契约 v1（mod ↔ Python）
 
-两侧都按 `v === 1` / `v == 1` 判等；改任何一条都要两侧同改，并同步 `tests/fixtures/mod_contract/` 与 `tests/mod/vault-mod.test.ts`。
+两侧都按 `v === 1` / `v == 1` 判等；改任何一条都要两侧同改，并同步 `skills/vault-loader/tests/fixtures/mod_contract/` 与 `tests/mod/vault-mod.test.ts`。
 
 - **请求**（mod 写，Python 读完即删）：`live/<sid_h>-<prompt_id>.req.json`，`sid_h = sha256(session_id)[:24]`，`{v, exclude[], pin[], unpin_llm[], annotations[]}`。SessionStart 的是 `<sid_h>-ss.req.json`，内容恒为 `{}`，只作「有 mod 在」的标记，Python 不读其内容（排除因此不作用于会话开始注入）。
 - **上限**两侧镜像（JS `LIMITS`、Python `MAX_*`）：exclude 50、pin 8、unpin_llm 8、annotations 50，单条字符串 ≤ 512 字符，请求 ≤ 1,000,000 字节。mod 在按钮处到上限即拒绝并 toast；Python 截断并报 `over_cap`。
-- **摘要**：`sha256(JSON([v, exclude, pin, unpin_llm, 标注 id 列表]))[:32]`，取校验之前的原样列表；Python 用 `ensure_ascii=False, separators=(",", ":")`。唯一用途：mod 判断快照回应的是不是自己发的那份请求，不一致即告警。固定值守卫：`request_v1.json` 的摘要是 `caef2f245a8dd2710078881708d351e5`（两侧用例都钉着）。
+- **摘要**：`sha256(JSON([v, exclude, pin, unpin_llm, 标注 id 列表, settings, persist, reads]))[:32]`，取校验之前的原样值；Python 用 `ensure_ascii=False, separators=(",", ":")`。唯一用途：mod 判断快照回应的是不是自己发的那份请求，不一致即告警。固定值守卫：`request_v1.json` 的摘要（两侧用例钉着同一个字面量，改摘要覆盖范围时连同夹具一起改）。
 - **快照**（Python 原子写，mod 只读）：`live/<sid_h>.json`，顶层键由 `snapshot_v1.json` 钉住。`status`：
   - `disabled`（停用类出口）、`gate:<reason>`（闸门）、`scored` / `dry_run`（召回路径）；
   - `pending`：已过事件去重、却没落到上面任何一个出口（SessionStart 的 vault 不可达出口就是这样；UPS 异常退出时也会）；
@@ -53,12 +53,14 @@ paths:
   - mod 只在 `scored` / `dry_run` 更新注入列表、钉住、排除、`prompt_h` 与 `metrics_on`（`llm`、`ts` 例外，见下方「增量键」）；其余状态保留上一次的展示。
 - `metrics_on` 反映本轮读到的配置（闸门轮也如实报）；`prompt_h` 只在 metrics 开启的打分轮出现，是标注的目标。`hits` 始终写（2026-10-12 起；此前只在 metrics 开启时写）。
 - **增量键（2026-10-12，仍是 v1）**：缺键不当默认值：能显示「未知」的显示「未知」，`rank` / `topic_hits` / `why` 缺键时该项不显示。顶层 `llm`（键恒在；通过停用闸门的 UPS 轮次——闸门、`scored` / `dry_run`、异常退出的 `pending`——写对象，SessionStart 快照、`disabled` 出口与读取出错时为 `null`；对象的键恒定：`state` / `fail` / `words` / `in_scoring` / `n_pinned` / `age_s` / `pin_on` / `stale_pins`，无值为 `null`）、`thresholds`（`min_topical` / `ft_topical` / `topic_hit_weight`，打分轮写）、`ts`；`injected[]` 增 `topical` / `admit_arm` / `topic_hits` / `llm_also_pinned`；`pins.llm[]` 增 `rank` / `dedup`；`session_start[]` 增 `why` / `tags`。`topic_hits` 只用本轮实际参与打分的主题词（`signals.session_topic_words`），不重读状态。mod 吸收：`llm` 为 `null` 或缺键时保留上一次的展示（从未收到对象时显示「未知」），是对象但 `state` 不认识时显示「未知」；`ts` 对 UPS 与 SessionStart 快照都吸收；`thresholds` 与注入列表等只在 `scored` / `dry_run` 时更新。条目级字段由 `tests/test_mod_static.py::test_mod_reads_only_contract_item_fields` 与 UPS 端到端同形用例钉住。
-- **值域**（两侧逐一相同，`test_session_ops_snapshot.py::test_llm_and_dedup_enums_match_mod` 钉住；mod 的白名单从文案表派生）：`llm.state` ∈ `_topic.LLM_STATES`；`llm.fail` ∈ `_topic.LLM_FAILS`，只在 `unavailable`、`failed` 与 `idle`（`dry_run`：主流程永不发起）时非 `null`；`n_pinned` 只在 `ok` 时非 `null`。`admit_arm` ∈ `topical` / `keyword_bypass` / `upgrade_candidate`（算不出为空串；`upgrade_candidate` 不等于本轮拿到全文）。`rank` 是本轮 `decision.admitted` 的 1-based 名次、可大于 `max_notes`，未进为 `null`，此时 `dedup` 取 `fulltext_injected` / `candidate_injected` / `user_excluded` 或 `null`。`why` ⊆ {`project_dir`, `tag`}。数值字段经 `_session_ops.finite_num`，非有限值写 `null`：Python 会写出 `Infinity`，mod 的 `JSON.parse` 整份拒收。
+- **增量键（2.4.0，仍是 v1）**：请求增 `settings{}`（面板 8 个键）、`persist[]`、`reads[]`（主模型读过的 vault 相对路径），上限 10 / 10 / 50；快照增 `supps[]`、`settings`、`persisted[]`、`vault_root`，`llm` 增 `mode` / `fail_streak` / `calls` / `disabled`，`rejected.what` 增 `settings` / `persist`；status 增 `supp_only`（2.4.0 开发期闸门轮只投补充时的取值，批次 3c 起不再产生，mod 仍认它）。回执与重发语义、`tool.call` 的 Read 观测（同样不加 `.catch`）见 `fine-rank.md`。
+- **值域**（两侧逐一相同，`test_session_ops_snapshot.py::test_llm_and_dedup_enums_match_mod` 钉住；mod 的白名单从文案表派生）：`llm.state` ∈ `_topic.LLM_STATES`；`llm.fail` ∈ `_topic.LLM_FAILS`，在 `unavailable`、`failed` 与 `idle`（`dry_run`：主流程永不发起）时非 `null`，`fine_model` 不合法时 `idle` / `pending` / `ok` 也记 `bad_model`；`n_pinned` 在首轮点名已完成且没有在飞调用（`state` 为 `ok` 或 `failed`）时非 `null`，`pending` 时为 `null`。`admit_arm` ∈ `topical` / `keyword_bypass` / `upgrade_candidate`（算不出为空串；`upgrade_candidate` 不等于本轮拿到全文）。`rank` 是本轮 `decision.admitted` 的 1-based 名次、可大于 `max_notes`，未进为 `null`，此时 `dedup` 取 `fulltext_injected` / `candidate_injected` / `user_excluded` 或 `null`。`why` ⊆ {`project_dir`, `tag`}。数值字段经 `_session_ops.finite_num`，非有限值写 `null`：Python 会写出 `Infinity`，mod 的 `JSON.parse` 整份拒收。
 - **`rejected[]`**：`{what, key, reason}`，`what` ∈ `exclude` / `pin` / `unpin_llm` / `annotation` / `request`。`reason` 与 mod 的处理：
   - `metrics_off`（配置正常读出且 metrics 关闭）、`no_record`（会话 metrics 文件读得到、但没有能核对上的记录）、`bad_item`：annotation 的这几种都是终局，mod 按 `key` 从队列删除；`over_cap` 的 `key` 为空，不对应具体条目（mod 每份请求本就只带 50 条）；
   - `not_in_index`：mod 把这条路径从 OPS 删掉；`key` 截到 64 字符，路径更长时 mod 删不掉它（Q-L3，已知）；
   - `bad_request`：整份请求作废。
-  - 列表上限 120（= 一份合法请求最多可能产生的条数），不得截得更短：截掉的 `not_in_index` 让 mod 永远收不到「已失效」。
+  - `settings` 与 `persist` 的 reason 值域及 mod 的处理见 `fine-rank.md`。
+  - 列表上限 142（= 一份合法请求最多可能产生的条数，见 `_session_ops.MAX_REJECTED`），不得截得更短：截掉的 `not_in_index` 让 mod 永远收不到「已失效」。
 - **既不 ack 也不拒收**（留在 mod 队列，7 天 TTL）：config 读坏回落默认值的那一轮、dry_run、会话 metrics 文件一个都读不到（`--purge` 之后与命名空间分裂分不开）、取锁超时。
 - **`acked[]`**：已写入、或已由别的会话写入的标注 id（同 id 只写一次），mod 从队列删除。
 - **清理责任**：请求由 Python 读完即删（重复事件除外，留给抢到事件的进程）；快照超过 24 h、请求与写快照的临时文件超过 1 h 由 SessionStart 的 `cleanup_live` 删，只认这三种文件名，不跟随链接与 reparse point；`--purge` 删 `live/` 下的这三种文件；store 队列由 mod 读队列时按 TTL 清。Python 不运行（未装、或 home 两侧不一致）时请求文件无人清理（已知）。
