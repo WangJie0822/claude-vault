@@ -286,11 +286,14 @@ class _Turn:
 # 于是省略路径字段。不能用 None 或空路径代替：`Path("")` 会按当前目录解析。
 _NO_VAULT = Path(__file__).resolve().parent / "__no_vault__"
 # describe_session_topic 认识的发起结果；其余（没发起、被门禁挡下）一律不传，按「尚未发起」显示。
-_SPAWN_OUTCOMES = ("spawned", "no_claude", "spawn_error")
+_SPAWN_OUTCOMES = ("spawned", "no_claude", "no_codex", "spawn_error")
 
 
-def _bind_report(turn: _Turn, hook_input: dict) -> None:
+def _bind_report(turn: _Turn, hook_input: dict, adapter=None) -> None:
     turn.report = None
+    if adapter is not None:
+        turn.report = adapter.make_report()
+        return
     if _session_ops is None:
         return
     try:
@@ -388,7 +391,9 @@ def _report_llm(turn: _Turn, config: dict, cwd: Path, hook_input: dict, *, in_sc
         fine = tf.state if tf is not None else _fine_quiet(sid)
         desc_cfg = config
         if raw_model is not None:
-            desc_cfg = dict(config, relevance=dict(config.get("relevance") or {}, fine_model=raw_model))
+            from copy import copy
+            desc_cfg = copy(config)
+            desc_cfg["relevance"] = dict(config.get("relevance") or {}, fine_model=raw_model)
         llm = describe_session_topic(cwd, sid, desc_cfg,
                                      spawn_outcome=spawn_outcome, fine=fine, inflight=inflight)
         llm["words"] = [w for w in (_session_ops.display_text(x, 40) for x in llm["words"]) if w][:8]
@@ -1082,7 +1087,9 @@ def _report_settings(turn: _Turn) -> None:
         return
     try:
         v = tf.view
-        rep.settings = _session_ops.settings_snapshot(v.effective, v.session, v.locked, v.source)
+        rep.settings = (_session_ops.settings_snapshot(v.effective, v.session, v.locked, v.source, host="codex")
+                        if getattr(v.config, "host", None) == "codex" else
+                        _session_ops.settings_snapshot(v.effective, v.session, v.locked, v.source))
         rep.rejected.extend(v.rejected)
     except Exception as exc:  # noqa: BLE001
         print(f"[vault-loader] 快照会话设置填充失败：{exc}", file=sys.stderr)
@@ -1138,7 +1145,10 @@ def _apply_persist(turn: _Turn, session_ops, cfg_fallback) -> None:
                 reason = "unavailable"
             else:
                 try:
-                    res = cs.set_key(full, _persist_raw(value))
+                    # 已由 check_persist 证明不扩大发送范围；仅此窄化通路确认隐私旋钮。
+                    res = (cs.set_key(full, _persist_raw(value), runtime="codex", privacy_ack=True)
+                           if getattr(tf.view.config, "host", None) == "codex" else
+                           cs.set_key(full, _persist_raw(value)))
                 except Exception:  # noqa: BLE001 — set_key 本应不抛；抛了也只算这一键写失败
                     res = None
                 if isinstance(res, dict) and res.get("ok"):
@@ -1190,7 +1200,8 @@ def _fine_payload(tf, mode: str, gen: str, slot: str, *, prompt: str, hook_input
     """父 → 子的 stdin（spec §6.3）。字段拼装的单点是 `_topic.build_fine_payload`（Task 12）：这里只算
     本轮输入，不另拼一份——两份会漂移，子进程读不到的字段静默回落默认（合稿裁定：此前这里漏了
     `use_tag_idf` / `tag_idf_floor` / `weights`，用户改过的打分权重不会传给精排）。"""
-    cfg = dict(config)
+    from copy import copy
+    cfg = copy(config)  # 保留受信 HostConfig 的宿主、模型与代际属性；只替换顶层 vault_path。
     cfg["vault_path"] = str(vault_path)       # 本轮已 expanduser 的 vault，与粗排读的是同一个
     return build_fine_payload(
         mode, prompt=prompt or "", config=cfg, gen_id=gen, src_seq=tf.turn_seq, slot=slot,
@@ -1337,11 +1348,11 @@ def _fill_provenance(rep, config: dict, active_entries: dict, decision, pinned_r
         p["dedup"] = None if p["path"] in rank_of else dedup_of.get(p["path"])
 
 
-def main() -> int:
+def main(hook_input=None, *, adapter=None) -> int:
     # 每轮一个新的 `_Turn`：本轮状态的复位是结构性的，没有入口、出口的复位语句（见 `_Turn`）
     turn = _Turn()
     try:
-        return _main_impl(turn)
+        return _main_impl(turn) if adapter is None and hook_input is None else _main_impl(turn, hook_input, adapter=adapter)
     finally:
         rep = turn.report
         if rep is not None:
@@ -1364,17 +1375,21 @@ def _read_hook_stdin() -> str:
     return buf.read().decode("utf-8", errors="replace")
 
 
-def _main_impl(turn: _Turn) -> int:
+def _main_impl(turn: _Turn, hook_input=None, *, adapter=None) -> int:
     home = Path.home()
 
-    try:
-        hook_input = json.loads(_read_hook_stdin() or "{}")
-    except json.JSONDecodeError:
-        hook_input = {}
+    if hook_input is None:
+        try:
+            hook_input = json.loads(_read_hook_stdin() or "{}")
+        except json.JSONDecodeError:
+            hook_input = {}
 
     cwd = Path(hook_input.get("cwd", os.getcwd()))
     prompt = hook_input.get("prompt", "")
-    _bind_report(turn, hook_input)
+    if adapter is None:
+        _bind_report(turn, hook_input)
+    else:
+        _bind_report(turn, hook_input, adapter)
     should_claim = False
     legacy_enabled = False
     coexist_note = ""
@@ -1383,18 +1398,17 @@ def _main_impl(turn: _Turn) -> int:
         from context_vault.coexist import check_legacy_plugin
         from context_vault.events import claim_event
         from context_vault.runtime import HookContext
-        hook_context = HookContext.from_payload(hook_input)
-        legacy_enabled, coexist_note = check_legacy_plugin(
-            home=home, cwd=hook_context.cwd
-        )
+        hook_context = adapter.context if adapter is not None else HookContext.from_payload(hook_input)
+        legacy_enabled, coexist_note = (check_legacy_plugin(home=home, cwd=hook_context.cwd, host="codex")
+            if adapter is not None else check_legacy_plugin(home=home, cwd=hook_context.cwd))
         # 缺 `hook_event_name` 的畸形 payload 不去重：去重依赖宿主给的事件名，没有它
         # 时按「每次都是新事件」处理（与 1.x 把它判成 UNKNOWN 时的行为一致）。
-        should_claim = bool(hook_context.event)
+        should_claim = bool(hook_context.event) and adapter is None
     except Exception as exc:
         hook_context = None
         print(f"[vault-loader] runtime 识别失败，使用 legacy state：{exc}", file=sys.stderr)
 
-    if _is_runtime_disabled(home):
+    if (adapter.runtime_disabled() if adapter is not None else _is_runtime_disabled(home)):
         return 0
 
     # 程序化调用（`claude -p` 及其派生）不注入：它带着完整任务 prompt 而来，
@@ -1407,12 +1421,12 @@ def _main_impl(turn: _Turn) -> int:
     # fail-open）。
     try:
         from scripts._entrypoint import is_supported_session
-        if not is_supported_session():
+        if adapter is None and not is_supported_session():
             return 0
     except Exception:
         pass
 
-    config, cfg_fallback, cfg_detail = load_config_ex()
+    config, cfg_fallback, cfg_detail = adapter.loaded if adapter is not None else load_config_ex()
     turn.cfg_corrupt = cfg_fallback == "corrupt"
     if hook_context is not None:
         try:

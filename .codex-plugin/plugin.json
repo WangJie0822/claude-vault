@@ -1,0 +1,7 @@
+{
+  "name": "context-vault",
+  "version": "2.5.0",
+  "description": "Capture and recall a local knowledge vault in Codex.",
+  "skills": "./skills/",
+  "hooks": "./hooks/codex-hooks.json"
+}

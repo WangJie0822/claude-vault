@@ -38,7 +38,7 @@ const FOOTER = 'Enter 展开/收起 · ↑↓/Tab 移动 · Esc 关闭'
 const MAX_PANE_ROWS = 40
 const LLM_TEXT = { off: '未开启（relevance.fine_rank）', idle: '尚未发起（等第一个有召回的提问）',
   unavailable: '无法发起', pending: '提炼中', ok: '已完成', failed: '失败' }
-const FAIL_TEXT = { no_claude: '找不到 claude 命令', spawn_error: '拉起子进程失败', timeout: '超时',
+const FAIL_TEXT = { no_codex: '找不到 codex 命令', isolation_failed: 'Codex 隔离检查失败', no_claude: '找不到 claude 命令', spawn_error: '拉起子进程失败', timeout: '超时',
   exit_nonzero: '退出码非 0', lost: '结果丢失', error: '出错', dry_run: 'dry_run 下不发起提炼',
   bad_model: '模型名不合法，已回落 haiku' }
 // 白名单从文案表派生：只往一边加值时，另一边不会悄悄显示 undefined
@@ -48,7 +48,7 @@ const LIMIT_TEXT = { exclude: '排除', pin: '手动钉住', unpin: '取消自�
 
 // 2.4.0（spec 2026-10-13 §10）：精排补充、面板设置与 Read 观测
 const MAX_ITEM_CHARS = 512                 // 与 Python _session_ops.MAX_ITEM_CHARS 同值
-const DISABLED_TEXT = { streak: '连续失败', no_claude: '找不到 claude 命令',
+const DISABLED_TEXT = { no_codex: '找不到 codex 命令', streak: '连续失败', no_claude: '找不到 claude 命令',
   call_cap: '达到每会话调用上限（relevance.fine_max_calls）',
   bytes_cap: '达到每会话外发上限（relevance.fine_session_max_bytes）' }
 const LLM_DISABLED = new Set(Object.keys(DISABLED_TEXT))

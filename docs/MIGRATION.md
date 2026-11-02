@@ -1,5 +1,18 @@
 # Context Vault 迁移指南
 
+## 2.4.0 → 2.5.0（恢复 Codex 支持）
+
+2.0.0～2.4.0 是 Claude 专用；2.5.0 恢复双宿主。保留原 Claude 安装，Codex 用根目录 `.agents/plugins/marketplace.json` 与 `.codex-plugin/plugin.json` 安装，步骤见 README「Codex 安装与信任」。首次安装或内容更新后审阅并信任两个 hook；未信任时宿主跳过，不以安装成功代替功能验证。Windows 已有桌面聊天恢复与实际手输提问已验收，全新聊天的首次启动未另行验收。
+
+- 配置与 Vault 仍共享，cache `_version` 保持 1；重建锁覆盖读取、扫描、索引与 cache 提交，获取失败非零退出，不应继续标记已总结。
+- Codex 运行状态写入 `state/codex/v2/`、事件写入 `state/codex/v2/events/`、指标写入 `metrics/codex/v2/`；本地控制位于 `state/live/codex/`。不读写 1.x 的同名旧状态，不删除旧数据。Claude 路径和默认行为保持。
+- 已总结清单按宿主区分，相同线程标识不会跨宿主误判。Codex 使用精确当前主线程，不按最新文件选会话；缺失、歧义或不完整来源不能标记完成。
+- Codex 新模型能力默认关闭；保留旧显式 `relevance.fine_model` 的继承，新增 `runtimes.codex.model/profile/model_provider`。核对有效值后再启用，不把模型名当费用等级；已有全局关闭优先。
+- 原 Claude mod 保留。Codex 使用独立本地面板及文本入口；启动提示由模型在首轮回答前打开对应聊天的应用内网页，已有聊天恢复、页面随提问更新及双会话隔离已验收；不声明原生 renderer、原生按钮或 AbovePrompt 常驻条。关闭服务停止新明文发布，已排队操作保留至核心回执。
+- Codex auth/config/sessions、归档会话和日志不进入文档归集，名称含 spec/plan 不豁免；正常设计文档仍可归集。
+
+回退：先关闭本地面板服务、在 Codex 中卸载 2.5.0 插件，然后使用目标旧版的安装材料。不要清空共享 Vault、配置、Claude state 或总结清单。回退版本忽略新增 runtime 配置与 v2 状态；需要撤销 Codex 覆盖时使用 `config` 的宿主范围备份恢复，不能把整份共享配置覆盖成 Codex 快照。旧版的模型默认行为仍按下文各版本说明处理。
+
 ## 2.3.0 → 2.4.0（LLM 精排逐轮化，默认外发范围扩大）
 
 配置、Vault、state、metrics 的路径不变。新增的落盘内容：每会话的精排状态在 `~/.context-vault/state/claude/fine/`
@@ -74,7 +87,7 @@ entry 新增可选键 `fm_truncated`，`_version` 仍是 1。
 
 ## 1.x → 2.0.0（移除 Codex 支持）
 
-2.0.0 起只支持 Claude Code，v1.4.2 是最后支持 Codex 的版本。配置、Vault、state、metrics、
+已发布的 2.0.0～2.4.0 只支持 Claude Code；当时 v1.4.2 是最后支持 Codex 的版本。配置、Vault、state、metrics、
 已总结会话清单的路径与格式都不变。按你的情况读对应小节。
 
 下文说的「三个退役目录」是：

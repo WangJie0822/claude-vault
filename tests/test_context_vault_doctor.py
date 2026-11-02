@@ -1,9 +1,24 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
 
-import scripts.context_vault_doctor as doctor
-from scripts.context_vault_doctor import diagnose
+_spec = importlib.util.spec_from_file_location("cv_doctor_test", Path(__file__).resolve().parents[1] / "scripts/context_vault_doctor.py")
+doctor = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(doctor)
+diagnose = doctor.diagnose
+
+
+def test_doctor_import_can_be_followed_by_real_loader_import():
+    source = Path(__file__).resolve().parents[1] / "scripts/context_vault_doctor.py"
+    code = "import importlib.util,sys; s=importlib.util.spec_from_file_location('synthetic_doctor',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); from context_vault.control import loader_module; print(loader_module('_note_paths').__file__)"
+    result = subprocess.run([sys.executable, "-B", "-c", code, str(source)],
+                            capture_output=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "vault-loader" in result.stdout and "_note_paths.py" in result.stdout
 
 
 def _write(path, data):

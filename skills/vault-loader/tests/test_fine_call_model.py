@@ -25,6 +25,42 @@ SLEEPER = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _claude_default_backend(monkeypatch):
+    monkeypatch.setattr(_topic, "_BACKEND", "claude")
+
+
+@pytest.mark.parametrize("orphan", [False, True] if os.name == "nt" else [False])
+def test_codex_default_runner_kills_grandchildren(tmp_path, monkeypatch, reap, orphan):
+    from context_vault import codex_model
+    pidfile = _install_shim(tmp_path, monkeypatch, orphan=orphan)
+    reap.append(pidfile)
+    bindir = tmp_path / "bin"
+    source = bindir / ("claude.cmd" if os.name == "nt" else "claude")
+    target = bindir / ("codex.cmd" if os.name == "nt" else "codex")
+    target.write_bytes(source.read_bytes())
+    target.chmod(0o755)
+    assert codex_model.call_codex("x", selection={}, timeout=4) is None
+    assert codex_model.LAST_FAIL == "timeout"
+    assert _wait(pidfile.exists, 5), "阳性对照失败：孙进程未启动"
+    assert _wait(lambda: not _alive(int(pidfile.read_text())), 10)
+
+
+def test_codex_call_adapter_uses_existing_tree_runner_and_exact_selection(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    seen = []
+    def call(prompt, **kwargs):
+        assert kwargs["selection"] == {"model": "CV/Exact", "profile": "work", "provider": "custom"}
+        kwargs["runner"](["synthetic"], input=prompt, timeout=1, env={}, cwd=str(tmp_path))
+        return "合成回复"
+    monkeypatch.setattr(_topic, "_BACKEND", "codex")
+    monkeypatch.setattr(_topic, "_MODEL_SELECTION", {"model": "CV/Exact", "profile": "work", "provider": "custom"})
+    monkeypatch.setattr(_topic, "_codex_backend", lambda: SimpleNamespace(call_codex=call, LAST_FAIL=None))
+    monkeypatch.setattr(_topic, "_run_tree_capped", lambda *args: seen.append(args) or (0, "unused"))
+    assert _topic._call_model("长中文") == "合成回复"
+    assert seen == [(["synthetic"], "长中文", 1, {}, str(tmp_path))]
+
+
 def _alive(pid: int) -> bool:
     if os.name == "nt":
         k32 = ctypes.WinDLL("kernel32")

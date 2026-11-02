@@ -1,13 +1,15 @@
 ---
 name: vault-loader
-description: 自动从知识库按相关性注入 summary 清单到 Claude Code 会话上下文（零配置，安装即生效）。SessionStart 注入项目相关笔记 + 近期工作日志；UserPromptSubmit 按用户问题动态深入。禁用逃生阀：VAULT_LOADER_DISABLE=1、~/.context-vault/.disabled 或 config enabled:false。
+description: 通过宿主 hook 从知识库按相关性注入 summary 清单到 Claude Code 或 Codex 会话上下文。SessionStart 注入项目相关笔记和近期工作日志，UserPromptSubmit 按提问动态召回；也用于诊断注入与配置。禁用逃生阀：VAULT_LOADER_DISABLE=1、~/.context-vault/.disabled 或 config enabled:false。
 argument-hint: "[--doctor]"
 allowed-tools: Read, Bash(python3 *)
 ---
 
 # vault-loader：自动加载知识库
 
-vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记自动注入 Claude Code 会话上下文，让 Claude Code 启动时即可看到项目历史决策、近期工作进展。
+vault-loader 通过两个 hook 把 Obsidian Vault 的相关笔记注入 Claude Code 或 Codex 会话上下文。
+
+Codex 由 `.codex-plugin/plugin.json` 显式选择 `hooks/codex-hooks.json`，安装后还须启用并信任当前 hook 定义。粗排共用现有核心，状态与指标单独保存；Codex 精排默认关闭，须显式配置 `runtimes.codex.relevance.fine_rank`，全局停用优先。模型未指定时继承 Codex 原生配置，显式模型/profile/provider 由宿主配置保留。原 Claude mod 保留；核验过的 Desktop 主线程在 SessionStart 提示主模型于首次回答前打开当前聊天的应用内面板，入口细节见同包 `vault-injected/SKILL.md`。启动和首次提问各保存一次元数据报告，不依赖页面已经存在；后续未附着轮次不持续采集。不承诺模型运行前打开或永久常驻。
 
 ## 触发机制
 
@@ -103,6 +105,27 @@ UserPromptSubmit 的打分（「脚本粗排」）只看提问关键词能命中
 | `dry_run` | `false` | true 时**不真实注入**（`hookSpecificOutput` 字段缺失，不喂模型），仅输出标 `[DRY-RUN]` 的 `systemMessage`，用于灰度验证会注入什么 |
 | `vault_path` | `~/.context-vault/knowledge-vault` | Vault 路径 |
 | `runtimes.claude.enabled` | `true` | 启停 SessionStart 与 UserPromptSubmit 两个注入入口 |
+| `runtimes.codex.enabled` | `true` | Codex 宿主开关；尊重旧配置的显式 false，不影响 Claude |
+| `runtimes.codex.model` | `""` | Codex 专属模型，空串继承；优先于旧 fine_model 显式值，再回落 Codex 当前有效模型。更改需单独确认外发选择 |
+| `runtimes.codex.profile` | `""` | Codex profile；空串使用其默认配置，不复制认证。更改需单独确认 |
+| `runtimes.codex.model_provider` | `""` | Codex provider 标识；空串继承有效配置，不把端点或令牌写在此字段；更改需单独确认 |
+| `runtimes.codex.user_prompt_submit.max_notes` | `3` | Codex 清单篇数覆盖；未显式配置时继承共享值，范围 0–8 |
+| `runtimes.codex.relevance.fine_rank` | `false` | Codex 精排单独 opt-in；全局或宿主已关时不能由会话打开，不继承 Claude 的外发授权 |
+| `runtimes.codex.relevance.fine_supplement` | `false` | Codex 逐轮补充单独 opt-in，还需 fine_rank 开启 |
+| `runtimes.codex.relevance.coarse_inject` | `true` | Codex 粗排覆盖；原始配置未写时沿用共享值 |
+| `runtimes.codex.relevance.auto_fulltext` | `false` | Codex 自动全文覆盖；原始配置未写时沿用共享值 |
+| `runtimes.codex.relevance.fine_pin_max` | `1` | Codex 首轮点名上限；未显式配置时沿用共享值 |
+| `runtimes.codex.relevance.fine_max_notes` | `3` | Codex 每次补充上限；未显式配置时沿用共享值 |
+| `runtimes.codex.relevance.fine_timeout_sec` | `120` | Codex 精排超时；未显式配置时沿用共享值 |
+| `runtimes.codex.relevance.fine_max_calls` | `20` | Codex 会话调用上限；未显式配置时沿用共享值 |
+| `runtimes.codex.relevance.fine_session_max_bytes` | `1000000` | Codex 累计外发字节上限；隐私旋钮；未写时沿用共享值 |
+| `runtimes.codex.relevance.fine_catalog` | `true` | Codex 目录层覆盖；隐私旋钮；未写时沿用共享值 |
+| `runtimes.codex.relevance.fine_catalog_max_chars` | `80000` | Codex 目录层预算；隐私旋钮；未写时沿用共享值 |
+| `runtimes.codex.relevance.fine_recent_prompts` | `3` | Codex 最近提问条数；隐私旋钮；未写时沿用共享值 |
+| `runtimes.codex.relevance.fine_exclude_tags` | `["private"]` | Codex 精排排除标签；隐私旋钮；未写时沿用共享值 |
+| `runtimes.codex.relevance.session_topic_top_n` | `30` | Codex 首轮候选数量；隐私旋钮；未写时沿用共享值 |
+| `runtimes.codex.relevance.session_topic_project_top_k` | `20` | Codex 项目候选数量；隐私旋钮；未写时沿用共享值 |
+| `runtimes.codex.relevance.session_topic_pool_max` | `50` | Codex 首轮候选池上限；隐私旋钮；未写时沿用共享值 |
 | `keyword_to_tags` | `{}` | cwd 关键词 → tag 映射 |
 | `opt_out_paths` | `["/tmp", "/private/tmp", <本机临时目录>]` | 路径前缀黑名单，命中即跳过 |
 | `verbose_on_skip` | `false` | 跳过时输出短提示 |
@@ -193,7 +216,7 @@ UserPromptSubmit 的打分（「脚本粗排」）只看提问关键词能命中
 | `relevance.auto_fulltext` | `false` | 是否按「全文升级判据」自动注入一篇全文。2.4.0 起默认关，主模型按注入行里的路径按需 Read；`true` 时与 2.3.0 行为相同 |
 | `relevance.fine_pin_max` | `1` | 首轮最多点名几篇（0–8，`0` 等价于不点名），读端每轮也按此值收口；本会话有手动钉住时实际上限为 `min(本值, 8 − 手动钉住篇数)`。取代旧键 `session_pin_max` |
 | `relevance.fine_max_notes` | `3` | 每次逐轮补充最多几篇（0–8）。是上限不是指标：模型可以一篇都不选 |
-| `relevance.fine_model` | `"haiku"` | 精排子进程的模型名，原样传给 `claude --model`；须匹配 `[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}`，否则回落 `haiku` 并在面板显示原因。面板在 haiku / sonnet / opus / 本值之间循环 |
+| `relevance.fine_model` | `"haiku"` | Claude 精排模型；非法值回落 haiku。Codex 仅兼容原始文件显式值，宿主 model 优先；未显式写时继承 Codex 有效模型，不把合并默认 haiku 当用户选择，不静默映射型号 |
 | `relevance.fine_timeout_sec` | `120` | 单次精排调用的超时秒数（10–300）；超时杀整棵进程树并计一次失败 |
 | `relevance.fine_max_calls` | `20` | 每会话最多发起几次精排调用（1–500）；发起前检查，达到后不再发起。不是硬上限，例外见「LLM 精排」的「频率与上限」 |
 | `relevance.fine_session_max_bytes` | `1000000` | 每会话累计外发给精排模型的字节上限（0–20000000）；发起前检查，达到后不再发起。不是硬上限：最后一次调用可能越过它，例外见「LLM 精排」的「频率与上限」。隐私旋钮；显式写过的值不会被 `migrate_config` 动 |
@@ -294,4 +317,4 @@ VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader 2>/dev/null | 
 cd "$VL" && python3 -m pytest -q
 ```
 
-应全部通过。其中 `tests/integration/test_perf.py` 的性能守卫是 **500 篇合成 fixture 下的参考基线**（SessionStart < 500 ms、UserPromptSubmit < 300 ms），**不是**对任意规模 Vault 的性能承诺——真实 Vault 的笔记数与 frontmatter 密度都更高，端到端耗时会显著超出该基线（详见该文件的注释）。
+应全部通过。其中 `tests/integration/test_perf.py` 的性能守卫是 **500 篇合成 fixture 下的参考基线**（Windows：UPS < 650ms、SessionStart / metrics < 750ms；macOS / Linux：UPS < 300ms、SessionStart / metrics < 500ms；单点见 `_budget_seconds`），**不是**对任意规模 Vault 的性能承诺——真实 Vault 的笔记数与 frontmatter 密度都更高，端到端耗时会显著超出该基线（详见该文件的注释）。

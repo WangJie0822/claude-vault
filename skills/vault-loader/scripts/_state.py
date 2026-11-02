@@ -87,8 +87,7 @@ def configure_context(runtime: str, session_id: str = "") -> None:
 
     ⚠️ **注入去重的 state 按 cwd 隔离，不按 session。** 这是有意的：
 
-    - 命名空间这一层（legacy / claude）区分的是迁移前后的两套布局（2.0.0 起宿主只剩
-      Claude Code，已没有两个 runtime 互相踩踏的问题），这一层就够了；
+    - Claude 保留 legacy / canonical 两套布局；Codex 固定采用独立的 v2 代际；
     - 再切一层 session 会让跨会话去重失效——同一批笔记每开一次新会话就被重新
       全文注入一遍，而这正是去重机制存在的理由（0.9.x 的行为就是按 cwd）；
     - 每会话一个目录还会单调增长，且没有任何清理路径。
@@ -106,7 +105,7 @@ def configure_context(runtime: str, session_id: str = "") -> None:
         # 去重集此后无人读取——现象与「去重没生效」完全一样，却查不到原因。
         # `_safe_component` 作为二次清洗保留：白名单日后扩容时不至于漏掉路径净化。
         _RUNTIME = (_safe_component(runtime, "legacy")
-                    if runtime in {"claude"} else "legacy")
+                    if runtime in {"claude", "codex"} else "legacy")
 
 
 def current_runtime() -> str:
@@ -143,7 +142,14 @@ def adopt_runtime(ns: str) -> None:
     """
     global _RUNTIME
     _RUNTIME = (_safe_component(ns, "legacy")
-                if ns in {"claude"} else "legacy")
+                if ns in {"claude", "codex"} else "legacy")
+
+
+def canonical_state_root(home: Path | None = None) -> Path:
+    if _RUNTIME == "codex":
+        from context_vault.paths import storage_root
+        return storage_root(home or Path.home(), host="codex", kind="state")
+    return context_home(home) / "state" / _RUNTIME
 
 
 def _hash_path(p: Path) -> str:
@@ -190,7 +196,7 @@ def _repo_root(cwd: Path) -> Path:
     **纯 stat 探测，刻意不 fork `git rev-parse --show-toplevel`。** 本机实测
     （2026-09-10，median of 15，每轮 3 次调用 = 一次 UPS 的调用数）：
     fork git **168~174ms**，stat 探测 **0.74~1.27ms**，差两个数量级；而 UPS 的
-    性能守卫阈值是 300ms（`tests/integration/test_perf.py`），fork 方案会吃掉
+    当时性能守卫阈值是 300ms（`tests/integration/test_perf.py`），fork 方案会吃掉
     大半预算。本机每个新进程都被安全代理注入，别的机器上 fork 会便宜些，但把一个
     与环境强相关的开销放进热路径本身就不划算。
     与 `git rev-parse --show-toplevel` 的一致性实测 7/7（含非 git 目录回落 cwd）。
@@ -236,7 +242,7 @@ def state_path_for_cwd(cwd: Path) -> Path:
     去重集，语义变化远超本次意图。两者判据不同是**结果**，不是遗漏。
     """
     if _RUNTIME != "legacy":
-        return context_home() / "state" / _RUNTIME / f"{_cwd_hash(cwd)}.json"
+        return canonical_state_root() / f"{_cwd_hash(cwd)}.json"
     return (
         Path.home() / ".claude" / "projects" / _cwd_hash(cwd) / "vault-loader-state.json"
     )
@@ -265,13 +271,13 @@ def session_topics_path(cwd: Path) -> Path:
     # 省掉一次 resolve（性能评审实测占本次热路径增量的 80%）。
     key = _hash_path(_repo_root(cwd))
     if _RUNTIME != "legacy":
-        return context_home() / "state" / _RUNTIME / "topics" / f"{key}.json"
+        return canonical_state_root() / "topics" / f"{key}.json"
     return Path.home() / ".claude" / "vault-loader-topics" / f"{key}.json"
 
 
 def diagnostics_path_for_cwd(cwd: Path) -> Path:
     if _RUNTIME != "legacy":
-        return (context_home() / "state" / _RUNTIME / "projects" /
+        return (canonical_state_root() / "projects" /
                 f"{_cwd_hash(cwd)}.json")
     return state_path_for_cwd(cwd)
 

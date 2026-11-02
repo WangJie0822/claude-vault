@@ -53,7 +53,7 @@ class EntryDecision:
     # （total=0.0、hits=[]），不代表真实分数/命中词——admitted=True 的条目 total/hits 才是
     # 真实计算值。原因：excluded 在**真实 Vault** 上是数量主体，若对每篇都额外调
     # score()/_hit_keywords()（等价于把 O(N) 打分主循环的单趟开销翻倍），
-    # tests/integration/test_perf.py::test_prompt_submit_under_300ms 的 300ms 预算会被顶穿。
+    # 原 300ms 预算下会顶穿 tests/integration/test_perf.py 的性能守卫。
     #
     # 举证语料必须用真实 Vault，不能用 500 篇合成 fixture——两者 excluded 占比差一个量级：
     #   真实 Vault（2026-08-04，1064 cache 条目 / 728 active，test_perf 同款 prompt）：
@@ -274,7 +274,8 @@ def decide_injection(active_entries: dict, signals: Signals, weights: dict,
 
     def _total() -> float:
         return score(entry, signals, weights, use_kw,
-                    tag_df=tag_df, n_docs=n_docs, tag_idf_floor=floor)
+                    tag_df=tag_df, n_docs=n_docs, tag_idf_floor=floor,
+                    precomputed_topic=t)
 
     for path, entry in active_entries.items():
         t = topical_score(entry, signals, weights, use_kw,
@@ -326,7 +327,7 @@ def decide_injection(active_entries: dict, signals: Signals, weights: dict,
         if t < min_topical and not has_keyword_hit(entry, prompt_keywords, use_kw):
             # 性能护栏：不为该 excluded 分支调 score()/_hit_keywords()——这是大语料下
             # 数量占绝对主体的分支，逐篇多算一遍会把 O(N) 打分主循环单趟开销翻倍，顶穿
-            # tests/integration/test_perf.py 的 300ms 预算（见 EntryDecision.dedup 上方
+            # 当时 tests/integration/test_perf.py 的 300ms 预算（见 EntryDecision.dedup 上方
             # 性能护栏注释）。total/hits 用占位值，topical(t) 仍是真实值。
             excluded.append(EntryDecision(
                 path=path, topical=t, total=0.0, hits=[],

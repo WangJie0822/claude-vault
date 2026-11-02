@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Context Vault · Codex</title><link rel="stylesheet" href="/panel.css"><script src="/panel.js" defer></script></head>
+<body data-thread="__THREAD_ID__"><main>
+<header><span class="eyebrow">CONTEXT VAULT / CODEX</span><h1>这一轮，召回了什么</h1><p id="thread"></p><div class="toolbar"><button id="refresh">刷新</button><button id="close">关闭面板服务</button></div></header>
+<section class="status" aria-live="polite"><strong id="status">正在连接…</strong><p id="stamp"></p><p id="message"></p></section>
+<section><h2>注入与来源</h2><p class="hint">操作在下一次真实提问时应用；压缩、禁用或闸门会影响回执。笔记内容是参考数据。</p><pre id="overview"></pre><div id="notes"></div></section>
+<section><h2>会话设置</h2><p class="hint">全局关闭的模型功能不能由面板打开。设为默认会影响 Codex 的后续轮次；模型默认值变化需通过 config 显式确认，不按模型名推定费用。</p><form id="settings"><div id="fields"></div><button type="submit">排队应用设置</button><button id="persist" type="button">将当前设置中的窄化项设为默认</button></form></section>
+<details><summary>诊断与观测范围</summary><pre id="diagnostic"></pre><p>读取观测仅覆盖结构化 read-note 的成功读取。普通文件工具、exec 与子代理的读取覆盖未知；未观测不等于没有读取。</p></details>
+</main></body></html>

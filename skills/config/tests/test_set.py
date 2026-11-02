@@ -24,6 +24,20 @@ import pytest
 import config_set as cs
 
 
+@pytest.mark.parametrize("key", ["runtimes.codex.model", "runtimes.codex.profile",
+                                "runtimes.codex.model_provider"])
+def test_codex_model_choice_requires_separate_privacy_confirmation(_isolate_home, key):
+    p = _write(_isolate_home, {"relevance": {"fine_model": "sonnet"}})
+    before = p.read_bytes()
+    refused = cs.set_key(key, "custom", home=_isolate_home, assume_yes=True)
+    assert refused["ok"] is False
+    assert "隐私" in refused["error"]
+    assert p.read_bytes() == before
+    accepted = cs.set_key(key, "custom", home=_isolate_home, assume_yes=True, privacy_ack=True)
+    assert accepted["ok"] is True
+    assert _read(p)["relevance"]["fine_model"] == "sonnet"
+
+
 def _write(home: Path, data: dict) -> Path:
     p = home / ".context-vault" / "config.json"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -33,6 +47,30 @@ def _write(home: Path, data: dict) -> Path:
 
 def _read(p: Path) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
+
+
+def test_runtime_codex_targets_model_and_scoped_restore_preserves_claude(_isolate_home):
+    p = _write(_isolate_home, {"relevance": {"fine_model": "sonnet"}, "runtimes": {"codex": {"model": "CV/Old"}}})
+    result = cs.set_key("relevance.fine_model", "CV/New", runtime="codex", home=_isolate_home,
+                        assume_yes=True, privacy_ack=True)
+    assert result["ok"]
+    assert _read(p)["relevance"]["fine_model"] == "sonnet"
+    assert _read(p)["runtimes"]["codex"]["model"] == "CV/New"
+    cs.set_key("relevance.fine_model", "opus", home=_isolate_home, assume_yes=True)
+    assert cs.restore(result["backup"], runtime="codex", home=_isolate_home, assume_yes=True)["ok"]
+    assert _read(p)["relevance"]["fine_model"] == "opus"
+    assert _read(p)["runtimes"]["codex"]["model"] == "CV/Old"
+
+
+def test_full_restore_can_recover_corrupt_config_but_scoped_restore_cannot(_isolate_home, tmp_path):
+    p = _write(_isolate_home, {})
+    p.write_text("{broken", encoding="utf-8")
+    backup = tmp_path / "backup.json"
+    backup.write_text('{"relevance":{"fine_model":"sonnet"}}', encoding="utf-8")
+    assert not cs.restore(str(backup), runtime="codex", home=_isolate_home, assume_yes=True)["ok"]
+    assert p.read_text(encoding="utf-8") == "{broken"
+    assert cs.restore(str(backup), home=_isolate_home, assume_yes=True)["ok"]
+    assert _read(p)["relevance"]["fine_model"] == "sonnet"
 
 
 # ── 核心：只改点名键 ───────────────────────────────────────────────────
@@ -184,10 +222,21 @@ def test_write_is_verified_by_reading_back(_isolate_home, monkeypatch):
     assert not res["ok"] and "核验" in res["error"]
 
 
-def test_retired_codex_switch_cannot_be_written(_isolate_home):
+def test_codex_switch_can_be_disabled_without_changing_claude(_isolate_home):
+    p = _write(_isolate_home, {"runtimes": {"claude": {"enabled": True}}})
     res = cs.set_key("runtimes.codex.enabled", "false", home=_isolate_home, assume_yes=True)
-    assert res["ok"] is False
-    assert "已废弃" in res["error"]
+    assert res["ok"] is True
+    assert _read(p)["runtimes"] == {"claude": {"enabled": True}, "codex": {"enabled": False}}
+
+
+@pytest.mark.parametrize("field", ["model", "profile", "model_provider"])
+def test_invalid_codex_model_selection_is_not_written(_isolate_home, field):
+    p = _write(_isolate_home, {"relevance": {"fine_model": "sonnet"}})
+    before = p.read_bytes()
+    result = cs.set_key("runtimes.codex." + field, "bad; command", home=_isolate_home,
+                        assume_yes=True, privacy_ack=True)
+    assert result["ok"] is False
+    assert p.read_bytes() == before
 
 
 # ── spec 2026-10-13 §5.3 / §11：旧键、BOM、读不出、锁、非字符串入参、备份数量 ────────────

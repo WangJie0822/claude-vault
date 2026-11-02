@@ -13,7 +13,7 @@
 |---|---|
 | 可配键全集 + 默认值 | vault-loader 的 `DEFAULT_CONFIG`，按**绝对路径**加载 |
 | 是否显式设置 | 原始 config.json 里该键在不在 |
-| 当前生效值 | 用 vault-loader 自己的 `_deep_merge` 合并，保证与运行时逐字一致 |
+| 当前生效值 | 共用配置合并；Codex 另经宿主解析，单独展示继承来源 |
 | 说明文本 | vault-loader `SKILL.md` 锚点内的配置表（有守卫强制全键覆盖） |
 
 **默认值不用 `import scripts._config_loader` 拿**：vault-loader 的 `scripts/` 是 regular
@@ -48,9 +48,6 @@ DEPRECATED: dict[str, str] = {
     "user_prompt_submit.min_score": "已废弃，运行时不读；改用 `relevance.min_topical_score`",
     "user_prompt_submit.fulltext_threshold":
         "已废弃，运行时不读；改用 `relevance.fulltext_topical_threshold`",
-    "runtimes.codex.enabled":
-        "已失效（2.0.0 移除 Codex 支持），运行时不读；若曾用它关掉启动注入，改用 "
-        "`session_start.enabled`",
 }
 
 # 已被新键取代、仍兼容读取的旧键（spec 2026-10-13 §5.3）。与 vault-loader `_fine_config.SUPERSEDED`
@@ -65,6 +62,19 @@ SUPERSEDED: dict[str, str] = {
 # 控制「多少篇笔记被发往外部模型端点」的旋钮。类型都是普通 int，类型校验对它们
 # 完全无效 —— 不标记就没有任何东西提醒用户「调大这个值等于多外发」。
 PRIVACY_KNOBS = frozenset({
+    "runtimes.codex.model",
+    "runtimes.codex.profile",
+    "runtimes.codex.model_provider",
+    "runtimes.codex.relevance.fine_rank",
+    "runtimes.codex.relevance.fine_supplement",
+    "runtimes.codex.relevance.fine_catalog",
+    "runtimes.codex.relevance.fine_catalog_max_chars",
+    "runtimes.codex.relevance.fine_recent_prompts",
+    "runtimes.codex.relevance.fine_session_max_bytes",
+    "runtimes.codex.relevance.fine_exclude_tags",
+    "runtimes.codex.relevance.session_topic_top_n",
+    "runtimes.codex.relevance.session_topic_project_top_k",
+    "runtimes.codex.relevance.session_topic_pool_max",
     "relevance.session_topic_top_n",
     "relevance.session_topic_project_top_k",
     "relevance.session_topic_pool_max",
@@ -184,7 +194,22 @@ def _descriptions() -> dict[str, str]:
     return out
 
 
-def build_inventory(home: Path | None = None) -> list[dict]:
+def runtime_key(key, runtime=None):
+    if runtime is None:
+        return key
+    if runtime != "codex":
+        raise ValueError("unsupported runtime")
+    from context_vault.host_config import CODEX_RELEVANCE_DEFAULTS
+    if key.startswith("runtimes.codex."):
+        return key
+    if key == "relevance.fine_model":
+        return "runtimes.codex.model"
+    if key in ("enabled", "user_prompt_submit.max_notes") or key.startswith("relevance.") and key.split(".", 1)[1] in CODEX_RELEVANCE_DEFAULTS:
+        return "runtimes.codex." + key
+    raise ValueError("shared setting: omit --runtime to change it")
+
+
+def build_inventory(home: Path | None = None, *, runtime=None) -> list[dict]:
     """生成配置清单。纯读，无任何写副作用。"""
     defaults = load_default_config()
     raw, path, exists = read_raw_config(home)
@@ -194,6 +219,13 @@ def build_inventory(home: Path | None = None) -> list[dict]:
     flat_current = flatten(merged)
     flat_explicit = flatten(raw) if raw else {}
     desc = _descriptions()
+    # _config_loader 已按可信插件根完成导入引导；不注册跨 skill 的 scripts 包。
+    from context_vault.host_config import effective_host_config
+    try:
+        codex = effective_host_config(raw, host="codex", base=merged)
+        codex_error = None
+    except ValueError as exc:
+        codex, codex_error = None, str(exc)
 
     items: list[dict] = []
     for key in sorted(flat_default):
@@ -214,6 +246,25 @@ def build_inventory(home: Path | None = None) -> list[dict]:
             "writable": not deprecated and not superseded,
             "config_file": str(path),
         })
+        if key.startswith("runtimes.codex."):
+            item = items[-1]
+            leaf = key[len("runtimes.codex."):]
+            if codex_error:
+                item.update(effective_source="invalid", effective_error=codex_error)
+            elif leaf == "model":
+                item.update(current=codex.model_selection.model,
+                            effective_source=codex.model_selection.source)
+            elif leaf in ("profile", "model_provider"):
+                value = getattr(codex.model_selection, "profile" if leaf == "profile" else "provider")
+                item.update(current=value, effective_source="runtime" if value else "codex-native")
+            elif leaf == "enabled" or leaf.startswith("relevance.") or leaf == "user_prompt_submit.max_notes":
+                section = "user_prompt_submit" if leaf.startswith("user_prompt_submit.") else "relevance"
+                value = codex["enabled"] if leaf == "enabled" else codex[section][leaf.split(".", 1)[1]]
+                shared = leaf if leaf != "enabled" else "enabled"
+                origin = key if key in flat_explicit else (shared if shared in flat_explicit else "shared-default")
+                if value != flat_current.get(key):
+                    origin = shared if shared in flat_explicit and value == flat_explicit[shared] else "policy"
+                item.update(current=value, effective_source=origin)
 
     for key, why in READONLY_EXTRA.items():
         items.append({
@@ -228,6 +279,20 @@ def build_inventory(home: Path | None = None) -> list[dict]:
             "config_file": str(path),
         })
 
+    if runtime is not None:
+        rows = {item["key"]: item for item in items}
+        for item in items:
+            try:
+                target = runtime_key(item["key"], runtime)
+            except ValueError:
+                item["writable"] = False
+                continue
+            item["target_key"] = target
+            if target in rows and target != item["key"]:
+                other = rows[target]
+                for field in ("current", "default", "source", "effective_source", "privacy", "writable"):
+                    if field in other:
+                        item[field] = other[field]
     return items
 
 
@@ -270,6 +335,12 @@ def render(items: list[dict], keyword: str | None = None, only_diff: bool = Fals
         tag = f"  [{' · '.join(mark)}]" if mark else ""
         out.append(f"- {r['key']}{tag}")
         out.append(f"    当前 {_fmt(r['current'])}    默认 {_fmt(r['default'])}")
+        if "effective_source" in r:
+            out.append(f"    生效来源 {r['effective_source']}")
+        if r.get("target_key") and r["target_key"] != r["key"]:
+            out.append(f"    写入键 {r['target_key']}")
+        if r.get("effective_error"):
+            out.append(f"    无法解析生效配置：{r['effective_error']}")
         out.append(f"    {r['desc']}")
     return "\n".join(out)
 
@@ -279,9 +350,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("keyword", nargs="?", help="只看键名或说明里含该词的项")
     ap.add_argument("--json", action="store_true", help="输出 JSON（供编排层精确取值）")
     ap.add_argument("--diff", action="store_true", help="只列已显式设置的项")
+    ap.add_argument("--runtime", choices=("codex",), help="显示 Codex 有效值与实际写入键")
     args = ap.parse_args(argv)
 
-    items = build_inventory()
+    items = build_inventory(runtime=args.runtime) if args.runtime else build_inventory()
     if args.json:
         rows = items
         if args.diff:

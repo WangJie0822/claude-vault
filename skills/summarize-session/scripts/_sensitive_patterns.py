@@ -5,6 +5,7 @@
 import os
 import re
 import fnmatch
+import posixpath
 
 # 路径 glob 模式（命中即敏感）
 _SENSITIVE_PATH_GLOBS = [
@@ -39,6 +40,29 @@ _API_KEY_RE = re.compile(
 )
 
 
+def _codex_runtime_path(norm):
+    """运行时文件硬排除先于文档白名单；保留 Codex docs 下正常设计文档。"""
+    norm = posixpath.normpath(norm)
+    tails = []
+    parts = norm.strip('/').split('/')
+    for index, part in enumerate(parts):
+        if part == '.codex':
+            tails.append(parts[index + 1:])
+    custom = os.environ.get('CODEX_HOME')
+    if custom:
+        root = os.path.abspath(os.path.expanduser(custom)).replace('\\', '/').lower().rstrip('/')
+        if norm.startswith(root + '/'):
+            tails.append(norm[len(root) + 1:].split('/'))
+    for tail in tails:
+        if not tail:
+            continue
+        if tail[0] in ('sessions', 'archived_sessions', 'logs', 'log'):
+            return True
+        if tail[0] in ('auth.json', 'config.toml', 'config.json') or tail[0].startswith('state_'):
+            return True
+    return False
+
+
 def _matches_any_glob(path: str, globs) -> bool:
     """fnmatch 不支持 ** 跨目录，自己用 substring + suffix 兼容。"""
     norm = path.replace('\\', '/').lower()
@@ -71,6 +95,8 @@ def is_sensitive_path(path: str) -> bool:
         return False
     norm = path.replace('\\', '/').lower()
     fname = os.path.basename(norm)
+    if _codex_runtime_path(norm) or _codex_runtime_path(os.path.realpath(path).replace('\\', '/').lower()):
+        return True
     # 硬 deny 短路：文件名命中 → 直接判敏感，不进白名单分支
     if fname in _HARD_DENY_FILENAMES:
         return True

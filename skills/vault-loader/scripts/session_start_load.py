@@ -356,10 +356,13 @@ def _finish(
 _REPORT = None
 
 
-def _bind_report(hook_input: dict, home: Path) -> None:
+def _bind_report(hook_input: dict, home: Path, adapter=None) -> None:
     """快照素材 + 无条件过期清理（spec §8.3：每次 SessionStart 都清，目录不存在即跳过）。"""
     global _REPORT
     _REPORT = None
+    if adapter is not None:
+        _REPORT = adapter.make_report()
+        return
     try:
         from scripts import _session_ops
     except Exception as exc:  # noqa: BLE001
@@ -380,11 +383,11 @@ def _report_status(status: str) -> None:
         _REPORT.status = status
 
 
-def main() -> int:
+def main(hook_input=None, *, adapter=None) -> int:
     global _REPORT
     _REPORT = None
     try:
-        return _main_impl()
+        return _main_impl() if adapter is None and hook_input is None else _main_impl(hook_input, adapter=adapter)
     finally:
         rep, _REPORT = _REPORT, None
         if rep is not None:
@@ -406,16 +409,20 @@ def _read_hook_stdin() -> str:
     return buf.read().decode("utf-8", errors="replace")
 
 
-def _main_impl() -> int:
+def _main_impl(hook_input=None, *, adapter=None) -> int:
     home = Path.home()
 
-    try:
-        hook_input = json.loads(_read_hook_stdin() or "{}")
-    except json.JSONDecodeError:
-        hook_input = {}
+    if hook_input is None:
+        try:
+            hook_input = json.loads(_read_hook_stdin() or "{}")
+        except json.JSONDecodeError:
+            hook_input = {}
 
     cwd = Path(hook_input.get("cwd", os.getcwd()))
-    _bind_report(hook_input, home)
+    if adapter is None:
+        _bind_report(hook_input, home)
+    else:
+        _bind_report(hook_input, home, adapter)
     hook_context = None
     should_claim = False
     legacy_enabled = False
@@ -426,17 +433,16 @@ def _main_impl() -> int:
         from context_vault.coexist import check_legacy_plugin
         from context_vault.events import claim_event
         from context_vault.runtime import HookContext
-        hook_context = HookContext.from_payload(hook_input)
-        legacy_enabled, coexist_note = check_legacy_plugin(
-            home=home, cwd=hook_context.cwd
-        )
+        hook_context = adapter.context if adapter is not None else HookContext.from_payload(hook_input)
+        legacy_enabled, coexist_note = (check_legacy_plugin(home=home, cwd=hook_context.cwd, host="codex")
+            if adapter is not None else check_legacy_plugin(home=home, cwd=hook_context.cwd))
         # 缺 `hook_event_name` 的畸形 payload 不去重：去重依赖宿主给的事件名，没有它
         # 时按「每次都是新事件」处理（与 1.x 把它判成 UNKNOWN 时的行为一致）。
-        should_claim = bool(hook_context.event)
+        should_claim = bool(hook_context.event) and adapter is None
     except Exception as exc:
         print(f"[vault-loader] runtime 识别失败，使用 legacy state：{exc}", file=sys.stderr)
 
-    if _is_runtime_disabled(home):
+    if (adapter.runtime_disabled() if adapter is not None else _is_runtime_disabled(home)):
         return 0
 
     # 程序化调用（`claude -p` 及其派生）不注入：它带着完整任务 prompt 而来，
@@ -449,12 +455,12 @@ def _main_impl() -> int:
     # fail-open）。
     try:
         from scripts._entrypoint import is_supported_session
-        if not is_supported_session():
+        if adapter is None and not is_supported_session():
             return 0
     except Exception:
         pass
 
-    config, cfg_fallback, cfg_detail = load_config_ex()
+    config, cfg_fallback, cfg_detail = adapter.loaded if adapter is not None else load_config_ex()
     if hook_context is not None:
         try:
             from scripts._state import configure_context
@@ -597,6 +603,8 @@ def _main_impl() -> int:
 
     project_notes = [e for e in entries.values() if _is_project_note(e)]
     project_notes.sort(key=lambda e: -e.mtime)
+    if adapter is not None:
+        project_notes = adapter.filter_session_notes(project_notes)
     project_notes = project_notes[: ss_cfg["max_notes"]]
     if _REPORT is not None and _REPORT.request_seen:
         try:

@@ -50,17 +50,22 @@ except ImportError:  # compatibility façade for isolated legacy script copies
             return legacy, False
         return canonical, True
 
+try:
+    from context_vault.host_defaults import CODEX_RELEVANCE_DEFAULTS, CODEX_UPS_DEFAULTS
+except ImportError:  # legacy 独立脚本没有 Codex 入口
+    CODEX_RELEVANCE_DEFAULTS = {}
+    CODEX_UPS_DEFAULTS = {}
+
+
 DEFAULT_CONFIG: dict = {
     "enabled": True,
     "dry_run": False,
     "vault_path": str(default_vault()),
     "runtimes": {
         "claude": {"enabled": True},
-        # 已废弃（2.0.0 移除 Codex 支持）：运行时不读。键保留在这里只为让 /config 清单
-        # 能把用户配置里残留的它标成「已废弃」（迁移脚本给每台迁移过的机器都写过它）；
-        # 同 user_prompt_submit.min_score 的先例：登记在 config_inventory.DEPRECATED 与
-        # test_skill_doc_config_coverage._EXEMPT。
-        "codex": {"enabled": True},
+        "codex": {"enabled": True, "model": "", "profile": "", "model_provider": "",
+                  "user_prompt_submit": deepcopy(CODEX_UPS_DEFAULTS),
+                  "relevance": deepcopy(CODEX_RELEVANCE_DEFAULTS)},
     },
 
     "session_start": {
@@ -155,7 +160,7 @@ DEFAULT_CONFIG: dict = {
         # 拦截非用户手输 prompt（后台 task-notification/系统注入）——含 UUID/tool-id/路径碎片污染
         "skip_non_user_prompts": True,
         # PERF-P2：prompt 关键词数（M）软上限。巨型 prompt（大段粘贴）会令 O(N×M×K) 评分破
-        # <300ms 预算；超上限时取确定性子集（sorted 前 N）。0/None 表示不限。
+        # UPS 同步预算；超上限时取确定性子集（sorted 前 N）。0/None 表示不限。
         "max_prompt_keywords": 30,
         # 第0层（2026-07-02 spec）：CJK bigram 分词与纯 CJK 闸门放宽
         "split_cjk_bigram": True,           # bigram 分词主开关（false=旧 mega-token 行为）
@@ -406,6 +411,17 @@ class ConfigLoad(NamedTuple):
     detail: str
 
 
+class ConfigDocument(NamedTuple):
+    """同一次文件读取的原始显式配置与兼容加载结果。"""
+    raw: dict
+    loaded: ConfigLoad
+
+
+def load_config_ex(path: Path | None = None) -> ConfigLoad:
+    """保持原三项返回契约；显式性与有效值由同一文件快照产生。"""
+    return load_config_document(path).loaded
+
+
 def load_config(path: Path | None = None) -> dict:
     """加载配置（薄封装，签名与行为完全不变）。
 
@@ -423,7 +439,7 @@ def load_config(path: Path | None = None) -> dict:
     return load_config_ex(path).config
 
 
-def load_config_ex(path: Path | None = None) -> ConfigLoad:
+def load_config_document(path: Path | None = None) -> ConfigDocument:
     """加载配置，并回报本次是否发生非预期回退。
     - 缺失：写最小占位到 path（不物化全量默认，见 `_MINIMAL_STUB`），返回默认值，**不置位**
     - 损坏：保留原文件，stderr 警告，返回默认值，置位 `corrupt`
@@ -444,7 +460,7 @@ def load_config_ex(path: Path | None = None) -> ConfigLoad:
         _ensure_relevance_normalized(result)
         resolve_superseded(result, {})
         # 零配置新装不是失效——不置位。
-        return ConfigLoad(result, None, "")
+        return ConfigDocument(deepcopy(stub), ConfigLoad(result, None, ""))
 
     try:
         # utf-8-sig 而非 utf-8：PowerShell 5.1 的 `Out-File -Encoding utf8` 与多个编辑器
@@ -456,6 +472,7 @@ def load_config_ex(path: Path | None = None) -> ConfigLoad:
         override = json.loads(text)
         if not isinstance(override, dict):
             raise ValueError("config root 必须为 object")
+        raw = deepcopy(override)
         override = {k: v for k, v in override.items() if k not in _CONFIG_META_KEYS}
         result = _deep_merge(DEFAULT_CONFIG, override)
         # A canonical config that does not explicitly pin vault_path follows
@@ -465,7 +482,7 @@ def load_config_ex(path: Path | None = None) -> ConfigLoad:
             result["vault_path"] = _default_vault_for(path)
         _ensure_relevance_normalized(result)
         resolve_superseded(result, override)
-        return ConfigLoad(result, None, "")
+        return ConfigDocument(raw, ConfigLoad(result, None, ""))
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         print(f"[vault-loader] config 损坏，回退默认值：{exc}", file=sys.stderr)
         result = deepcopy(DEFAULT_CONFIG)
@@ -474,7 +491,7 @@ def load_config_ex(path: Path | None = None) -> ConfigLoad:
         result["vault_path"] = _default_vault_for(path)
         _ensure_relevance_normalized(result)
         resolve_superseded(result, {})
-        return ConfigLoad(result, "corrupt", str(exc))
+        return ConfigDocument({}, ConfigLoad(result, "corrupt", str(exc)))
 
 
 def compare_vault_paths(vl_config: dict, home: Path | None = None) -> tuple[str, str] | None:

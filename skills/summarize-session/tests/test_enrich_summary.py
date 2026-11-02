@@ -18,6 +18,38 @@ GOOD = "修复 rebuild_index 同秒 mtime 判据导致 cache 不重读、补全�
 BODY = "正文内容" * 80
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+@pytest.mark.parametrize("raw,cli,want", [({"relevance": {"fine_model": "CV/Legacy"}}, [], "CV/Legacy"),
+    ({"runtimes": {"codex": {"model": "CV/Runtime", "profile": "work", "model_provider": "gateway"}}}, [], "CV/Runtime"),
+    ({"runtimes": {"codex": {"model": "CV/Runtime", "profile": "work", "model_provider": "gateway"}}}, ["--model", "CV/Task"], "CV/Task"),
+    ({}, [], None)])
+def test_codex_apply_uses_shared_model_precedence_and_list_never_calls(tmp_path, monkeypatch, raw, cli, want, encoding, capsys):
+    home = tmp_path / "home"; (home / ".context-vault").mkdir(parents=True)
+    (home / ".context-vault/config.json").write_text(json.dumps(raw), encoding=encoding)
+    monkeypatch.setenv("HOME", str(home)); monkeypatch.setenv("USERPROFILE", str(home))
+    vault = _build(tmp_path)
+    seen = []
+    def call(prompt, **kwargs):
+        seen.append(kwargs["selection"])
+        return json.dumps({"summary": GOOD})
+    monkeypatch.setattr(E, "call_codex", call, raising=False)
+    monkeypatch.setattr(E, "call_claude", lambda *a, **k: pytest.fail("Codex 批处理不得调用 Claude"))
+    original_call = E._call_model
+    list_calls = []
+    monkeypatch.setattr(E, "_call_model", lambda prompt: list_calls.append(prompt) or json.dumps({"summary": GOOD}))
+    assert E.main(["--vault", str(vault), "--backend", "codex", *cli]) == 0
+    assert seen == list_calls == []
+    listing = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert listing["est_tokens"] is None
+    monkeypatch.setattr(E, "_call_model", original_call)
+    assert E.main(["--vault", str(vault), "--backend", "codex", "--apply", "--expect", "2", "--no-commit", *cli]) == 0
+    assert len(seen) == 2 and all(s["model"] == want for s in seen)
+    assert all(s["profile"] == raw.get("runtimes", {}).get("codex", {}).get("profile") for s in seen)
+    assert all(s["provider"] == raw.get("runtimes", {}).get("codex", {}).get("model_provider") for s in seen)
+    assert all(s["source"] == ("task" if cli else "runtime" if "runtimes" in raw else
+                               "legacy-explicit" if "relevance" in raw else "codex-native") for s in seen)
+
+
 def _w(v, rel, fm, body=BODY):
     p = v / rel
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -39,6 +71,7 @@ def _build(tmp_path, git=False) -> Path:
         subprocess.run(["git", "-C", str(v), "commit", "-qm", "init"], check=True)
     r = subprocess.run([sys.executable, str(SCRIPTS / "rebuild_index.py"), "--vault", str(v)],
                        capture_output=True, text=True, encoding="utf-8",
+                       timeout=60,
                        env=dict(os.environ, PYTHONIOENCODING="utf-8"))   # rebuild_index 输出跟随控制台编码
     assert r.returncode == 0, r.stderr
     return v

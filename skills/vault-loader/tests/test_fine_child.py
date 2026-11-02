@@ -310,6 +310,139 @@ def test_k_turns_injected_and_excluded_reach_the_prompt_but_not_fine_state(monke
     assert "更早的那个问题" not in raw and "召回 打分 怎么定" not in raw     # F16
 
 
+def test_codex_real_payload_delivers_only_pretrigger_user_text(monkeypatch, env, tmp_home):
+    from context_vault.host_config import HostConfig
+    from context_vault.session_source import resolve_current_session
+    path = tmp_home / ".codex/sessions" / ("rollout-test-" + SID + ".jsonl")
+    path.parent.mkdir(parents=True)
+    rows = [{"type": "session_meta", "timestamp": "2026-10-20T00:00:00Z",
+             "payload": {"id": SID, "source": "vscode", "cwd": str(env.cwd)}}]
+    for sec, text in ((1, "Codex过去的设计输入"), (2, "Codex未来的输入")):
+        rows.append({"type": "response_item", "timestamp": f"2026-10-20T00:00:{sec:02d}Z",
+            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+    path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_home / ".codex"))
+    env.cfg = HostConfig(env.cfg, host="codex")
+    env.cfg.session_ref = resolve_current_session(host="codex", context={"thread_id": SID}, home=tmp_home)
+    env.cfg.trigger_timestamp = "2026-10-20T00:00:02Z"
+    payload = _payload(env)
+    assert payload["session_source"]["thread_id"] == SID
+    seen = _run(monkeypatch, env, payload, "PINNED: NONE\nWORDS: 召回")
+    assert "Codex过去的设计输入" in seen["prompt"]
+    assert "Codex未来的输入" not in seen["prompt"]
+    raw = _fine_state.fine_path(SID).read_text(encoding="utf-8")
+    assert "Codex过去的设计输入" not in raw
+
+
+def test_codex_stale_epoch_drops_model_content_but_keeps_usage_stats(monkeypatch, env, tmp_home):
+    import hashlib
+    from pathlib import Path
+    from context_vault.host_config import HostConfig
+    from context_vault.session_source import SessionRef
+    from scripts import _state
+    _state.configure_context("codex")
+    env.cfg = HostConfig(env.cfg, host="codex")
+    env.cfg.session_ref = SessionRef("codex", "thread-a", "thread-a", Path("unavailable.jsonl"), env.cwd)
+    env.cfg.state_session_id, env.cfg.context_epoch = SID, 0
+    env.cfg.trigger_timestamp = "2026-10-20T00:00:02Z"
+    metadata = tmp_home / ".context-vault/state/codex/v2/lifecycle" / (hashlib.sha256(b"thread-a").hexdigest()[:24] + ".json")
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(json.dumps({"v": 1, "epoch": 0, "start_seq": 0}), encoding="utf-8")
+    payload = _payload(env)
+    assert payload["codex_context"] == {"thread_id": "thread-a", "epoch": 0}
+    def compact_during_call(text):
+        metadata.write_text(json.dumps({"v": 1, "epoch": 1, "start_seq": 1}), encoding="utf-8")
+        return _pick("PINNED", "召回闸门")(text)
+    def previous_failure(st):
+        st.fail_streak = 1
+        return st
+    _fine_state.update_fine(SID, previous_failure)
+    seen = _run(monkeypatch, env, payload, compact_during_call)
+    assert seen["calls"] == 1
+    assert load_session_pinned(env.cwd, SID, 24) == []
+    stats = _fine_state.load_fine(SID).stats_q
+    assert stats and stats[-1]["bytes"] > 0 and stats[-1]["n_sel"] == 0
+    assert _fine_state.load_fine(SID).fail_streak == 1
+
+
+@pytest.mark.parametrize("failure", ["cache_empty", "entry_error", "model_error", "parse_error"])
+@pytest.mark.parametrize("stale", [False, True])
+def test_codex_all_error_exits_respect_epoch_and_release_owned_resources(monkeypatch, env, tmp_home, failure, stale):
+    from pathlib import Path
+    from context_vault import lifecycle
+    from context_vault.atomic import atomic_write_json
+    from context_vault.host_config import HostConfig
+    from context_vault.session_source import SessionRef
+    from scripts import _state
+
+    _state.configure_context("codex")
+    env.cfg = HostConfig(env.cfg, host="codex")
+    env.cfg.session_ref = SessionRef("codex", "thread-a", "thread-a", Path("unavailable.jsonl"), env.cwd)
+    env.cfg.state_session_id, env.cfg.context_epoch = SID, 0
+    with lifecycle.locked_thread(home=tmp_home, thread_id="thread-a") as (path, metadata):
+        atomic_write_json(path, metadata)
+    now = time.time()
+    assert _fine_state.claim_inflight(SID, GEN, 120, now)
+    slot = _fine_state.claim_slot(GEN, 120, now)
+    other = _fine_state.claim_slot("fedcba9876543210", 120, now)
+    assert slot and other and slot != other
+    payload = _payload(env, slot=slot)
+    assert payload["codex_context"] == {"thread_id": "thread-a", "epoch": 0}
+    if stale:
+        with lifecycle.locked_thread(home=tmp_home, thread_id="thread-a") as (path, metadata):
+            atomic_write_json(path, dict(metadata, epoch=1, start_seq=1))
+    def seed(st):
+        st.fail_streak = 1
+        return st
+    _fine_state.update_fine(SID, seed)
+    calls = []
+    def fake_model(text):
+        calls.append(text)
+        if failure == "model_error":
+            raise RuntimeError("synthetic model exception")
+        return _pick("PINNED", "召回闸门")(text)
+    def boom(*_a, **_k):
+        raise RuntimeError("synthetic entry or parse exception")
+    monkeypatch.setattr(_topic, "_call_model", fake_model)
+    if failure == "cache_empty":
+        (env.vault / ".meta/frontmatter-cache.json").unlink()
+    elif failure == "entry_error":
+        monkeypatch.setattr(_topic, "_child_main", boom)
+    elif failure == "parse_error":
+        monkeypatch.setattr(_topic, "parse_selection", boom)
+    assert run_extraction_child([str(env.cwd), SID, _state.current_runtime()],
+                                stdin_text=json.dumps(payload, ensure_ascii=False)) == 0
+    state = _fine_state.load_fine(SID)
+    assert state.fail_streak == (1 if stale else 2)
+    assert state.disabled_reason == (None if stale else "streak")
+    assert state.last_fail == (None if stale else "error")
+    assert not session_topics_path(env.cwd).exists()
+    assert state.supp is None
+    assert len(state.stats_q) == 1
+    stat = state.stats_q[0]
+    assert stat["bytes"] == (len(calls[0].encode("utf-8")) if calls else 0)
+    assert len(calls) == (1 if failure in ("model_error", "parse_error") else 0)
+    assert ("stale_epoch" in stat["degraded"]) is stale
+    assert _fine_state.inflight_active(SID, time.time()) is None
+    assert not (_fine_state.slots_dir() / slot).exists()
+    assert (_fine_state.slots_dir() / other).exists()
+
+
+@pytest.mark.parametrize("mode", ["pin", "supp"])
+@pytest.mark.parametrize("model", [None, "CV/" + "a" * 100])
+def test_codex_payload_and_child_keep_model_selection_without_haiku(monkeypatch, env, mode, model):
+    from context_vault.host_config import HostConfig, ModelSelection
+    from scripts import _state
+    _state.configure_context("codex")
+    env.cfg = HostConfig(env.cfg, host="codex", model_selection=ModelSelection("codex", model, "work", "custom", "runtime"))
+    payload = _payload(env, mode=mode)
+    assert payload["cfg"]["backend"] == "codex"
+    assert payload["cfg"]["model_selection"]["model"] == model
+    seen = _run(monkeypatch, env, payload, "PINNED: NONE\nSUPPLEMENT: NONE\nWORDS: 召回")
+    assert seen["model"] == model
+
+
+
 def test_save_keep_state_preserves_ok_and_fail(env):
     save_session_topic(env.cwd, SID, ["a词"], pinned=["笔记/无关.md"], accounted=True, state="ok")
     save_session_topic(env.cwd, SID, ["b词"], state=_KEEP)

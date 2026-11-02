@@ -52,6 +52,8 @@ ALLOWED_DIR_PREFIXES = (
 # 精确文件：`docs/` 只分发 MIGRATION.md 一个文件，其余（如 docs/superpowers/ 设计文档）
 # 一律不分发，故这里给的是**具体文件**而非 `docs/` 前缀。
 ALLOWED_FILES = frozenset({
+    ".agents/plugins/marketplace.json",
+    ".codex-plugin/plugin.json",
     "docs/MIGRATION.md",
     "README.md",
     "CLAUDE.md",
@@ -159,6 +161,7 @@ def test_process_artifact_guard_catches_known_offenders():
     assert _process_artifacts_under_skills(offenders) == offenders
     # 反向：正常分发文件不得被误伤——含 "report"/"test" 字样但不是这两类命名模式
     should_pass = [
+        ".codex-plugin/plugin.json",
         "skills/vault-loader/SKILL.md",
         "skills/vault-loader/scripts/_topic.py",
         "skills/vault-loader/tests/test_report_epoch_split.py",
@@ -226,12 +229,14 @@ def test_allowlist_rejects_known_non_distributed_paths():
         ".claude/settings.json",
         ".claude/rules/sub/x.md",
         ".claude/rules/x.md.bak",
-        ".codex-plugin/plugin.json",
+        ".codex-plugin/private.json",
+        ".agents/plugins/private.json",
         "AGENTS.md",
     ]
     assert _outside_allowlist(should_be_rejected) == should_be_rejected
     # 反向：真实分发内容必须放行，否则守卫会把正常提交拦成红
     should_pass = [
+        ".agents/plugins/marketplace.json", ".codex-plugin/plugin.json",
         ".claude-plugin/plugin.json",
         "context_vault/runtime.py", "hooks/run-hook.cmd",
         "skills/vault-loader/scripts/_scorer.py", "commands/vault.md",

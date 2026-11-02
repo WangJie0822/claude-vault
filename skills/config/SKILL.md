@@ -17,6 +17,12 @@ CFG=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/config/scripts 2>/dev/null
 
 优先用当前 SKILL.md 同级的 `scripts/`；取不到才用上面的 cache 搜索。
 
+Codex 使用当前加载技能的绝对路径；不要使用上面的 Claude cache 定位器。仅在路径拿不到时查当前 `CODEX_HOME/plugins/cache/`（未设置则 `~/.codex/plugins/cache/`），同时核对插件名和版本。
+
+Codex 查看与写入均加 `--runtime codex`。例如 `config_inventory.py fine_model --runtime codex --json` 显示有效模型、来源与 `target_key`；`config_set.py relevance.fine_model <ID> --runtime codex --yes --i-understand-privacy` 只写 Codex 模型。模型、profile/provider 和外发范围变化要取得明确确认，`--yes` 不替代隐私确认。未指定模型继承 Codex 当前配置；不按模型名字推定费用。
+
+`config_set.py --restore <备份> --runtime codex --yes` 只还原备份中的 Codex 命名空间，保留当前 Claude 与共享字段；不带 `--runtime` 保留整份配置还原。仅支持运行时覆盖的键可通过该参数写入，共享键需明确选择共享作用域。
+
 ## 列清单
 
 ```bash

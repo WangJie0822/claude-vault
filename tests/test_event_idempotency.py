@@ -23,7 +23,7 @@ def test_event_names_do_not_collide(tmp_path):
     assert claim_event("claude", "UserPromptSubmit", "s1", "e1", home=tmp_path)
 
 
-@pytest.mark.parametrize("runtime", ["codex", "../x", "", "CLAUDE", "legacy"])
+@pytest.mark.parametrize("runtime", ["../x", "", "CLAUDE", "legacy"])
 def test_claim_event_rejects_unknown_runtime(tmp_path, runtime):
     """runtime 会被拼进 marker 目录：白名单之外一律拒绝，且不得在盘上留下任何东西。"""
     with pytest.raises(ValueError, match="unsupported runtime"):
@@ -31,6 +31,14 @@ def test_claim_event_rejects_unknown_runtime(tmp_path, runtime):
     events = tmp_path / ".context-vault" / "state" / "events"
     markers = list(events.rglob("*.json")) if events.exists() else []
     assert not markers, f"被拒绝的 runtime 不得留下 marker：{markers}"
+
+
+def test_codex_events_use_isolated_v2_and_do_not_read_legacy(tmp_path):
+    assert claim_event("claude", "UserPromptSubmit", "s1", "e1", home=tmp_path)
+    assert claim_event("codex", "UserPromptSubmit", "s1", "e1", home=tmp_path)
+    assert not claim_event("codex", "UserPromptSubmit", "s1", "e1", home=tmp_path)
+    assert list((tmp_path / ".context-vault/state/codex/v2/events").glob("*.json"))
+    assert not (tmp_path / ".context-vault/state/events/codex").exists()
 
 
 def test_same_host_event_id_in_different_projects_does_not_collide(tmp_path):

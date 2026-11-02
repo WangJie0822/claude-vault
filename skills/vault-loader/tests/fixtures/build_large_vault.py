@@ -8,7 +8,7 @@
 默认 True——真实正文的价值在**覆盖读代码路径的正确性**（test_fixture_writes_real_bodies
 验证分布/代码块/CJK），以及让全文注入分支真正执行读+slice+sanitize。
 诚实边界（full-review 3A-T3 实测）：真实正文读+slice+sanitize 对 UPS 端到端仅加 ~0ms
-（被解释器启动+O(N) 打分循环主导），故 300ms 预算断言**不对读成本敏感**——它守护的是
+（被解释器启动+O(N) 打分循环主导），故端到端参考预算断言**不对读成本敏感**——它守护的是
 整体 O(N) 打分开销，不是读路径局部回归。别据此以为改小读上限就会被 perf 守卫拦住。
 """
 from __future__ import annotations

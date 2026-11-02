@@ -825,6 +825,22 @@ def main():
 
     cache_path = Path(args.cache) if args.cache else vault / '.meta' / 'frontmatter-cache.json'
 
+    if args.dry_run or (args.health_check_only and not args.fix_frontmatter):
+        return _rebuild_transaction(args, vault, cache_path)
+    # 索引与 cache 共用事务；自定义 --cache 也不能绕过同一 Vault 的索引锁。
+    transaction = vault / '.meta' / 'frontmatter-cache.json.lock'
+    transaction.parent.mkdir(parents=True, exist_ok=True)
+    if not _acquire_lock(str(transaction)):
+        print('错误: Vault 重建锁获取失败，本次未写入索引或缓存', file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        return _rebuild_transaction(args, vault, cache_path)
+    finally:
+        _release_lock(str(transaction))
+
+
+def _rebuild_transaction(args, vault, cache_path):
+
     exclude_dirs = {'.obsidian', '.meta', '.git', 'node_modules', '.trash'}
 
     # 1. 加载缓存
@@ -944,25 +960,12 @@ def main():
         index_files_written.append(
             str(idx_path.relative_to(vault)).replace('\\', '/'))
 
-    # 7. 写回缓存（并发安全：锁 + 原子写入）；带上当前解析器修订号
+    # 7. 持有外层 Vault 事务锁，原子写回缓存；带上当前解析器修订号。
     cache['entries'] = entries
     cache[PARSER_KEY] = PARSER_REV
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_lock = str(cache_path) + '.lock'
-    cache_written = False
-    if _acquire_lock(cache_lock):
-        try:
-            atomic_write_json(str(cache_path), cache)
-            cache_written = True
-        finally:
-            _release_lock(cache_lock)
-    else:
-        # 锁失败时跳过缓存写入（不覆盖，以免丢失其他窗口的并发写入）。
-        # 索引本身已经成功写入 CLAUDE.md；缓存只是性能优化，下次全量重建即可。
-        print(
-            '警告: 缓存锁获取失败（超时 {}s），本次跳过缓存写入，下次将全量重建'.format(LOCK_TIMEOUT),
-            file=sys.stderr,
-        )
+    atomic_write_json(str(cache_path), cache)
+    cache_written = True
 
     # 8. 最终 health_check + 可选孤立 INDEX 归档
     final_issues = _health_check(entries, vault, index_files_written)

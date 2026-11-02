@@ -122,12 +122,38 @@ def test_auto_backend_outside_hook_fails_cleanly(tmp_path, capsys, monkeypatch):
     assert "backend" in capsys.readouterr().err.lower()
 
 
-def test_backend_codex_is_rejected_by_cli(tmp_path):
+def test_backend_codex_empty_vault_is_valid_without_model_request(tmp_path):
     vault = tmp_path / "v"
     vault.mkdir()
-    with pytest.raises(SystemExit) as exc:
-        E.main(["--vault", str(vault), "--backend", "codex"])
-    assert exc.value.code == 2
+    assert E.main(["--vault", str(vault), "--backend", "codex", "--dry-run"]) == 0
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+@pytest.mark.parametrize("raw,cli,want", [({"relevance": {"fine_model": "CV/Legacy"}}, [], "CV/Legacy"),
+    ({"runtimes": {"codex": {"model": "CV/Runtime", "profile": "work", "model_provider": "gateway"}}}, [], "CV/Runtime"),
+    ({"runtimes": {"codex": {"model": "CV/Runtime", "profile": "work", "model_provider": "gateway"}}}, ["--model", "CV/Task"], "CV/Task"),
+    ({}, [], None)])
+def test_codex_cli_uses_shared_model_precedence(tmp_path, monkeypatch, raw, cli, want, encoding):
+    import json
+    home = tmp_path / "home"
+    (home / ".context-vault").mkdir(parents=True)
+    (home / ".context-vault/config.json").write_text(json.dumps(raw), encoding=encoding)
+    monkeypatch.setenv("HOME", str(home)); monkeypatch.setenv("USERPROFILE", str(home))
+    vault = tmp_path / "vault"; vault.mkdir()
+    note = vault / "note.md"; note.write_text("---\ntags: [test]\n---\n正文", encoding="utf-8")
+    seen = []
+    def call(prompt, **kwargs):
+        seen.append(kwargs["selection"])
+        return '{"keywords": ["召回"]}'
+    monkeypatch.setattr(E, "call_codex", call, raising=False)
+    monkeypatch.setattr(E, "_call_claude", lambda *a, **k: pytest.fail("Codex 批处理不得调用 Claude"))
+    assert E.main(["--vault", str(vault), "--backend", "codex", *cli]) == 0
+    assert len(seen) == 1 and seen[0]["model"] == want
+    assert seen[0]["profile"] == raw.get("runtimes", {}).get("codex", {}).get("profile")
+    assert seen[0]["provider"] == raw.get("runtimes", {}).get("codex", {}).get("model_provider")
+    assert seen[0]["source"] == ("task" if cli else "runtime" if "runtimes" in raw else
+                                 "legacy-explicit" if "relevance" in raw else "codex-native")
+    assert "召回" in note.read_text(encoding="utf-8")
 
 
 def test_extract_json_handles_nested():

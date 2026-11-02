@@ -1,0 +1,24 @@
+{
+  "description": "Context Vault explicit Codex host adapter",
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "startup|resume|clear|compact|fork",
+      "hooks": [{
+        "type": "command",
+        "command": "/bin/sh \"${PLUGIN_ROOT}/hooks/run-codex-hook.sh\"",
+        "commandWindows": "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/hooks/run-codex-hook.ps1\"",
+        "timeout": 10,
+        "additionalContextLimit": 5000
+      }]
+    }],
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/bin/sh \"${PLUGIN_ROOT}/hooks/run-codex-hook.sh\"",
+        "commandWindows": "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/hooks/run-codex-hook.ps1\"",
+        "timeout": 10,
+        "additionalContextLimit": 5000
+      }]
+    }]
+  }
+}

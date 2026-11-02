@@ -70,12 +70,16 @@ def _claude_legacy_enabled(home: Path, cwd: Path | None = None) -> CoexistCheck:
 
 
 def check_legacy_plugin(*, home: Path | None = None,
-                        cwd: Path | None = None) -> CoexistCheck:
+                        cwd: Path | None = None, host: str = "claude") -> CoexistCheck:
+    if host == "codex":
+        return CoexistCheck(False, "")
+    if host != "claude":
+        raise ValueError("unsupported host")
     return _claude_legacy_enabled(home or Path.home(), cwd)
 
 
 def legacy_plugin_enabled(*, home: Path | None = None,
-                          cwd: Path | None = None) -> bool:
+                          cwd: Path | None = None, host: str = "claude") -> bool:
     """布尔便捷入口（doctor 与既有用例在用）。与 `check_legacy_plugin` 一样只收关键字
     参数：1.x 按位置传 runtime 的调用会 TypeError。"""
-    return check_legacy_plugin(home=home, cwd=cwd).yield_ownership
+    return check_legacy_plugin(home=home, cwd=cwd, host=host).yield_ownership

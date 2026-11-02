@@ -195,7 +195,7 @@ def _panel_keys() -> tuple:
         return ()
 
 
-def _settings_dict(raw, rejected: list) -> dict:
+def _settings_dict(raw, rejected: list, *, host="claude") -> dict:
     """会话设置的结构校验：键是非空、不超长的 str；值是 bool、|n| ≤ 1e9 的 int 或非空不超长的 str。
     float（含 NaN / Infinity）、None、列表、对象一律 bad_item。先截断再逐条校验，与 `_str_list` 同形。"""
     if not isinstance(raw, dict):
@@ -212,7 +212,8 @@ def _settings_dict(raw, rejected: list) -> dict:
             elif isinstance(v, int):
                 ok = abs(v) <= 10 ** 9
             elif isinstance(v, str):
-                ok = 0 < len(v) <= MAX_SETTING_STR_CHARS
+                limit = 128 if host == "codex" and k == "fine_model" else MAX_SETTING_STR_CHARS
+                ok = 0 < len(v) <= limit
             else:
                 ok = False
         if not ok:
@@ -274,7 +275,7 @@ def request_digest(obj) -> Optional[str]:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
-def parse_request(obj) -> SessionOps:
+def parse_request(obj, *, host="claude") -> SessionOps:
     if not isinstance(obj, dict) or obj.get("v") != REQUEST_VERSION:
         # has_settings 显式为 False：整份作废的请求不算带了 settings，沿用已存的会话设置
         return SessionOps(rejected=({"what": "request", "key": "", "reason": "bad_request"},),
@@ -284,7 +285,7 @@ def parse_request(obj) -> SessionOps:
     pin = _str_list(obj.get("pin"), MAX_PIN, "pin", rejected)
     unpin = _str_list(obj.get("unpin_llm"), MAX_UNPIN, "unpin_llm", rejected)
     anns = _annotation_list(obj.get("annotations"), rejected)
-    settings = _settings_dict(obj.get("settings"), rejected)
+    settings = _settings_dict(obj.get("settings"), rejected, host=host)
     persist = _persist_list(obj.get("persist"), rejected)
     reads = _reads_list(obj.get("reads"))
     return SessionOps(exclude=tuple(exclude), pin=tuple(pin), unpin_llm=tuple(unpin),
@@ -380,12 +381,12 @@ def supp_item(path: str, src_seq, recheck: str, rendered: bool) -> dict:
             "rendered": rendered is True}
 
 
-def settings_snapshot(effective, session, locked, source) -> dict:
+def settings_snapshot(effective, session, locked, source, *, host="claude") -> dict:
     """快照 `settings`（spec §10.3）：只输出面板认识的键；`effective` 与 `source` 恒含全部键。
     数值经 finite_num、字符串经 display_text：配置里的值未必干净，非有限数会让 mod 整份拒收快照。"""
     keys = _panel_keys()
 
-    def _val(v):
+    def _val(v, key):
         if isinstance(v, bool):
             return v
         if isinstance(v, int):
@@ -394,7 +395,7 @@ def settings_snapshot(effective, session, locked, source) -> dict:
             except (OverflowError, ValueError):     # 超大 int：math.isfinite 转 float 时抛
                 return None
         if isinstance(v, str):
-            return display_text(v, MAX_SETTING_STR_CHARS)
+            return display_text(v, 128 if host == "codex" and key == "fine_model" else MAX_SETTING_STR_CHARS)
         return None
 
     eff = effective if isinstance(effective, dict) else {}
@@ -402,8 +403,8 @@ def settings_snapshot(effective, session, locked, source) -> dict:
     src = source if isinstance(source, dict) else {}
     lock = set(locked) if isinstance(locked, (list, tuple, set, frozenset)) else set()
     return {
-        "effective": {k: _val(eff.get(k)) for k in keys},
-        "session": {k: _val(ses[k]) for k in keys if k in ses},
+        "effective": {k: _val(eff.get(k), k) for k in keys},
+        "session": {k: _val(ses[k], k) for k in keys if k in ses},
         "locked": [k for k in keys if k in lock],
         "source": {k: (src.get(k) if src.get(k) in SETTING_SOURCES else None) for k in keys},
     }

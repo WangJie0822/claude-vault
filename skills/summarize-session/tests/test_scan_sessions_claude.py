@@ -45,10 +45,10 @@ def _run(home: Path, *args: str) -> subprocess.CompletedProcess:
                           env=env, timeout=60)
 
 
-def test_runtime_flag_is_a_hidden_noop(tmp_path):
+def test_runtime_flag_keeps_claude_and_selects_codex_explicitly(tmp_path):
     """旧版 SKILL.md 仍会传 `--runtime claude`：plugin cache 里多版本并存，而定位器
-    `sort -V | tail -1` 只取最高版本的脚本。它必须继续被接受，但 `--help` 不再展示，
-    `codex` 一律拒绝。"""
+    `sort -V | tail -1` 只取最高版本的脚本。它必须继续被接受，`--help` 展示双宿主选择，
+    Codex 显式选择独立根，不改变 Claude 默认根。"""
     claude_dir = tmp_path / "claude-home"
     (claude_dir / "projects").mkdir(parents=True)
     manifest = tmp_path / "manifest.json"
@@ -58,18 +58,19 @@ def test_runtime_flag_is_a_hidden_noop(tmp_path):
     assert json.loads(ok.stdout)["runtime"] == "claude"
 
     help_text = _run(tmp_path, "--help").stdout
-    assert "--runtime" not in help_text
+    assert "--runtime {claude,codex}" in help_text
     assert "--codex-dir" not in help_text
 
-    bad = _run(tmp_path, "--runtime", "codex", "--manifest", str(manifest),
-               "--claude-dir", str(claude_dir))
-    assert bad.returncode == 2
+    codex = _run(tmp_path, "--runtime", "codex", "--manifest", str(manifest),
+                 "--codex-dir", str(tmp_path / "codex-home"), "--claude-dir", str(claude_dir))
+    assert codex.returncode == 0, codex.stderr
+    assert json.loads(codex.stdout)["runtime"] == "codex"
 
 
-def test_codex_dir_flag_is_removed(tmp_path):
+def test_codex_dir_does_not_switch_default_runtime(tmp_path):
     r = _run(tmp_path, "--codex-dir", str(tmp_path), "--manifest", str(tmp_path / "m.json"))
-    assert r.returncode == 2
-    assert "unrecognized arguments" in r.stderr
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["runtime"] == "claude"
 
 
 # 行形态取自 Claude Code 2.1.293 的真实 transcript（只取键与 content 类型，正文为虚构）：

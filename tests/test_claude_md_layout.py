@@ -112,8 +112,10 @@ LEAK_NEGATIVES = ["版本 1.4.1 发布", "见 https://docs.example.com/a", "`@` 
                   "`\\\\?\\UNC\\`", "`~/.claude/projects/<hash>/`", "dis" + chr(0x200B) + "able"]
 # 泄漏扫描的放行项：(文件, 命中原文, 所在行必须包含的锚串)。三者同时成立才放行——
 # 只按命中原文放行太粗（例如 `D:/` 会放过 CHANGELOG 将来出现的任何盘符路径），
-# 按整个文件豁免更粗。当前三项都在 CHANGELOG：opt_out 示例路径与两个格式规范 URL。
+# 按整个文件豁免更粗。放行项限公开文档链接与 CHANGELOG 的占位路径。
 LEAK_ALLOW = frozenset({
+    ("README.md", "https://developers.openai.com/plugins/build/plugins", "[官方插件包装]"),
+    ("README.md", "https://learn.chatgpt.com/docs/hooks", "[官方 hooks 文档]"),
     ("CHANGELOG.md", "D:/", '"D:/work/secret"'),
     ("CHANGELOG.md", "https://keepachangelog.com/zh-CN/1.1.0/", "[Keep a Changelog]"),
     ("CHANGELOG.md", "https://semver.org/lang/zh-CN/", "[语义化版本]"),

@@ -101,11 +101,19 @@ def lease_lock(target: Path, *, timeout: float = 2.0,
             pass
 
 
-def atomic_write_json(path: Path, data: dict) -> None:
+def atomic_write_json(path: Path, data: dict, *, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if private and os.name != 'nt':
+        path.parent.chmod(0o700)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        if private:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                stream.write(text)
+        else:
+            tmp.write_text(text, encoding="utf-8")
         for attempt in range(6):
             try:
                 os.replace(tmp, path)

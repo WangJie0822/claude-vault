@@ -1,6 +1,6 @@
 # Context Vault
 
-面向 Claude Code 的本地「知识库沉淀—召回」闭环插件（2.0.0 起不再支持 Codex，v1.4.2 是最后支持 Codex 的版本，需要时可从该 tag 自行构建）。仓库名可暂时保留 `claude-vault`，插件 ID 从 1.0.0 起为 `context-vault`。三个 skill 协同构成闭环（另有第四个 `config` 作为运维入口，用来查看与修改本插件的配置项）：
+面向 Claude Code 与 Codex 的本地「知识库沉淀—召回」闭环插件。2.5.0 恢复 Codex 适配；2.0.0～2.4.0 为 Claude 专用。仓库目录保留 `claude-vault`，插件 ID 为 `context-vault`。三个 skill 构成闭环，`config` 是运维入口，Codex 另有 `vault-injected` 控制入口：
 
 | Skill | 作用 |
 |---|---|
@@ -8,7 +8,68 @@
 | **summarize-session** | 会话结束时把对话沉淀为结构化笔记、工作日志和 CLAUDE.md 更新，写入你的知识库。 |
 | **vault** | 手动检索：会话中需要调取特定笔记时，按关键词、分类或标签搜索。 |
 
-闭环：`summarize-session` 写入 → `vault-loader` 读取并注入 → Claude Code 启动时已带好相关上下文。
+闭环：`summarize-session` 写入 → `vault-loader` 读取并注入 → 宿主会话使用相关上下文。两宿主共享 Vault 和索引，运行状态按宿主隔离。
+
+## Codex：能力与验收边界
+
+| 功能 | 实现与验证范围 |
+|---|---|
+| 自动召回 | 独立 Codex 声明与显式适配器，复用原召回核心；Windows 本机已验证信任后的真实 CLI 注入，以及桌面已有聊天恢复时的 SessionStart 提示和实际手输提问触发的召回。首次安装及 hook 内容更新后仍须审阅、信任 hook。 |
+| 手动检索 | 复用 `vault`，用宿主文件工具读取根索引、分类索引及笔记全文；本机已检索到新沉淀笔记，不跨宿主缓存。 |
+| 会话沉淀 | 精确读取当前 Codex 主线程 rollout，忽略子代理与包装消息；真实会话→Vault 笔记→共享索引→自动召回已测，成功写入和重建后才标记。总结由当前会话模型写作，未对总结质量做独立评分。 |
+| 模型配置 | 保留 Claude 配置；Codex 支持精确模型 ID、profile/provider 和原生配置继承。两个本机引擎经本地合成 provider 测试；真实付费子调用未验收。 |
+| 最近两版 mod 能力 | Claude 保留原 mod；Codex 通过独立本地面板与文本入口提供来源解释、模型补充、排除/撤销、钉住、标注和八项会话设置。双线程浏览器操作→下一轮→应用回执已测。 |
+| 应用内面板 | 已有桌面聊天恢复时，由启动提示驱动模型在首轮回答前自动打开该聊天的应用内网页；手输提问后现有页面更新、双会话页面与操作隔离已验收。未声明支持 Codex 原生 renderer、原生面板按钮或 AbovePrompt 常驻条。 |
+| 读取观测 | 仅结构化 `read-note` 成功读取，重复去重；失败不记，metrics 关闭零新增访问记录。普通工具、exec、子代理的读取覆盖未知。 |
+
+实跑 Windows：CLI 0.153.0、桌面引擎 0.163.0-alpha.10.2 的合成 provider 链路，以及 0.166.0-alpha.5.1 的已有聊天恢复与真实输入；这些版本不是最低版本声明。修复后全新创建聊天的首次启动、macOS / Linux 的 Codex 入口尚未真机验收。Windows 性能预算仍有七项 Codex 入口和两项 Claude 精排稳态失败，本版按已知限制发布，复跑方式见 [CHANGELOG](CHANGELOG.md)「2.5.0」。以下原有 band、终端键位与 Claude Read 权限说明均指 Claude。
+
+### Codex 安装与信任
+
+从包含 `.agents/plugins/marketplace.json` 的 2.5.0 插件目录或已解包产物添加本地市场：
+
+```bash
+codex plugin marketplace add "<插件目录>"
+codex plugin add context-vault@context-vault-marketplace
+```
+
+安装后检查宿主的 hook 列表并审阅、信任本插件的两个 hook。官方说明：新 hook 或内容变化后的 hook 会等待信任，尚未信任时跳过；插件不绕过此机制。实际可用性应以新会话的 SessionStart 与下一次提问的注入输出为准，不能只看安装成功。参见[官方插件包装](https://developers.openai.com/plugins/build/plugins)与[官方 hooks 文档](https://learn.chatgpt.com/docs/hooks)。
+
+### Codex 模型与配置
+
+共享配置仍为 `~/.context-vault/config.json`，无需复制 Claude 数据。下例仅演示配置结构，启用模型前先核对外发范围：
+
+```json
+{
+  "runtimes": {
+    "codex": {
+      "enabled": true,
+      "model": "vendor/exact-model-id",
+      "profile": "my-profile",
+      "relevance": {"fine_rank": false, "fine_supplement": false}
+    }
+  }
+}
+```
+
+模型优先级：任务显式值 → 当前会话 → `runtimes.codex.model` → 原始配置中显式的 `relevance.fine_model` → Codex 原生配置。省略 Codex model 时不会自动塞入 Claude 的默认 haiku；已有显式旧模型值仍兼容，因此切换宿主时要核对其有效值。`profile` / `model_provider` 采用现有 Codex 配置中的精确名称，不按模型名估算费用。
+
+Codex 新增精排与逐轮补充默认关闭；已有 Claude 默认行为保留。经 `config` 明确启用 `runtimes.codex.relevance.fine_rank` 后才允许 Codex 模型链路，逐轮补充另需启用 `fine_supplement`。共享全局关闭仍优先。`config_inventory.py --runtime codex` 展示有效值与来源；`config_set.py --runtime codex` 仅写 Codex 覆盖，恢复也按宿主收敛。具体确认、备份与恢复步骤见 [config skill](skills/config/SKILL.md)。
+
+模型子调用保留现有认证/profile/provider，关闭工具、项目指令、skills、hooks 和已发现的 MCP；无法枚举 MCP 时不外发。发现与执行之间配置变化的竞态尚未覆盖，不把隔离探针称为真实账号验证。
+
+### Codex 面板与文本控制
+
+调用 `vault-injected` 查看状态或打开面板，也可从当前插件目录运行：
+
+```bash
+python "<插件目录>/scripts/vault_control.py" status
+python "<插件目录>/scripts/vault_control.py" open
+```
+
+入口从可信当前主线程核对身份，不能按最新会话文件推测。核验为 Codex Desktop 的 SessionStart 提示主模型在首次回答前打开当前聊天的应用内页面；先检查已有且线程相符、授权正常的 IAB 页面，有则复用。否则 `prepare` 返回一次性启动链接，由主模型的应用内浏览器工具打开；仅有排队打开工具时须报告 queued，没有应用内工具时报告能力缺口。CLI 显式 `open` 保留系统浏览器入口。面板使用回环地址，无外部服务；一次性票据在消费前具有完整面板授权，300 秒内单次有效，不要预取、分享或持久化。完整 capability 只经子进程 stdin 和浏览器内部跳转片段传递，页面存入标签会话存储后清除片段。
+
+Desktop 在页面创建前保存启动和首次真实提问的报告，各一次，首次提问延迟也可捕获。这是本地明文元数据保存行为：含标题、路径、命中和状态，不含笔记正文；关闭或授权到期不删除已有文件。后续普通提问仅在有效附着期间更新展示，不重开用户关闭的页面。面板按粗排、LLM 点名、补充、手动钉住、排除、启动上下文分组；闸门保留上次打分，压缩清空旧展示并保留可编辑意图。`queued_revision` 是排队，`applied_revision` 才是核心回执；禁用、闸门、压缩会影响处理。浏览器授权上限一小时、附着租约 60 秒、服务空闲退出 300 秒；过期需重新准备。窄化默认设置只写 Codex 专属键；模型默认变化走 `config` 显式确认。完整命令见 [vault-injected skill](skills/vault-injected/SKILL.md)。
 
 ---
 
@@ -23,7 +84,7 @@
 
 安装后 hook **自动生效**——插件自带的 `hooks/hooks.json` 会被 Claude Code 自动加载注册（SessionStart / UserPromptSubmit），**无需手动编辑 `~/.claude/settings.json`**。若要临时停用，见下方「停用逃生阀」。
 
-> 2.x 不支持 Codex，请不要在 Codex 中安装。已在 Codex 中装过 1.x 的用户，先用 `codex plugin list` 找到 `context-vault@<marketplace>`（按 1.x README 安装的是 `context-vault@context-vault-local`），再执行 `codex plugin remove context-vault@<marketplace>`；还要继续在 Codex 里用 1.4.2 的，先读 `docs/MIGRATION.md` 的 2.0.0 一节再清理任何数据。
+> Codex 使用上面的开发版安装入口；旧版升级及回退先读 [迁移指南](docs/MIGRATION.md)，不要删除共享 Vault 或旧运行目录来“重新安装”。
 
 > **从 2.3.0 或更早升级：2.4.0 默认扩大了外发范围，升级时没有任何提示。** LLM 精排（默认开）从「每会话首轮外发一次」
 > 改为每个通过闸门的提问都可能外发一次，内容另有目录层（全部未归档、未排除笔记的文件名）、最近几轮手输的提问与本项目
@@ -313,9 +374,9 @@ vault-loader 内置一套**可选**的效果评估机制：记录每轮召回的
    # VL = 当前已加载 skill 的 scripts 目录（Claude Code 插件 cache 里取最新版）：
    VL=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/vault-loader/scripts 2>/dev/null | sort -V | tail -1)
 
-   # --runtime all 同时处理 legacy（0.9.x 布局）与 claude 两个命名空间；对 2.0.0 之前留下的 metrics/codex/，
-   # --purge 会整目录删除（含 .salt），--reset-counts 只删其中两份计数文件，事件记录与人工标注不动。
-   # Codex 里还在用 1.4.2 时不要对 all 执行这两条，见 docs/MIGRATION.md。
+   # --runtime all 同时处理 legacy（0.9.x 布局）、claude 与 Codex v2 命名空间。
+   # 旧 Codex v1 的 metrics/codex/ 刻意保留，不纳入 --purge / --reset-counts；
+   # 这些命令不会清空旧 Codex v1 数据。历史迁移行为见 docs/MIGRATION.md。
    # 迁移是「复制」不是「移动」，legacy 目录在迁移后仍留在盘上——漏掉它，
    # --purge 只会清掉一半却照样报告「已清空 N 个数据文件」。
    python3 "$VL/analyze_metrics.py" --runtime all --report

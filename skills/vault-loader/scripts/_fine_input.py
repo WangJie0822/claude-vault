@@ -2,7 +2,7 @@
 """精排子进程的输入构造（spec 2026-10-13 §6.3）：最近 K 轮用户输入、本项目最近工作、宽召回词、
 排除集、摘要层与目录层候选、统一编号。
 
-输入构造在精排子进程里跑（没有 UPS 的 300 ms 预算）。父进程（UPS）只用 `exclusion_set`：发起前按同一份
+输入构造在精排子进程里跑（不受 UPS 同步预算约束）。父进程（UPS）只用 `exclusion_set`：发起前按同一份
 排除集数一次「排除后还有没有候选」（`prompt_submit_load._maybe_spawn`），并且在单独兜底的块里导入它——本模块
 导入失败只让本轮不发起精排，粗排照常；`_topic` 也只在用到的函数里导入本模块（2.4.0 full-review A-H1）。
 所有进 prompt 的文本都是 **不可信数据**：经 `sanitize_injected_text(keep_newlines=False)` 折成单行、剥控制字符
@@ -186,6 +186,40 @@ def recent_user_prompts(path, k: int, current_prompt: str) -> "tuple[list, str |
 
 
 # ---------------- 本项目最近工作 ----------------
+
+def recent_prompts_for_payload(payload, k, current_prompt, *, session_id, claude_dir):
+    """显式来源不完整时降级；绝不跨宿主寻找另一个 transcript。"""
+    if "session_source" not in payload:
+        return recent_user_prompts(safe_transcript_path(
+            payload.get("transcript_path"), session_id, claude_dir), k, current_prompt)
+    if type(k) is not int or k <= 0:
+        return [], None
+    source = payload.get("session_source")
+    if not isinstance(source, dict) or source.get("host") != "codex":
+        return [], "transcript_err"
+    try:
+        from context_vault.session_source import resolve_current_session, recent_prompts
+        if (source.get("state_session_id", source.get("thread_id")) != session_id
+                or not source.get("before")):
+            return [], "transcript_err"
+        ref = resolve_current_session(host="codex", context=source,
+                                      home=Path(source.get("home") or Path.home()))
+        texts = recent_prompts(ref, before=source["before"], limit=k + 1)
+    except (OSError, ValueError, TypeError):
+        return [], "transcript_err"
+    out, total = [], 0
+    for text in reversed(texts):
+        if text.strip() == (current_prompt or "").strip():
+            continue
+        clean = clean_text(text, K_ITEM_CHARS)
+        if not clean:
+            continue
+        remaining = K_TOTAL_CHARS - total
+        out.append(clean[:remaining])
+        total += len(out[-1])
+        if len(out) >= k or total >= K_TOTAL_CHARS:
+            break
+    return list(reversed(out)), None if out else "transcript_none"
 
 def worklog_files(vault_path: Path, days: int) -> list:
     """`<vault>/工作日志/` 下 mtime 在 days 天内的 .md，按文件名降序（新的在前）。

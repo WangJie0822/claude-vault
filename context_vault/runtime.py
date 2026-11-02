@@ -17,14 +17,9 @@ from typing import Any, Mapping
 
 
 class RuntimeKind(str, Enum):
-    """宿主。2.0.0 起只支持 Claude Code。
-
-    保留枚举而不是改成裸字符串：`.value` 是 state / metrics / events 三处命名空间的
-    路径段，调用方一律取 `.value`。1.x 按 payload 的 `turn_id`/`model` 与环境变量
-    `PLUGIN_ROOT` 判出 CODEX，Claude Code 的 SessionStart 因此在部分模式下被错判、
-    记录落进 codex 命名空间——宿主固定后这条错判不复存在。
-    """
+    """宿主由入口明确指定；默认保留 Claude，不按 payload 或环境猜测。"""
     CLAUDE = "claude"
+    CODEX = "codex"
 
 
 def _text(value: Any) -> str:
@@ -44,6 +39,10 @@ class HookContext:
     prompt_id: str | None = None
     source: str = ""
     actor: str = ""
+    thread_id: str = ""
+    root_session_id: str = ""
+    context_epoch: int = 0
+    actor_kind: str = "unknown"
 
     @property
     def metrics_event_id(self) -> str:
@@ -56,23 +55,31 @@ class HookContext:
         return self.event_id if self.stable_event_id else ""
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "HookContext":
+    def from_payload(cls, payload: Mapping[str, Any], *,
+                     runtime: RuntimeKind = RuntimeKind.CLAUDE) -> "HookContext":
+        runtime = RuntimeKind(runtime)
         event = _text(payload.get("hook_event_name"))
         cwd_raw = _text(payload.get("cwd")) or os.getcwd()
         session_id = _text(payload.get("session_id")) or "unknown"
         prompt_id = _text(payload.get("prompt_id")) or None
         event_id = prompt_id or ""
+        if runtime is RuntimeKind.CODEX:
+            event_id = _text(payload.get("turn_id")) or event_id
         stable_event_id = bool(event_id)
         if not event_id:
             # 宿主不下发 prompt_id（SessionStart 恒如此）时回落内容派生 id。它只用于
             # 合并近乎同时的重复投递，绝不能永久压制后续的提问或压缩。
-            raw = "\0".join((RuntimeKind.CLAUDE.value, event, session_id,
+            raw = "\0".join((runtime.value, event, session_id,
                              _text(payload.get("source")),
                              _text(payload.get("prompt"))))
             event_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
         transcript = _text(payload.get("transcript_path"))
+        thread = _text(payload.get("thread_id")) if runtime is RuntimeKind.CODEX else ""
+        epoch = payload.get("context_epoch", 0)
+        epoch = epoch if type(epoch) is int and 0 <= epoch < 2**31 else 0
+        kind = payload.get("actor_kind")
         return cls(
-            runtime=RuntimeKind.CLAUDE,
+            runtime=runtime,
             event=event,
             cwd=Path(cwd_raw),
             session_id=session_id,
@@ -83,4 +90,8 @@ class HookContext:
             prompt_id=prompt_id,
             source=_text(payload.get("source")),
             actor=_text(payload.get("agent_type")),
+            thread_id=thread,
+            root_session_id=_text(payload.get("root_session_id")) if thread else "",
+            context_epoch=epoch,
+            actor_kind=kind if kind in ("main", "subagent") else "unknown",
         )

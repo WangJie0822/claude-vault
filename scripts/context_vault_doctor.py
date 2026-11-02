@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -14,7 +15,11 @@ if str(ROOT) not in sys.path:
 
 from context_vault.paths import canonical_config, context_home, legacy_loader_config
 from context_vault.coexist import legacy_plugin_enabled
-from scripts.migrate_context_vault import inspect
+# 根工具与 vault-loader 都有 scripts；按同根绝对文件加载，不占其包名。
+_spec = importlib.util.spec_from_file_location("_cv_doctor_migration", ROOT / "scripts/migrate_context_vault.py")
+_migration = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_migration)
+inspect = _migration.inspect
 
 
 _EMPTY_LEGACY = {

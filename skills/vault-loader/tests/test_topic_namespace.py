@@ -74,7 +74,8 @@ def _run_child(cwd: Path, sid: str, runtime: str, home: Path):
                           env=env, cwd=str(ROOT), timeout=60)
 
 
-def test_child_writes_where_parent_reads(tmp_home: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_child_writes_where_parent_reads(tmp_home: Path, tmp_path: Path, runtime) -> None:
     """父进程 runtime=claude 时，子进程写的东西父进程必须读得到。
 
     这是本文件的承重断言。修复前它必然红：子进程不调 `configure_context`，
@@ -83,18 +84,18 @@ def test_child_writes_where_parent_reads(tmp_home: Path, tmp_path: Path) -> None
     cwd = tmp_path / "proj"
     cwd.mkdir()
     sid = "sess-cross-proc"
-    configure_context("claude", sid)
+    configure_context(runtime, sid)
     # 把隐含前提提成显式断言：本用例的判别力**只在** `has_legacy_data(tmp_home)` 为假时
     # 成立——否则父子都落 legacy、天然一致，「子进程不配 runtime」这个变异不再转红，
     # 承重断言变空网且完全无声。该前提由 conftest 的 tmp_home 恰好满足，而**兄弟文件**
     # `test_topic_observability.py::_setup` 正在往那里写 `.claude/skills/vault-loader/
     # config.json`；两文件 setup 一旦合并（一次很自然的 DRY 重构），守卫就整个失效而
     # CI 只会更绿。前提破掉时要红在这一行，不要静默通过。
-    assert current_runtime() == "claude", (
+    assert current_runtime() == runtime, (
         "前提被破坏：tmp_home 里出现了 legacy 数据，此时父子都落 legacy，"
         "本用例对『落点分裂』失去判别力")
 
-    r = _run_child(cwd, sid, "claude", tmp_home)
+    r = _run_child(cwd, sid, runtime, tmp_home)
     assert r.returncode == 0, f"子进程异常退出：{r.stderr}"
 
     assert load_session_topic(cwd, sid, 24) == STUB_WORDS, (
@@ -181,7 +182,7 @@ def test_adopt_runtime_does_not_re_derive(tmp_home: Path) -> None:
 
 @pytest.mark.parametrize("hostile", [
     "../../PWNED", r"..\..\PWNED", "", "unknown", "CLAUDE", "claude/../x", None, 3,
-    "codex",
+    "codex/../x",
 ])
 def test_adopt_runtime_keeps_the_whitelist(hostile) -> None:
     """白名单不可省：`_RUNTIME` 会被拼进 state 路径。

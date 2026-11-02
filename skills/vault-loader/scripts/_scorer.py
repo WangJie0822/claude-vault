@@ -175,7 +175,8 @@ def _prompt_topical_hits(entry: Entry, signals: Signals, weights: dict,
                          use_keywords: bool = True, tag_df=None,
                          n_docs: int = 0, tag_idf_floor: float = 0.5) -> float:
     """prompt 关键词对 tag/summary/keywords 的话题命中分（去重 + 门控）。
-    score() 的 J 段与 topical_score() 共用此单点，消除重复、防漂移。
+    score() 的 J 段与 topical_score() 共用此实现，防止口径漂移；
+    决策层先算话题分，再通过 precomputed_topic 复用，避免重复执行。
 
     tag_df 为 None 时数值等价保持旧行为（tag 命中拿满 prompt_tag_hit；注：factor=1.0
     使返回 float 4.0 而非 int 4，`==` 成立故数值等价，非逐字节相同）；
@@ -215,8 +216,9 @@ def _prompt_topical_hits(entry: Entry, signals: Signals, weights: dict,
 
 def score(entry: Entry, signals: Signals, weights: dict,
           use_keywords: bool = True, tag_df=None,
-          n_docs: int = 0, tag_idf_floor: float = 0.5) -> float:
-    """计算单篇笔记的相关性分数。"""
+          n_docs: int = 0, tag_idf_floor: float = 0.5, *,
+          precomputed_topic: float | None = None) -> float:
+    """计算总分；可复用同篇、同输入、同轮已算的话题分（0也是有效值）。"""
     total: float = 0
 
     # A：项目目录直接命中
@@ -247,8 +249,9 @@ def score(entry: Entry, signals: Signals, weights: dict,
             total += weights["mtime_recent_90d"]
 
     # J：UserPromptSubmit 模式追加（与 topical_score 共用 _prompt_topical_hits 单点）
-    total += _prompt_topical_hits(entry, signals, weights, use_keywords,
-                                  tag_df, n_docs, tag_idf_floor)
+    total += (precomputed_topic if precomputed_topic is not None else
+              _prompt_topical_hits(entry, signals, weights, use_keywords,
+                                   tag_df, n_docs, tag_idf_floor))
 
     return total
 

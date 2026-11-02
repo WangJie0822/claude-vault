@@ -17,6 +17,8 @@ paths:
 
 ## 现行补充
 
+- Codex 状态用 v2。
+
 - 命令串 `/bin/sh "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd" <脚本> || exit 1`：
   - wrapper 在 git 里一直是 100644，直接执行它在 Linux 原生文件系统上是 126（2026-10-09，WSL Ubuntu 26.04，dash，ext4；`/mnt/<盘符>` 显示 777 会掩盖）；
   - 首词用绝对路径：裸名 `sh` 按 PATH 查找，当前目录条目在前时会执行仓库里预置的 `sh`；

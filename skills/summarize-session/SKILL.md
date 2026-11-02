@@ -7,7 +7,9 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash(date *), Bash(basename *), Ba
 
 # 会话总结与知识沉淀
 
-将当前对话中产生的有价值信息，结构化地沉淀到 Obsidian 知识库和项目规则文件中，确保 Claude Code 跨会话共享知识。
+将当前对话中产生的有价值信息，结构化地沉淀到 Obsidian 知识库和项目规则文件中，供 Claude Code 与 Codex 跨会话使用。
+
+**Codex 宿主先读 [Codex 调用与会话归属](references/codex.md)**，再执行下面的通用写作流程。该页覆盖精确线程、历史补录、AGENTS.md、模型与 Memory 边界；下文 Claude 专用扫描/标记示例按该页替换。
 
 ## 脚本路径（重要）
 
@@ -23,7 +25,7 @@ SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2
 - **禁用源目录形式**：旧文档把脚本写成 `~/.claude/` 下 `skills/<本 skill>` 的 `scripts/` 子路径——插件化后那里无脚本，跑必 No such file。
 - **`--plugin-dir` 本地开发模式**（不走 cache）：把 `SS` 直接指向你本地仓库的 `skills/summarize-session/scripts`。
 - **PowerShell**：不要原样执行 Bash 定位器；直接把 `$SS` 设为当前 skill 的绝对 `scripts` 目录。
-- **模型后端**：调用 `enrich_keywords.py` 必须显式传 `--backend claude`（`auto` 只在带 `CLAUDE_PLUGIN_ROOT` 的 hook 子进程里成立，Claude Code 的 Bash 工具与普通终端里都会拒绝执行）。`scan_sessions.py` 不需要宿主参数，2.0.0 起只扫描 Claude Code 会话。
+- **模型后端**：付费补词/补摘要显式选择 `--backend claude` 或 `--backend codex`；`auto` 保留 Claude hook 兼容行为。Codex 可传 `--model` 覆盖本批，未传时继承插件/宿主模型。普通总结由当前会话模型写作，无须额外模型调用。`scan_sessions.py` 默认 Claude，Codex 传 `--runtime codex`。
 - **运行时数据**：1.0 新装统一放在 `~/.context-vault/`；旧 `~/.claude/skills/...` 配置继续兼容读取，迁移前不删除。
 
 ## 知识库路径解析
@@ -53,10 +55,10 @@ skill 需要知道 Obsidian Vault 的路径才能正确写入笔记。按以下�
 
 ### keywords backfill（可选，手动 opt-in）
 
-`scripts/enrich_keywords.py` 给存量笔记一次性补 `keywords`（供 vault-loader 召回）。每篇一次模型调用，须手动运行、不接自动管线，并必须显式传 `--backend claude`；不传时（`auto`）在 Claude Code 的 Bash 工具与普通终端里都会拒绝执行。
+`scripts/enrich_keywords.py` 给存量笔记一次性补 `keywords`（供 vault-loader 召回）。每篇一次模型调用，须手动运行、不接自动管线；显式传 `--backend claude|codex`（选择其中一个），先用 `--dry-run` 看范围。
 
 - 先 `--dry-run` 看会处理哪些篇；`--limit N` 限制本次最多发起 N 次付费调用。
-- ⚠️ **成本告警**：大 vault 全量 backfill = 笔记数 × 一次 haiku 调用，先用 `--limit` 小批试。
+- ⚠️ **成本告警**：每篇一次所选后端的模型调用；Claude 未覆盖模型时使用 haiku，Codex 按有效模型、profile 与 provider 配置执行，任务级 `--model` 优先。不能取得实际单价时成本标为未知，不按 haiku 估算；先用 `--dry-run` 核对范围，再用 `--limit` 小批试。
 - 跑完会改笔记 frontmatter，**需再跑 `rebuild_index.py` 刷新 cache** 召回才生效（脚本结束会提示）。
 - 定位器（每个 Bash 块内联）：
   Claude fallback 可用 `SS=$(ls -d ~/.claude/plugins/cache/*/*vault/*/skills/summarize-session/scripts 2>/dev/null | sort -V | tail -1)`；随后执行 `python3 "$SS/enrich_keywords.py" --backend claude --vault "$VAULT" --dry-run`。
@@ -532,7 +534,7 @@ summary: "2026-03-19 工作记录"
      python3 "$SS/keywords_gap.py" --vault "$VAULT" \
        --set "<missing 数组里的路径>" --keywords "词1,词2,词3"
      ```
-   - **零额外模型调用**：你本来就在会话里跑，读笔记自己想词即可。**不要**改调 `enrich_keywords.py`——那个每篇 spawn 一次付费 haiku，是清存量专用、手动 opt-in 的
+   - **零额外模型调用**：你本来就在会话里跑，读笔记自己想词即可。**不要**改调 `enrich_keywords.py`——那个每篇额外调用一次所选后端的有效模型（成本未知时如实标明），是清存量专用、手动 opt-in 的
    - 词的质量约束同 `references/note-format.md`：CJK ≥2 字、ASCII ≥3 字；禁单字与"性能/优化/设计"这类超宽通用词（子串匹配会刷命中无关提问）。非法词由 `--set` 静默剔除，返回值里的 `keywords` 才是实际写入的
    - `--limit 10` 是**刻意限流**：存量缺口大时不要一次补完拖垮会话，剩下的下次会话继续；`total` 始终如实报全量
    - 每次 `--set` 返回 `cache_synced`：为 `false` 时该篇召回要等下次 rebuild 才生效，在第五步输出中如实提示，不要当作成功

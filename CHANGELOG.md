@@ -2,6 +2,28 @@
 
 本文件记录 Context Vault（原 claude-vault）的用户可见变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-11-02
+
+### 新增
+
+- 恢复 Codex 支持：专用插件声明与本地市场，使用独立 v2 状态、精确主线程来源和压缩代际，接入自动召回、手动检索及会话沉淀。保留 Claude hooks/mod。
+- Codex 本地面板与文本控制支持启动上下文、提问召回分组、来源解释、排除/撤销、钉住、相关性标注、模型补充及八项会话设置；操作区分 queued 与 applied 回执，压缩后保留控制意图。
+- 桌面会话启动 hook 向主模型提供打开提示，由模型在首轮回答前打开该聊天的应用内网页；页面使用一次性启动票据，打开后清除票据。双会话页面与操作队列隔离已验收。
+- 兼容旧显式模型配置，增加 Codex 模型/profile/provider、任务与会话覆盖；Codex 精排和逐轮补充默认关闭，保留 Claude 默认值。
+- Codex 结构化 `read-note` 的成功读取观测，失败不计、重复去重；指标关闭不新增访问记录。
+
+### 修复
+
+- Windows 桌面传入扩展路径时，按等价路径比较会话来源；保留实际 I/O 路径及身份、根目录、库外路径和链接保护。
+- 启动捕获保留首个真实提问额度，超时清理有界；快照随提问更新，未知精排状态、继承模型输入和跨代际取消点名意图正确呈现。
+- 共享 Vault 的索引/cache 重建和精确提交串行执行；锁失败退出不报成功；Codex auth/config/session 路径硬排除先于归集文档白名单。
+
+### 验收范围与已知限制
+
+- Windows 桌面引擎 0.166.0-alpha.5.1：已有聊天恢复时的真实 SessionStart 提示、模型自动打开应用内面板，以及实际手输提问后现有页面更新已验收。修复后全新创建聊天的首次启动未另行验收。此前 CLI 0.153.0 和桌面引擎 0.163.0-alpha.10.2 的合成 provider 链路已测；这些版本不是最低版本声明。
+- 本版提供应用内网页，不声明支持 Codex 原生 renderer、原生面板按钮或 AbovePrompt 常驻条。macOS / Linux 的 Codex 入口未做真机验收；真实付费精排及语义相关性未验收。
+- **Windows 性能预算仍未达标，按已知限制发布。** 500 篇合成笔记、每路径 7 个计时样本的声明入口测试中，startup、coarse、panel、metrics、fine、fine-large、first 七项超过原 0.65～0.75 秒预算；完整套件另有 Claude 精排新稳态与大 payload 稳态两项超过 0.65 秒预算。未放宽阈值，未纳入实验性启动器改动。复跑：在 `skills/vault-loader/` 执行 `python -m pytest tests/integration/test_perf.py tests/test_perf_budget.py -q`；耗时随环境变化，功能验收不代表性能预算通过。
+
 ## [2.4.0] - 2026-10-19
 
 > **升级前请读：默认外发范围扩大，升级时没有任何提示。** 2.3.0 每会话只在首轮外发一次；2.4.0 默认每个通过闸门的提问都可能发起一次 LLM 精排，外发内容另有目录层（全部未归档、未排除笔记的文件名）、最近几轮手输的提问与本项目近期工作日志的条目标题。config 里没写这些键的，升级后直接按新默认运行。收窄：`relevance.fine_catalog: false`（不送目录）、`fine_recent_prompts: 0`、`fine_supplement: false`（只保留首轮）、`fine_rank: false`（全关），逐篇用 `private` tag。完整外发清单见 README「2.4.0 起外发给模型的内容」，升级与回退的注意事项见 [docs/MIGRATION.md](docs/MIGRATION.md)「2.3.0 → 2.4.0」。

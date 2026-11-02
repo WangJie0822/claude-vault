@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import signal
@@ -9,6 +10,23 @@ import subprocess
 import tempfile
 
 from context_vault.exe_search import which_no_cwd
+from context_vault.codex_model import call_codex
+
+
+def configured_selection(host, *, task_model=None):
+    """付费批处理共用宿主选择契约；只读配置，坏配置拒绝发起。"""
+    from context_vault.host_config import resolve_model_selection
+    from context_vault.paths import resolve_config_path
+    path, _ = resolve_config_path()
+    raw = {}
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("model config unreadable") from exc
+        if not isinstance(raw, dict):
+            raise ValueError("model config must be an object")
+    return resolve_model_selection(raw, host=host, task_model=task_model)
 
 # 不加载用户 / 项目 / 本地的 settings、CLAUDE.md 与 hooks，不加载 MCP 与 skill：
 # 实测单次输入 117,438 → 30,866 token（2026-10-13，单样本，claude 2.1.296）。
@@ -81,15 +99,15 @@ def call_claude(prompt: str, *, timeout: int = 60,
 
 
 def choose_backend(requested: str = "auto") -> str:
-    """解析 enrich 的模型后端。2.0.0 起只有 claude。
+    """解析 enrich 的模型后端；Codex 须显式选择，auto 保留 Claude 兼容行为。
 
     `auto` 只在有 `CLAUDE_PLUGIN_ROOT` 的进程里判为 claude——Claude Code 给 hook 子进程导出
     该变量；skill 让模型在 Bash 工具里手动运行时没有它（2026-10-08 实测），普通终端同理，
     这两种情况都拒绝。`enrich_keywords.py` 的 `--limit` 默认不限量，把 auto 直接等同
     claude 会让一次误跑把整个 Vault 里缺 keywords 的笔记逐篇交给付费模型。
     """
-    if requested == "claude":
-        return "claude"
+    if requested in ("claude", "codex"):
+        return requested
     if requested != "auto":
         raise ValueError(f"unsupported backend: {requested}")
     if os.environ.get("CLAUDE_PLUGIN_ROOT"):

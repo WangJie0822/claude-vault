@@ -182,8 +182,24 @@ def get_value(config, key: str):
     sec, leaf = _split(key)
     d = _section(config, sec)
     if leaf not in d:
-        return default_of(key)
-    return validate_value(key, d[leaf])[1]
+        return _host_default(config, key)
+    return _host_validate(config, key, d[leaf])[1]
+
+
+def _host_default(config, key):
+    if key == "fine_model" and getattr(config, "host", "claude") == "codex":
+        return None
+    return default_of(key)
+
+
+def _host_validate(config, key, value):
+    if key == "fine_model" and getattr(config, "host", "claude") == "codex":
+        from context_vault.host_config import validate_model
+        try:
+            return True, validate_model(value, host="codex", inherit=True)
+        except ValueError:
+            return False, None
+    return validate_value(key, value)
 
 
 def fine_supplement_on(config) -> bool:
@@ -228,7 +244,7 @@ def apply_session_settings(config, session) -> SettingsView:
                 if key not in PANEL_KEYS:
                     rejected.append({"what": "settings", "key": key[:64], "reason": "unknown"})
                     continue
-                ok, nv = validate_value(key, v)
+                ok, nv = _host_validate(cfg, key, v)
                 if not ok:
                     rejected.append({"what": "settings", "key": key, "reason": "bad_value"})
                     continue
@@ -242,8 +258,12 @@ def apply_session_settings(config, session) -> SettingsView:
         rel = cfg["relevance"]
         rel["session_topic"] = rel["fine_rank"]
         rel["session_pin_max"] = rel["fine_pin_max"]
+        if getattr(cfg, "host", "claude") == "codex" and "fine_model" in accepted:
+            from dataclasses import replace
+            cfg.model_selection = replace(cfg.model_selection, model=accepted["fine_model"],
+                                          source="session")
         source = {k: "session" if k in accepted
-                  else ("config" if base[k] != default_of(k) else "default") for k in PANEL_KEYS}
+                  else ("config" if base[k] != _host_default(cfg, k) else "default") for k in PANEL_KEYS}
         return SettingsView(config=cfg, effective=effective, session=accepted, locked=locked,
                             source=source, rejected=rejected, base=base)
     except Exception as exc:  # noqa: BLE001 — 会话设置只是增强，绝不连累召回
@@ -258,7 +278,7 @@ def _failure_view(config) -> SettingsView:
     cfg = config if isinstance(config, dict) else deepcopy(DEFAULT_CONFIG)
     try:
         base = {k: get_value(cfg, k) for k in PANEL_KEYS}
-        source = {k: "config" if base[k] != default_of(k) else "default" for k in PANEL_KEYS}
+        source = {k: "config" if base[k] != _host_default(cfg, k) else "default" for k in PANEL_KEYS}
     except Exception:  # noqa: BLE001
         base = {k: default_of(k) for k in PANEL_KEYS}
         source = {k: "default" for k in PANEL_KEYS}
@@ -266,14 +286,16 @@ def _failure_view(config) -> SettingsView:
 
 
 def check_persist(key: str, value, view: SettingsView) -> "str | None":
-    """「设为默认」只允许收窄（§10.4）：关开关、减篇数、模型改回 haiku；与 config 现值相同视为无变化、放行。
+    """「设为默认」只允许收窄（§10.4）：关开关、减篇数；Claude 模型改回 haiku 沿用旧策略。
+
+    Codex 不按模型名称推定便宜或隐私收窄，模型变化一律返回 widen、交显式配置确认。
 
     判据是会话设置**之前**的 config 有效值（`view.base`），不是会话值——会话里放宽过的值不能借
     persist 写进 config。返回 None = 允许；否则 "bad_key" | "bad_value" | "widen"。
     """
     if key not in PANEL_KEYS:
         return "bad_key"
-    ok, nv = validate_value(key, value)
+    ok, nv = _host_validate(view.config, key, value)
     if not ok:
         return "bad_value"
     cur = (view.base or {}).get(key, get_value(view.config, key))
@@ -282,5 +304,7 @@ def check_persist(key: str, value, view: SettingsView) -> "str | None":
     if key in _NARROW_INTS:
         return None if nv <= cur else "widen"
     if key == "fine_model":
+        if getattr(view.config, "host", "claude") == "codex":
+            return None if nv == cur else "widen"
         return None if nv in (DEFAULT_MODEL, cur) else "widen"
     return "bad_key"

@@ -1,5 +1,5 @@
 """知识库（Vault）自动 git commit：用 git status 枚举知识库目录内变更精确 add + commit。
-只 commit 不 push；失败不阻塞（返回 status=failed）。不复用文件锁（靠 skill 串行 + git index.lock）。"""
+只 commit 不 push；失败不阻塞（返回 status=failed）。共享 Vault 的提交串行化。"""
 import os
 import re
 import json
@@ -10,6 +10,7 @@ from pathlib import Path
 # 注入同目录，供本包内脚本按模块名互相 import（本文件自 2026-09-07 起不再直接
 # 依赖 rebuild_index，但该路径注入是本目录脚本的既有约定，保留以免影响其他入口）。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _fs import _acquire_lock, _release_lock
 
 # 2026-09-03：由「顶层目录白名单」改为「排除法」。
 # 原白名单是 ('工作日志','Claude Code','项目笔记','缺陷全链路','技术笔记','偏好与习惯','参考资料','领域')，
@@ -146,6 +147,24 @@ def commit_vault(vault, title, no_commit=False, baseline=False, *, paths=None, p
         return {'status': 'skipped', 'reason': 'no_commit_flag'}
     if not is_git_repo(vault):
         return {'status': 'skipped', 'reason': 'not_git'}
+    lock = Path(vault) / '.meta' / 'git-commit.lock'
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        if not _acquire_lock(str(lock)):
+            return {'status': 'failed', 'reason': 'vault_commit_locked'}
+    except OSError:
+        return {'status': 'failed', 'reason': 'vault_commit_lock_unavailable'}
+    try:
+        return _commit_vault_locked(vault, title, no_commit, baseline, paths=paths, prefix=prefix)
+    finally:
+        _release_lock(str(lock))
+
+
+def _commit_vault_locked(vault, title, no_commit=False, baseline=False, *, paths=None, prefix=None):
+    if no_commit:
+        return {'status': 'skipped', 'reason': 'no_commit_flag'}
+    if not is_git_repo(vault):
+        return {'status': 'skipped', 'reason': 'not_git'}
     head = '[docs|vault|会话总结][公共]' if prefix is None else prefix
     msg = head + (sanitize_title(title) or '知识库更新')
     only = None
@@ -162,7 +181,8 @@ def commit_vault(vault, title, no_commit=False, baseline=False, *, paths=None, p
         changes = enumerate_changes(vault)
         if not changes:
             return {'status': 'nothing', 'reason': 'no_vault_changes'}
-        add = _git(vault, ['add', '--'] + changes)  # argv 形式，已过滤越界
+        only = changes
+        add = _git(vault, ['add', '--'] + only, literal=True)
         files = len(changes)
     if add.returncode != 0:
         return {'status': 'failed', 'reason': 'git_add: ' + add.stderr.strip()}

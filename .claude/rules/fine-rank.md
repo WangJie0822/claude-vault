@@ -48,6 +48,8 @@ paths:
 
 ### 配置与会话设置
 
+- Codex 配置由受信入口生成带宿主属性的 dict，JSON 同名字段不能改变宿主；`deepcopy` 保留该属性。原生模型选择用 None 表示，不经 Claude 的 haiku 回落；会话设置沿用相同验证。Codex「设为默认」不按型号推断费用，模型不同即拒收为 widen，转显式配置确认；Claude 原策略保留。
+
 - 新旧键兼容的读取单点在 `_fine_config`：`fine_rank_on` 取「`fine_rank` 与 `session_topic` 任一为 false 即关」，`pin_max_raw` 取「新键、旧键里不等于默认值的那个，新键优先」；`load_config_ex` 合并后经 `resolve_superseded`（定义在 `_config_loader`，`_fine_config` 重导出）把有效值同时写回新旧两键。生产代码不得再直接读 `session_topic` / `session_pin_max`。
 - 会话设置（面板的 8 个键，与 mod 的 `SETTING_ROWS` 逐一相同、同序，由对拍用例钉住）经 `apply_session_settings` 叠加在有效 config 上，之后整轮只读那份 config；config 里为 false 的 `fine_rank` / `fine_supplement` 在会话内不能打开（锁定）；「设为默认」只允许收窄（`check_persist`），放宽方向一律拒绝并提示经 `/config` 修改。
 - 请求里有 `settings` **对象**（含 `{}`）才以它为准，`{}` 即清空本会话已存的设置；不带该键或值不是对象，沿用已存（`SessionOps.has_settings`；整份作废的请求也算「没带」）。

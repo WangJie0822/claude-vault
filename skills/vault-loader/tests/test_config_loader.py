@@ -13,6 +13,41 @@ from scripts._config_loader import (
 )
 
 
+def test_document_raw_and_loaded_share_one_read(tmp_home, monkeypatch):
+    from scripts._config_loader import load_config_document
+    path = tmp_home / "config.json"
+    first = {"_comment": "keep", "relevance": {"fine_model": "First-Model"}}
+    path.write_text(json.dumps(first), encoding="utf-8")
+    read = Path.read_text
+    seen = []
+
+    def changing_read(p, *args, **kwargs):
+        if p == path:
+            seen.append(p)
+            return json.dumps(first if len(seen) == 1 else {"relevance": {"fine_model": "Second-Model"}})
+        return read(p, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", changing_read)
+    document = load_config_document(path)
+    assert document.raw == first
+    assert document.loaded.config["relevance"]["fine_model"] == "First-Model"
+    assert len(seen) == 1
+    assert len(document.loaded) == 3
+
+
+def test_document_missing_and_corrupt_do_not_invent_explicit_model(tmp_home):
+    from scripts._config_loader import load_config_document
+    path = tmp_home / "config.json"
+    fresh = load_config_document(path)
+    assert "fine_model" not in fresh.raw.get("relevance", {})
+    assert fresh.loaded.fallback_reason is None
+    path.write_text("{broken", encoding="utf-8")
+    broken = load_config_document(path)
+    assert broken.raw == {}
+    assert broken.loaded.fallback_reason == "corrupt"
+    assert path.read_text(encoding="utf-8") == "{broken"
+
+
 def _config_path(home: Path) -> Path:
     return home / ".claude" / "skills" / "vault-loader" / "config.json"
 

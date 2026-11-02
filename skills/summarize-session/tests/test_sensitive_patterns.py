@@ -90,3 +90,28 @@ def test_sensitive_content_api_key_still_matches_at_word_boundary():
 def test_sensitive_content_normal_md_with_word_secret_unaffected():
     """正文 '...mysecret...' 不命中（同 prose 测试，再次保险）"""
     assert is_sensitive_content('# Notes about mysecret usage tips') is False
+
+
+@pytest.mark.parametrize("tail", ["auth.json", "config.toml", "sessions/design-plan.md", "archived_sessions/spec.md", "logs/note.md"])
+def test_custom_codex_home_hard_deny_precedes_document_whitelist(tmp_path, monkeypatch, tail):
+    home = tmp_path / "custom-runtime"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    assert is_sensitive_path(str(home / tail))
+    assert is_sensitive_path(str(tmp_path / ".CODEX" / tail))
+    assert not is_sensitive_path(str(home / "docs/design.md"))
+    assert not is_sensitive_path(str(tmp_path / "project/specs/codex-auth-design.md"))
+
+
+def test_codex_sensitive_directory_alias_cannot_use_doc_whitelist(tmp_path):
+    import os
+    runtime = tmp_path / ".codex/sessions"
+    runtime.mkdir(parents=True)
+    (runtime / "design-plan.md").write_text("synthetic", encoding="utf-8")
+    docs = tmp_path / "docs"; docs.mkdir()
+    alias = docs / "plans"
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(str(runtime), str(alias))
+    else:
+        os.symlink(runtime, alias, target_is_directory=True)
+    assert is_sensitive_path(str(alias / "design-plan.md"))

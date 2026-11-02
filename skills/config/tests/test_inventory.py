@@ -24,6 +24,14 @@ import pytest
 
 import config_inventory as inv
 
+
+def test_runtime_inventory_alias_reports_effective_model_and_target(_isolate_home):
+    _write_config(_isolate_home, {"relevance": {"fine_model": "sonnet"}, "runtimes": {"codex": {"model": "CV/Exact"}}})
+    rows = {r["key"]: r for r in inv.build_inventory(_isolate_home, runtime="codex")}
+    assert rows["relevance.fine_model"]["current"] == "CV/Exact"
+    assert rows["relevance.fine_model"]["target_key"] == "runtimes.codex.model"
+    assert rows["relevance.fine_model"]["effective_source"] == "runtime"
+
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -112,16 +120,13 @@ def test_deprecated_keys_are_flagged_not_hidden(_isolate_home):
     assert dep["desc"], "废弃键也要说明为什么废弃、改用哪个键"
 
 
-def test_retired_codex_switch_is_flagged_deprecated(_isolate_home):
-    """2.0.0 移除 Codex 后 `runtimes.codex.enabled` 失效；迁移脚本给每台迁移过的机器都写过它，
-    必须在清单里以「已废弃」出现，而不是消失或混在生效项里。"""
+def test_codex_switch_is_active_and_preserves_explicit_false(_isolate_home):
+    """恢复 Codex 后，旧用户显式关闭的宿主仍须显示为关闭。"""
+    _write_config(_isolate_home, {"runtimes": {"codex": {"enabled": False}}})
     by_key = {it["key"]: it for it in inv.build_inventory(home=_isolate_home)}
     dep = by_key["runtimes.codex.enabled"]
-    assert dep["status"] == "deprecated"
-    # 1.x 里该键只关掉被误判成 Codex 的 SessionStart；等价替代只有 session_start.enabled。
-    # runtimes.claude.enabled 会把 SessionStart 与 UPS 两个入口一起关掉，不得列为替代。
-    assert "session_start.enabled" in dep["desc"]
-    assert "runtimes.claude.enabled" not in dep["desc"]
+    assert (dep["status"], dep["current"], dep["source"]) == ("active", False, "explicit")
+    assert by_key["runtimes.claude.enabled"]["current"] is True
 
 
 def test_keys_without_documentation_are_marked_not_blank(_isolate_home):
@@ -270,3 +275,31 @@ def test_strict_read_tells_unreadable_from_empty(_isolate_home, text, readable):
 def test_strict_read_of_missing_file_is_readable_and_empty(_isolate_home):
     data, _p, exists, ok = inv.read_raw_config_strict(_isolate_home)
     assert (data, exists, ok) == ({}, False, True)
+
+
+def test_codex_inventory_exposes_effective_inheritance(_isolate_home):
+    _write_config(_isolate_home, {"relevance": {"fine_model": "Org/Legacy", "fine_catalog": False}})
+    items = {it["key"]: it for it in inv.build_inventory(home=_isolate_home)}
+    model = items["runtimes.codex.model"]
+    catalog = items["runtimes.codex.relevance.fine_catalog"]
+    assert model["current"] == "Org/Legacy"
+    assert catalog["current"] is False
+    assert model["effective_source"] == "legacy-explicit"
+    assert catalog["effective_source"] == "relevance.fine_catalog"
+    assert model["source"] == catalog["source"] == "default"
+    rendered = inv.render([model, catalog])
+    assert "legacy-explicit" in rendered and "relevance.fine_catalog" in rendered
+
+
+def test_codex_inventory_native_and_explicit_overrides(_isolate_home):
+    _write_config(_isolate_home, {"runtimes": {"codex": {"model": "Org/Codex",
+                   "relevance": {"fine_rank": True, "fine_catalog": False}}}})
+    rows = {it["key"]: it for it in inv.build_inventory(home=_isolate_home)}
+    assert rows["runtimes.codex.model"]["current"] == "Org/Codex"
+    assert rows["runtimes.codex.model"]["effective_source"] == "runtime"
+    assert rows["runtimes.codex.relevance.fine_catalog"]["current"] is False
+    _write_config(_isolate_home, {})
+    rows = {it["key"]: it for it in inv.build_inventory(home=_isolate_home)}
+    assert rows["runtimes.codex.model"]["current"] is None
+    assert rows["runtimes.codex.model"]["effective_source"] == "codex-native"
+    assert rows["runtimes.codex.relevance.fine_rank"]["current"] is False

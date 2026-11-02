@@ -38,7 +38,7 @@ This file is the resident project guidance for Claude Code; detailed rule bodies
 
 ## 项目概述
 
-`context-vault`（仓库目录历史名 `claude-vault`）是一个跨平台（macOS / Linux / Windows）、面向 Claude Code 的插件（2.0.0 起不再支持 Codex），把四个 skill 与一组 hook 打包成「知识库沉淀—召回」闭环（其中三个构成闭环本体，第四个 `config` 是运维入口）。面向中文笔记工作流调优。
+`context-vault`（历史目录 `claude-vault`）是跨平台的 Claude Code / Codex 知识库插件：三个闭环 skill、配置入口与 Codex 本地面板入口。两宿主共享 Vault，隔离运行状态。
 
 ## 架构大图
 
@@ -65,7 +65,7 @@ Read 到匹配文件时 rules 会自动注入；上下文里已出现该 rules �
 - **所有 hook fail-open**：顶层 `try/except` 兜底 `exit 0`，任何 hook 都不得阻断会话。
 - 不得从当前目录解析程序名：「`which` 后执行」用 `which_no_cwd`（例外 `_topic._call_model`，勿「统一」；裸调用点由白名单守卫登记）；summarize-session 的 CLI 与两个 hook 入口在 `__main__` 块先调 `harden_exe_search()`（Windows 设变量、POSIX 过滤 PATH）；两份 helper 的函数定义由守卫保持一致。
 - `run-hook.cmd` 是 polyglot（同一文件既是 batch 又是 POSIX sh），两种解释器都要能解析，保持 LF 行尾；宿主三个平台都只走 sh 段（只用 POSIX sh 构造，探测前丢弃 PATH 的空条目与相对条目），batch 段只在 cmd.exe 直接运行时执行；wrapper 按 `py` → `python3` → `python` 探测，找不到即静默 `exit 0`。
-- 宿主恒为 Claude（2.0.0 起没有宿主识别）；入口只对带 `hook_event_name` 的 payload 做事件去重，事件 marker 用 `O_EXCL`。state 与 metrics 按命名空间（legacy / claude）隔离，注入去重按 cwd，不按 session 切。
+- Claude 旧入口不改；Codex 只经 `codex_entry` 显式适配，按 v2 隔离状态，线程与代际不得混用；原生 UI 未验收。事件去重仍用 `O_EXCL`。
 - runtime 命名空间是进程级全局：新起的子进程、同一进程里的另一个 hook 入口，都必须各自配置；`_state` 与 `_metrics` 是两个独立全局。子进程用 `current_runtime()` 交出、`adopt_runtime()` 接收，走 argv 不走 stdin；`{claude}` 白名单与 `_safe_component` 清洗必须原样保留（只剩一个取值也不得当死代码删掉）。SessionStart 入口里不要把 `_metrics` 的 import 提到与 `_state.configure_context()` 并列（UPS 入口有 `_MetricsStub` 兜底，可以并列）。
 - `has_legacy_data()` 会被本类缺陷的副作用自举翻转：没有 committed 迁移标记的机器上，补配 `configure_context` 式的修复会静默空转。
 - 「宿主拒绝写入」不得永久静默：判据单点 `context_vault/degrade.py::is_host_write_denied`，命中即登记 `degraded` 诊断、由 `take_user_visible` 冷却后说一次；`_metrics` 的 prune 失败刻意不升级为诊断。
@@ -118,7 +118,7 @@ skill 驱动（`SKILL.md` 即编排逻辑，模式见其参数表），辅以 `s
 
 ## 分发边界（重要）
 
-并非所有目录都随插件分发。**git 跟踪 = 分发源**：`.claude-plugin/`、`context_vault/`、`hooks/`、`skills/`、`commands/`、`scripts/`、`tests/`、`images/`、`docs/MIGRATION.md`、README、CLAUDE.md、`.claude/rules/*.md`（规则正文，仅一层）、CHANGELOG.md、VERSION。
+并非所有目录都随插件分发。**git 跟踪 = 分发源**：`.agents/plugins/marketplace.json`、`.codex-plugin/plugin.json`、`.claude-plugin/`、`context_vault/`、`hooks/`、`skills/`、`commands/`、`scripts/`、`tests/`、`images/`、`docs/MIGRATION.md`、README、CLAUDE.md、`.claude/rules/*.md`（规则正文，仅一层）、CHANGELOG.md、VERSION。
 
 **本地开发工具 / 设计文档，被 `.gitignore` 排除、不分发**：
 - `packaging/` —— 作者私有发布工具：`build_plugin.py`（脱敏闸门，见 `.claude/rules/distribution.md`）、`import_assets.py`（从 `~/.claude` 源 allowlist 同步资产到插件目录）。
@@ -135,7 +135,7 @@ skill 驱动（`SKILL.md` 即编排逻辑，模式见其参数表），辅以 `s
 
 **推送策略（强制）**：私有开发远端承载完整开发历史、接受全部 ref；**公开仓库与内网镜像只接受发布分支 `master` 与 tag**。由 `.git/hooks/pre-push` 守卫，两道判据——ref 名 + 谱系（`git merge-base origin/master <sha>` 失败即属 `dev` 谱系）。后者是实质防线：把 `dev` 改名成 `master` 推送同样拦得住。守卫 **fail-closed**（与 hook 的 fail-open 相反）：`origin/master` 缺失即拒绝，绕过需 `--no-verify`。源副本在 `packaging/hooks/pre-push`（不分发，换机需重装）。
 
-**发布流程（重要）**：对外发布为每版一笔 squash 提交——master 是独立谱系，该提交的树等于待发布那一版 dev 提交的树（重做已打 tag 的版本时钉死该版原有的树，不取当前 dev），父提交是原 master tip，另打注解标签 `v<版本>`。禁止把 `dev` 或其任何衍生分支推向公开或内网远端：脱敏闸门只扫工作树、不扫 git 历史。发布时同步 bump 三处版本号：`VERSION`、`.claude-plugin/plugin.json`、`.claude-plugin/marketplace.json` 的自身条目（守卫 `tests/test_plugin_version_sync.py`）；别靠记忆数这几个文件，跑门禁（`packaging/run_gates.py`，仅作者主检出）。
+**发布流程（重要）**：对外发布为每版一笔 squash 提交——master 是独立谱系，该提交的树等于待发布那一版 dev 提交的树（重做已打 tag 的版本时钉死该版原有的树，不取当前 dev），父提交是原 master tip，另打注解标签 `v<版本>`。禁止把 `dev` 或其任何衍生分支推向公开或内网远端：脱敏闸门只扫工作树、不扫 git 历史。发布时同步 `VERSION`、两宿主 `plugin.json`、marketplace 自身条目的版本（守卫 `tests/test_plugin_version_sync.py`）；运行 `packaging/run_gates.py`（仅作者主检出）。
 
 ## 开发与测试
 
@@ -170,4 +170,4 @@ python -m pytest packaging/
 - vault-loader 对 Vault 只读；summarize-session 是唯一写入方（且只追加/新建，不删除已有笔记；`summary` 可在备份后替换）。
 - git 跟踪文件中不写 Obsidian `[[...]]` wikilink（vault 是个人知识库层、不随仓库分发）。
 - 文档以中文为主；但分发内容必须通过 `build_plugin.py` 脱敏扫描（零私人标识）。
-- 分发的 SKILL.md / references 必须优先按当前加载的 `SKILL.md` 绝对路径定位同级 scripts；仅 Claude Bash 无法取得该路径时允许搜索 `~/.claude/plugins/cache/`，同时识别 `context-vault` 与旧 `claude-vault`。不得跨到 `~/.codex` 取脚本（那里只可能是停止更新的 1.x 副本），也不得使用 `~/.claude/skills/.../scripts/` 源目录形式。skill shell 不得假设注入 `CLAUDE_PLUGIN_ROOT`；PowerShell 必须使用当前 skill 的绝对 scripts 路径。
+- 分发 skill 优先按当前 `SKILL.md` 绝对路径定位同根脚本；不得跨宿主搜索缓存或使用退役源 skills 目录。shell 不假设 `CLAUDE_PLUGIN_ROOT`；PowerShell 使用脚本绝对路径。

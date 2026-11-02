@@ -301,7 +301,7 @@ class FakePopen:
 
 
 def test_spawn_does_not_block(tmp_path: Path, monkeypatch) -> None:
-    """承重守卫：spawn 必须立即返回（UPS 有 300 ms 预算，精排一次约 10 s）。
+    """承重守卫：spawn 必须立即返回（UPS 有独立同步预算，精排一次约 10 s）。
 
     阈值 1.0s 的依据（本机实测，各 n=30，FakePopen 不起真进程）：健康态 spawn（当时还含 in-flight 写）
     median 12.3ms / max 39.5ms；阻塞态（真等子进程跑完 LLM）中位 21s。两侧几何中心约 1.24s，取 1.0s。

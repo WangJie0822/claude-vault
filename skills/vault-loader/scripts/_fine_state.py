@@ -51,7 +51,7 @@ STATS_Q_MAX = 5
 STREAK_LIMIT = 2
 DISABLE_COOLDOWN_SEC = 1800        # 【初值】streak 停用满 30 分钟可恢复（F66）
 LOCK_TIMEOUT_SEC = 0.25
-DISABLED_REASONS = ("streak", "no_claude", "call_cap", "bytes_cap")
+DISABLED_REASONS = ("streak", "no_claude", "no_codex", "call_cap", "bytes_cap")
 # 与 `_topic.PENDING_GRACE_SEC` 同值（parity 用例钉住）。不 import `_topic`：UPS 与子进程都会导入本模块，
 # `_topic` 带着子进程管理与模板，没必要为一个常量把它拉进来
 PENDING_GRACE_SEC = 30
@@ -65,6 +65,9 @@ _MAX_PATH_CHARS = 512
 _MAX_SUPP_PATHS = 8                # = fine_max_notes 的硬上限
 _MAX_MARKER_BYTES = 4096
 _TMP_TTL_SEC = 3600
+# 终结清理只在失败时等待；最多五次尝试、四次20ms间隔，不等待标记自然过期。
+_INFLIGHT_RELEASE_ATTEMPTS = 5
+_INFLIGHT_RELEASE_RETRY_SEC = 0.02
 STATS_KEYS = ("gen_id", "mode", "ok", "fail", "none", "n_sel", "n_echo_mismatch",
               "n_catalog", "n_catalog_dropped", "n_summary_layer", "bytes", "degraded")
 # stats_q 里 `degraded`（子进程的降级码列表）的上限：码表现有 5 个，每个都是短 ASCII 枚举
@@ -98,7 +101,7 @@ def fine_dir() -> Path:
     """按**调用时**生效的命名空间取目录（与 `_state.session_topics_path` 同一判定）。"""
     rt = _state.current_runtime()
     if rt != "legacy":
-        return _state.context_home() / "state" / rt / "fine"
+        return _state.canonical_state_root() / "fine"
     return Path.home() / ".claude" / "vault-loader-fine"
 
 
@@ -173,7 +176,8 @@ def _clean_settings(v) -> dict:
             continue
         if isinstance(x, float) and not math.isfinite(x):
             continue
-        if isinstance(x, str) and len(x) > _MAX_SETTING_STR:
+        limit = 128 if _state.current_runtime() == "codex" and k == "fine_model" else _MAX_SETTING_STR
+        if isinstance(x, str) and len(x) > limit:
             continue
         if isinstance(x, (bool, int, float, str)):
             out[k] = x
@@ -404,10 +408,35 @@ def claim_inflight(session_id: str, gen_id: str, timeout_sec: int, now: float) -
 
 
 def release_inflight(session_id: str, gen_id: str) -> None:
+    """有界重试自己的在飞标记；每次重读 owner，换 gen 即停止，正常释放不等待。"""
     p = inflight_path(session_id)
-    m = _marker_read(p)
-    if m is not None and gen_id and m["gen_id"] == gen_id:
-        _unlink_quiet(p)
+    if p is None or not isinstance(gen_id, str) or not gen_id:
+        return
+    last_error = "标记暂不可读"
+    for attempt in range(_INFLIGHT_RELEASE_ATTEMPTS):
+        # 不复用上次读到的owner；读取失败合成的corrupt也不能当作所有权依据。
+        m = _marker_read(p)
+        if m is None:
+            try:
+                os.lstat(p)
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                last_error = str(exc)
+        elif not m.get("corrupt"):
+            if m["gen_id"] != gen_id:
+                return
+            try:
+                p.unlink()
+                return
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                # Windows轮询读句柄会暂时阻止unlink；错误不能吞成永久残留。
+                last_error = str(exc)
+        if attempt + 1 < _INFLIGHT_RELEASE_ATTEMPTS:
+            time.sleep(_INFLIGHT_RELEASE_RETRY_SEC)
+    _warn_once("inflight_release", f"[vault-loader] 在飞标记清理重试耗尽：{last_error}")
 
 
 def release_expired_inflight(session_id: str, now: float) -> bool:
@@ -517,15 +546,28 @@ def cleanup_fine(ttl_hours: float, now: "float | None" = None) -> int:
     return removed
 
 
-def purge_fine(home: "Path | None" = None) -> int:
-    """`analyze_metrics --purge` 用：删掉两个命名空间下本模块写出的全部文件，空目录一并删除。
-
-    canonical 只有 `claude` 一个命名空间（2.0.0 起白名单只剩它），legacy 在 `~/.claude/vault-loader-fine`。
-    """
+def purge_fine(home: "Path | None" = None, *, runtimes=None) -> int:
+    """仅清指定宿主；未传参保留原 Claude canonical + legacy 清理范围。"""
     base = home or Path.home()
     removed = 0
-    for d in (_state.context_home(base) / "state" / "claude" / "fine",
-              base / ".claude" / "vault-loader-fine"):
+    selected = ("claude", "legacy") if runtimes is None else runtimes
+    directories = []
+    for runtime in selected:
+        if runtime == "legacy":
+            directories.append(base / ".claude" / "vault-loader-fine")
+        elif runtime == "claude":
+            directories.append(_state.context_home(base) / "state/claude/fine")
+        elif runtime == "codex":
+            from context_vault.paths import storage_root
+            root = storage_root(base, host=runtime, kind="state")
+            chain = (root, root.parent, root.parent.parent, _state.context_home(base),
+                     root / "fine", root / "fine/slots")
+            if any(_is_link_like(p) for p in chain):
+                raise OSError("refusing linked Codex fine storage")
+            directories.append(root / "fine")
+        else:
+            raise ValueError("unsupported fine namespace")
+    for d in directories:
         for sub, pats in ((d / "slots", (_SLOT_NAME,)),
                           (d, (_JSON_NAME, _LOCK_NAME, _TMP_NAME, _INFLIGHT_NAME))):
             for ent in list(_own_regular_files(sub, pats)):

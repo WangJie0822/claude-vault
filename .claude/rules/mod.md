@@ -1,5 +1,12 @@
 ---
 paths:
+  - "context_vault/panel/**/*"
+  - "context_vault/control.py"
+  - "context_vault/panel_server.py"
+  - "context_vault/panel_launcher.py"
+  - "context_vault/panel_view.py"
+  - "context_vault/structured_read.py"
+  - "scripts/vault_control.py"
   - "hooks/vault-mod.js"
   - "hooks/vault-mod.d.ts"
   - "skills/vault-loader/scripts/_session_ops.py"
@@ -12,6 +19,10 @@ paths:
 > 本文件是 CLAUDE.md「硬约束索引 · mod（注入可见与可控）」的正文。
 
 ## 现行补充
+
+### Codex 本地控制
+
+- Codex 复用 `control`，queued 不冒充 applied；细则见 README「Codex 面板与文本控制」，原生 UI 未验收。
 
 - 通道：mod 在 `classic.UserPromptSubmit` 的 `next()` 之前写按轮请求文件 `state/live/<sid_h>-<prompt_id>.req.json`，事件 `e` 原样传递；Python 只凭 stdin 的 `session_id` / `prompt_id` 算路径，读完即删。**不要改回「往 e 里加字段」**：settings hook 收到的 stdin（含 HTTP、prompt、agent 类）会一并收到这些笔记路径与标注，且「新增字段进 stdin」只有实测、文档未写。
 - 快照只在本轮请求存在过时写，所有出口经 `TurnReport.finalize` 统一写：停用类 `disabled`、闸门经 `_stage_gate_record` 记 `gate:<reason>`、召回路径 `scored` / `dry_run`。重复事件既不写快照也不删请求：请求属于抢到事件的那个进程，删掉会让它读空。新增出口不用逐个改，但新增闸门必须走 `_stage_gate_record`。

@@ -8,6 +8,14 @@ def context_home(home: Path | None = None) -> Path:
     return (home or Path.home()) / ".context-vault"
 
 
+def storage_root(home: Path, *, host: str, kind: str) -> Path:
+    """在用宿主的固定代际；旧 Codex 数据不在此映射内。"""
+    if host not in {"claude", "codex"} or kind not in {"state", "metrics"}:
+        raise ValueError("unsupported storage namespace")
+    base = context_home(home) / kind / host
+    return base / "v2" if host == "codex" else base
+
+
 def canonical_config(home: Path | None = None) -> Path:
     return context_home(home) / "config.json"
 

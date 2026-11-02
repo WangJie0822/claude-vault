@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from pathlib import Path
 
 import pytest
 
-from scripts.migrate_context_vault import apply_migration, inspect
+_spec = importlib.util.spec_from_file_location("cv_migration_test", Path(__file__).resolve().parents[1] / "scripts/migrate_context_vault.py")
+migration = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(migration)
+apply_migration, inspect = migration.apply_migration, migration.inspect
 
 
 def _write(path: Path, data: dict) -> None:
@@ -61,7 +65,6 @@ def test_apply_failure_before_config_commit_is_retryable(monkeypatch, tmp_path):
     metrics = tmp_path / ".claude/vault-loader-metrics/2026-08/s1.jsonl"
     metrics.parent.mkdir(parents=True)
     metrics.write_text('{}\n', encoding="utf-8")
-    import scripts.migrate_context_vault as migration
     real_copytree = migration.shutil.copytree
     failed = False
 
@@ -89,7 +92,7 @@ def test_failed_migration_cleans_up_its_staging(tmp_path, monkeypatch):
     """
     import shutil as _shutil
 
-    from scripts import migrate_context_vault as M
+    M = migration
 
     home = tmp_path / "home"
     legacy = home / ".claude" / "skills" / "vault-loader"

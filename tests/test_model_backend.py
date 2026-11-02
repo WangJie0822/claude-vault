@@ -9,6 +9,38 @@ import pytest
 from context_vault import model
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+@pytest.mark.parametrize("host", ["claude", "codex"])
+def test_configured_selection_accepts_bom_without_changing_precedence(tmp_path, monkeypatch, encoding, host):
+    import json
+    monkeypatch.setenv("HOME", str(tmp_path)); monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    config = tmp_path / ".context-vault/config.json"
+    config.parent.mkdir()
+    raw = {"relevance": {"fine_model": "Legacy"}, "runtimes": {"codex": {
+        "model": "CV/Runtime", "profile": "work", "model_provider": "gateway"}}}
+    config.write_text(json.dumps(raw), encoding=encoding)
+    selected = model.configured_selection(host)
+    assert selected.model == ("CV/Runtime" if host == "codex" else "Legacy")
+    assert selected.profile == ("work" if host == "codex" else None)
+    assert selected.provider == ("gateway" if host == "codex" else None)
+    task = model.configured_selection(host, task_model="Task")
+    assert task.model == "Task" and task.source == "task"
+    assert (task.profile, task.provider) == (selected.profile, selected.provider)
+    config.write_text("{}", encoding=encoding)
+    native = model.configured_selection(host)
+    assert native.model == (None if host == "codex" else "haiku")
+    assert native.source == ("codex-native" if host == "codex" else "claude-default")
+
+
+@pytest.mark.parametrize("content", [b"\xef\xbb\xbf{", b"\xef\xbb\xbf[]", b"\xff\xfe"])
+def test_configured_selection_rejects_bad_configuration(tmp_path, monkeypatch, content):
+    monkeypatch.setenv("HOME", str(tmp_path)); monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    config = tmp_path / ".context-vault/config.json"; config.parent.mkdir()
+    config.write_bytes(content)
+    with pytest.raises(ValueError, match="model config"):
+        model.configured_selection("codex", task_model="CV/Task")
+
+
 def test_backend_auto_requires_claude_plugin_root(monkeypatch):
     """auto 只在 Claude Code 的 hook / skill 环境里成立；Codex 的 PLUGIN_ROOT 不再有任何作用。"""
     monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
@@ -19,13 +51,12 @@ def test_backend_auto_requires_claude_plugin_root(monkeypatch):
     assert model.choose_backend("auto") == "claude"
 
 
-def test_backend_rejects_codex():
-    with pytest.raises(ValueError, match="unsupported backend"):
-        model.choose_backend("codex")
+def test_backend_accepts_explicit_codex():
+    assert model.choose_backend("codex") == "codex"
 
 
-def test_codex_backend_is_removed():
-    assert not hasattr(model, "call_codex")
+def test_codex_backend_facade_keeps_claude_compatibility():
+    assert callable(model.call_codex)
     assert not hasattr(model, "KEYWORDS_SCHEMA")
 
 

@@ -104,6 +104,23 @@ def set_keywords(vault: pathlib.Path, target: str, raw_keywords: list) -> dict:
 
 
 def _sync_cache_entry(vault: pathlib.Path, rel: str, kws: list[str]) -> bool:
+    from _fs import _acquire_lock, _release_lock
+    cp = vault / '.meta' / 'frontmatter-cache.json'
+    if not cp.is_file():
+        return False
+    lock = str(cp) + '.lock'
+    try:
+        if not _acquire_lock(lock, timeout=10):
+            return False
+    except OSError:
+        return False
+    try:
+        return _sync_cache_entry_locked(vault, rel, kws)
+    finally:
+        _release_lock(lock)
+
+
+def _sync_cache_entry_locked(vault: pathlib.Path, rel: str, kws: list[str]) -> bool:
     """把新 keywords 同步进 frontmatter-cache 的对应 entry。返回是否同步成功。
 
     **这一步不是优化，是正确性必需**：rebuild_index 的增量判据是

@@ -1923,10 +1923,9 @@ def main() -> int:
     # --show-paths 是 --report 的修饰项，不参与互斥
     ap.add_argument("--show-paths", action="store_true")
     ap.add_argument(
-        "--runtime", choices=("auto", "legacy", "claude", "all"), default="auto",
+        "--runtime", choices=("auto", "legacy", "claude", "codex", "all"), default="auto",
         help="metrics 命名空间。auto：canonical 配置存在时等同 all，否则等同 legacy。"
-             "all：legacy 与 claude；并处理 2.0.0 退役的 metrics/codex/——--purge 整目录删除"
-             "（含 .salt），--reset-counts 只删其中 near_miss_counts.json 与 nudge_ts.json",
+             "all：legacy、claude 与 codex v2；旧 codex 数据保留原位，不自动迁移或删除。",
     )
     args = ap.parse_args()
     home = Path.home()
@@ -1938,11 +1937,19 @@ def main() -> int:
     # 原样留在盘上（含加盐 hash、明文笔记路径、明文 session id、不可再生的人工标注）。
     # 漏掉它时 `--purge` 只清一半却报告「已清空 N 个数据文件」，`--report` 也看不到
     # 那半边——「没有数据」与「数据在另一个命名空间」不可区分。
-    runtimes = ("legacy", "claude") if selected == "all" else (selected,)
+    runtimes = _metrics.ACTIVE_RUNTIMES if selected == "all" else (selected,)
     # 按映射后的实际目录去重：canonical config 存在而迁移未提交时，`configure_context`
     # 把 claude 映射回 legacy，两项指向同一个目录——不去重时 `--report` 的事件数翻倍，
     # `--purge` 把同一目录扫两遍并打印两次（full-review P2B-E1）。退役目录仍按 `selected` 判。
     runtimes = _distinct_runtimes(runtimes, home)
+    if selected == "all" and (args.review or args.review_web):
+        # 尚未使用 Codex 的 Claude 用户保留原有交互入口；不以空的新增目录制造歧义。
+        used = []
+        for runtime in runtimes:
+            _metrics.configure_context(runtime)
+            if runtime != "codex" or _metrics.metrics_dir(home).exists():
+                used.append(runtime)
+        runtimes = tuple(used)
 
     def all_records():
         for runtime in runtimes:
@@ -1983,7 +1990,8 @@ def main() -> int:
         n_live = 0
         try:
             from scripts import _session_ops
-            n_live = _session_ops.purge_live(home)
+            if selected != "codex":
+                n_live = _session_ops.purge_live(home)
         except Exception as exc:  # noqa: BLE001
             print(f"会话快照清理失败：{exc}", file=sys.stderr)
         n_fine = 0
@@ -1991,9 +1999,14 @@ def main() -> int:
             # 2.4.0 的 per-session 精排状态（spec 2026-10-13 §7 F57）：含本会话已注入的笔记路径，
             # 「一键清空」不能留它
             from scripts import _fine_state
-            n_fine = _fine_state.purge_fine(home)
+            # metrics 的目录去重不代表 fine 的目录去重；Claude 既有两套清理范围保留。
+            fine_runtimes = (_metrics.ACTIVE_RUNTIMES if selected == "all"
+                             else ("codex",) if selected == "codex" else ("claude", "legacy"))
+            n_fine = _fine_state.purge_fine(home, runtimes=fine_runtimes)
         except Exception as exc:  # noqa: BLE001
             print(f"精排状态清理失败：{exc}", file=sys.stderr)
+            if selected == "codex":
+                return 2
         # 把实际扫过的目录打出来：这是不可逆删除，用户必须能看出「漏了哪一个」。
         # 只报一个总数时，「清了 0 个」与「压根没扫到那个目录」完全不可区分。
         msg = f"已清空 {n} 个数据文件（扫描目录：{'、'.join(scanned)}）"
@@ -2012,7 +2025,7 @@ def main() -> int:
         return 0
     if args.review_web:
         if len(runtimes) != 1:
-            print("--review-web 必须显式指定 --runtime legacy|claude",
+            print("--review-web 必须显式指定 --runtime legacy|claude|codex",
                   file=sys.stderr)
             return 2
         _metrics.configure_context(runtimes[0])
@@ -2030,7 +2043,7 @@ def main() -> int:
 
     if args.review:
         if len(runtimes) != 1:
-            print("--review 必须显式指定 --runtime legacy|claude", file=sys.stderr)
+            print("--review 必须显式指定 --runtime legacy|claude|codex", file=sys.stderr)
             return 2
         _metrics.configure_context(runtimes[0])
         # 下面两条是**假设没有这层护栏**、裸 input() 会撞上的失败形态——正是这层

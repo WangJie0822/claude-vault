@@ -26,7 +26,7 @@ paths:
 - **受跟踪文件里不写 8-4-4-4-12 hex 的 UUID 字面量**，占位的也不行：作者的发布闸门把它当真实 session id 拦截，而 worktree 与分发副本里没有 `packaging/`，`test_no_secrets_in_tree` 在那里只扫通用规则、照样绿——2026-10-10 mod 子项目的 20 处占位 UUID 直到合入主检出才被拦下。需要合法 UUID 时运行时拼接（Python `"-".join((...))`、TS `[...].join('-')`），JSON 夹具写占位符、读时替换（实例：`test_session_ops.py` 的 `_fixture_text`）。
 - **Python 下限 3.9**（2026-10-09 作者决定）：除 `scan_sessions.py` 外，代码本来就按 3.9 写（`_note_paths.resolve_note_path` 用了 `Path.is_relative_to`，未做兼容）；`scan_sessions.py` 签名里的 `X | Y` 自 1.1.0 起让它在 3.9 上无法导入，到 2.0.0 的 full-review 才发现（`git log -S"str | None = None" -- skills/summarize-session/scripts/scan_sessions.py`）。守卫 `tests/test_python_floor.py` 查哪几类、不查什么、哪些写法会多报，都写在它的 docstring 里。两点要记住：`ast.parse` 的 `feature_version` 实测会放过 3.12 的 f-string 新写法、3.11 的 `a[*b]` 与 3.10 不加括号的 `:=`，所以守卫另用 AST / token 规则逐类补查；运行期 API（如 `zip(strict=)`、3.10 及以下的 `fromisoformat` 不认末尾 `Z`）守卫查不到，本机只有新版解释器时，要打桩还原旧行为来测（实例：`test_scan_sessions_claude.py` 的 `_Py310Datetime`）。
 
-现状订正（「## 迁移原文」里以现在时写的两处已失效）：summarize-session 在 Windows 上已没有「环境性失败」，obsidian_cli 那批用例已按平台分支改写；`test_perf.py` 的判据已是 median of 7 加一次预热，不再是「3 次 spawn 取最差值」。
+现状订正：summarize-session 的 Windows 用例已按平台改写；`test_perf.py` 用一次预热、七次 median，预算见 `_budget_seconds`（Windows 650/750ms，其它平台300/500ms）。迁移原文中的「3次取最差」与「阈值未放松」均属历史。
 
 ## 迁移原文（基线 `3ac359f`）
 

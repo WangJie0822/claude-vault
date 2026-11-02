@@ -100,14 +100,14 @@ _KEEP = object()
 
 # topics entry 的提炼状态（spec 2026-10-12 §3.2）。白名单：读端遇到集合外的值一律归 failed / error。
 TOPIC_STATES = ("pending", "ok", "failed")
-TOPIC_FAILS = ("no_claude", "timeout", "exit_nonzero", "error")
+TOPIC_FAILS = ("no_claude", "no_codex", "isolation_failed", "timeout", "exit_nonzero", "error")
 # 本轮 spawn 结果里表示「发起不了」的两种（describe 据此显示 unavailable，节点 1 T7）
-_UNAVAILABLE = ("no_claude", "spawn_error")
+_UNAVAILABLE = ("no_claude", "no_codex", "spawn_error")
 # describe_session_topic 输出的 state / fail 全集，即快照 `llm` 的值域；mod 侧 LLM_TEXT / FAIL_TEXT
 # 的键必须与它逐一相同（`test_session_ops_snapshot.py` 的 parity 用例）。保持元组：取值来自可篡改
 # 的 JSON，`x in 元组` 遇到 list / dict 只返回 False，frozenset 会抛 TypeError。
 LLM_STATES = ("off", "idle", "unavailable", "pending", "ok", "failed")
-LLM_FAILS = ("no_claude", "spawn_error", "timeout", "exit_nonzero", "lost", "error", "dry_run", "bad_model")
+LLM_FAILS = ("no_claude", "no_codex", "isolation_failed", "spawn_error", "timeout", "exit_nonzero", "lost", "error", "dry_run", "bad_model")
 
 # topics entry 的 ts 允许比本机时钟超前多少秒（时钟回拨的余量）。超前更多的视为无效：伪造的
 # 未来 ts 否则永不过期，且会在条数淘汰时把刚写入的会话挤出去（full-review S-3）。
@@ -420,7 +420,7 @@ def describe_session_topic(cwd: Path, session_id: str, config: dict, *,
         out["disabled"] = dr if dr in _fine_state.DISABLED_REASONS else None
     if not topic_on:
         return out
-    bad_model = not validate_value("fine_model", rel.get("fine_model", TOPIC_MODEL))[0]
+    bad_model = False if getattr(config, "host", None) == "codex" else not validate_value("fine_model", rel.get("fine_model", TOPIC_MODEL))[0]
 
     def _done(o: dict) -> dict:
         if bad_model and o["fail"] is None and o["state"] in ("idle", "pending", "ok"):
@@ -607,6 +607,8 @@ PENDING_GRACE_SEC = 30
 # 精排子调用的模型与超时（spec 2026-10-13 D8 / §6.2）：子进程按 stdin 里的有效配置改写这两个
 # 模块级变量，`_call_model` 签名因此不变（约 13 处测试替身直接替换它，节点 1 T5）。
 _MODEL = TOPIC_MODEL
+_BACKEND = "claude"
+_MODEL_SELECTION = {}
 _TIMEOUT = TOPIC_TIMEOUT_SEC
 # 不加载用户 / 项目 / 本地 settings、CLAUDE.md、hooks、MCP 与 skill（D8；2.3.0 在会话环境、近似普通
 # 终端、内网第三方 provider 三种启动方式下实测连通）。与 context_vault.model._ISOLATION 逐字相同，
@@ -1011,6 +1013,16 @@ def _run_tree_capped(argv, input_text: str, timeout: float, env: dict, cwd: str)
     return proc.returncode, out
 
 
+def _codex_backend():
+    """只在 Codex 子调用分支按插件绝对路径加载标准库模块。"""
+    import importlib.util
+    path = Path(__file__).resolve().parents[3] / "context_vault/codex_model.py"
+    spec = importlib.util.spec_from_file_location("_cv_codex_model", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _call_model(prompt_text: str) -> str | None:
     """同步调模型。**只在子进程里跑**，父进程永远不碰它。
 
@@ -1033,6 +1045,12 @@ def _call_model(prompt_text: str) -> str | None:
     直接替换本函数，改返回形态会让它们静默解包出错（节点 1 T5）。
     """
     global _LAST_FAIL
+    if _BACKEND == "codex":
+        backend = _codex_backend()
+        result = backend.call_codex(prompt_text, selection=_MODEL_SELECTION, timeout=_TIMEOUT,
+            runner=lambda argv, *, input, timeout, env, cwd: _run_tree_capped(argv, input, timeout, env, cwd))
+        _LAST_FAIL = backend.LAST_FAIL
+        return result
     model = _MODEL if isinstance(_MODEL, str) and MODEL_RE.fullmatch(_MODEL) else TOPIC_MODEL
     timeout = _TIMEOUT
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not timeout > 0:
@@ -1093,7 +1111,7 @@ def build_fine_payload(mode: str, *, prompt: str, config: dict, gen_id: str, src
     ss = cfg.get("session_start", {}) or {}
     sc = cfg.get("scoring", {}) or {}
     vp = cfg.get("vault_path")
-    return {
+    result = {
         "v": 1, "mode": mode, "gen_id": gen_id, "src_seq": int(src_seq), "slot": slot,
         "prompt": prompt if isinstance(prompt, str) else "",
         "transcript_path": transcript_path if isinstance(transcript_path, str) else "",
@@ -1129,10 +1147,32 @@ def build_fine_payload(mode: str, *, prompt: str, config: dict, gen_id: str, src
         "prev_words": _strs(prev_words, MAX_TOPIC_WORDS),
         "extra_paths": _strs(extra_paths, 20),
     }
+    if getattr(config, "host", None) == "codex":
+        from dataclasses import asdict
+        selection = getattr(config, "model_selection", None)
+        result["cfg"]["backend"] = "codex"
+        result["cfg"]["model_selection"] = (asdict(selection) if selection is not None else
+            {"backend": "codex", "model": get_value(cfg, "fine_model"), "profile": None,
+             "provider": None, "source": "codex-native"})
+        result["cfg"]["model"] = result["cfg"]["model_selection"]["model"]
+        ref = getattr(config, "session_ref", None)
+        result["session_source"] = {
+            "host": "codex", "home": str(Path.home()),
+            "codex_home": os.environ.get("CODEX_HOME", str(Path.home() / ".codex")),
+            "thread_id": getattr(ref, "thread_id", ""),
+            "state_session_id": getattr(config, "state_session_id", getattr(ref, "thread_id", "")),
+            "cwd": str(getattr(ref, "cwd", "")),
+            "transcript_path": str(getattr(ref, "transcript_path", "")),
+            "before": getattr(config, "trigger_timestamp", ""),
+        }
+        if hasattr(config, "context_epoch"):
+            result["codex_context"] = {"thread_id": getattr(ref, "thread_id", ""),
+                                       "epoch": config.context_epoch}
+    return result
 
 
 def spawn_fine(cwd: Path, session_id: str, payload: dict) -> str:
-    """detached 拉起精排子进程，**立即返回**：UPS 有 300 ms 预算，一次精排约 10 s（spec §2）。
+    """detached 拉起精排子进程，**立即返回**：UPS 有独立同步预算，一次精排约 10 s（spec §2）。
 
     返回 `spawned` / `no_claude` / `spawn_error`，同时记进 `_LAST_SPAWN`（由 `take_spawn_outcome` 取走，
     不落盘：父进程找不到 claude 时事后读文件分不出「没装 claude」与「尚未发起」，节点 1 T7）。
@@ -1151,9 +1191,10 @@ def spawn_fine(cwd: Path, session_id: str, payload: dict) -> str:
     global _LAST_SPAWN
     _LAST_SPAWN = None
     try:
-        if shutil.which("claude") is None:
-            _LAST_SPAWN = "no_claude"
-            return "no_claude"
+        backend = payload.get("cfg", {}).get("backend", "claude")
+        if (_codex_backend().find_codex() if backend == "codex" else shutil.which("claude")) is None:
+            _LAST_SPAWN = "no_codex" if backend == "codex" else "no_claude"
+            return _LAST_SPAWN
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         # runtime 走 **argv 而不是 payload**：子进程读坏 payload 时按空 payload 记失败，决定写盘落点的参数要是
         # 跟 payload 一起丢了，失败记录与后续写回会静默回落 legacy。取 `current_runtime()` 而不是让调用方传：
@@ -1234,9 +1275,9 @@ def _record_result(session_id: str, *, mode: str, src_seq: int, gen_id: str, ok:
                     st.supp = {"gen_id": gen_id, "src_seq": src_seq, "paths": list(paths), "ts": now}
         else:
             st.last_fail = fail
-            if fail == "no_claude":
+            if fail in ("no_claude", "no_codex"):
                 if st.disabled_reason is None:
-                    st.disabled_reason, st.disabled_at = "no_claude", now
+                    st.disabled_reason, st.disabled_at = fail, now
             else:
                 st.fail_streak = int(st.fail_streak or 0) + 1
                 if st.fail_streak >= _fine_state.STREAK_LIMIT and st.disabled_reason is None:
@@ -1252,27 +1293,55 @@ def _record_result(session_id: str, *, mode: str, src_seq: int, gen_id: str, ok:
         _fine_write(session_id, mutate)
 
 
-def _child_main(cwd: Path, session_id: str, payload: dict, gen_id: "str | None") -> None:
-    """精排子进程主体（spec §6.2–§6.4）。所有失败都经 `_record_result` 记成 fine 状态的失败计数。
+def _result_guard(payload):
+    if "codex_context" in payload:
+        from context_vault.lifecycle import result_guard
+        return result_guard(payload, home=Path.home())
+    from contextlib import nullcontext
+    return nullcontext(True)
+
+
+def _commit_child_result(session_id, payload, *, mode, src_seq, gen_id, ok, fail, paths, stats, apply=None):
+    """所有结果出口共用代际栅栏；旧结果只入账用量，不写内容、失败或停用状态。"""
+    with _result_guard(payload) as current:
+        if not current:
+            from . import _fine_state
+            saved = dict(stats, ok=True, fail=None, none=True, n_sel=0,
+                         degraded=list(stats.get("degraded", [])) + ["stale_epoch"])
+            def usage_only(st):
+                st.stats_q = (list(st.stats_q or []) + [saved])[-_fine_state.STATS_Q_MAX:]
+                return st
+            _fine_write(session_id, usage_only)
+            return
+        if apply is not None:
+            apply()
+        _record_result(session_id, mode=mode, src_seq=src_seq, gen_id=gen_id,
+                       ok=ok, fail=fail, paths=paths, stats=stats)
+
+
+def _child_main(cwd: Path, session_id: str, payload: dict, gen_id: "str | None", *, stats=None) -> None:
+    """精排子进程主体（spec §6.2–§6.4）。所有结局经统一代际提交；当前代际失败才增加失败计数。
 
     `_fine_input` / `_fine_state` 在这里导入（理由见模块顶部）：导入失败时异常交给 `run_extraction_child`，
-    按 `error` 记一次失败并释放在飞标记与槽位。"""
-    global _LAST_FAIL, _MODEL, _TIMEOUT
+    按 `error` 提交一次结局并释放在飞标记与槽位。"""
+    global _LAST_FAIL, _MODEL, _TIMEOUT, _BACKEND, _MODEL_SELECTION
     from . import _fine_state
     from ._fine_input import (build_fine_input, config_dir, exclusion_set, project_rels,
-                              recent_user_prompts, recent_work_titles, safe_transcript_path,
+                              recent_prompts_for_payload, recent_work_titles,
                               wide_recall_words, worklog_files)
     mode = payload.get("mode") if payload.get("mode") in _MODES else ""
     src_seq = payload.get("src_seq")
     if not isinstance(src_seq, int) or isinstance(src_seq, bool) or src_seq < 0:
         src_seq = -1
-    stats = _new_stats(gen_id or "", mode)
+    if stats is None:
+        stats = _new_stats(gen_id or "", mode)
     degraded: list = stats["degraded"]
 
-    def _done(ok: bool, fail: "str | None" = None, paths=()) -> None:
+    def _done(ok: bool, fail: "str | None" = None, paths=(), apply=None) -> None:
         stats.update(ok=ok, fail=None if ok else fail)
-        _record_result(session_id, mode=mode, src_seq=src_seq, gen_id=gen_id or "", ok=ok,
-                       fail=None if ok else fail, paths=list(paths), stats=dict(stats, degraded=list(degraded)))
+        _commit_child_result(session_id, payload, mode=mode, src_seq=src_seq, gen_id=gen_id or "", ok=ok,
+                             fail=None if ok else fail, paths=list(paths),
+                             stats=dict(stats, degraded=list(degraded)), apply=apply)
 
     vault = payload.get("vault_path")
     if (payload.get("v") != 1 or not mode or gen_id is None or src_seq < 0
@@ -1282,9 +1351,22 @@ def _child_main(cwd: Path, session_id: str, payload: dict, gen_id: "str | None")
         return
     cfg = payload.get("cfg") if isinstance(payload.get("cfg"), dict) else {}
     prompt = payload.get("prompt") if isinstance(payload.get("prompt"), str) else ""
-    ok_model, model = validate_value("fine_model", cfg.get("model"))
-    if not ok_model:
-        degraded.append("bad_model")         # spec §5.2：不合法回落 haiku，照常调用
+    _BACKEND = cfg.get("backend", "claude")
+    if _BACKEND == "codex":
+        selection = cfg.get("model_selection")
+        if not isinstance(selection, dict):
+            _done(False, "error")
+            return
+        _MODEL_SELECTION = dict(selection)
+        model = selection.get("model")
+    elif _BACKEND == "claude":
+        _MODEL_SELECTION = {}
+        ok_model, model = validate_value("fine_model", cfg.get("model"))
+        if not ok_model:
+            degraded.append("bad_model")         # Claude 既有非法模型回落。
+    else:
+        _done(False, "error")
+        return
     _MODEL = model
     _TIMEOUT = validate_value("fine_timeout_sec", cfg.get("timeout"))[1]
     pin_max = cfg.get("pin_max", 1)
@@ -1299,9 +1381,9 @@ def _child_main(cwd: Path, session_id: str, payload: dict, gen_id: "str | None")
         _done(False, "error")
         return
     root = _repo_root(cwd)
-    k_texts, kdeg = recent_user_prompts(
-        safe_transcript_path(payload.get("transcript_path"), session_id, config_dir()),
-        validate_value("fine_recent_prompts", cfg.get("recent_prompts"))[1], prompt)
+    k_texts, kdeg = recent_prompts_for_payload(
+        payload, validate_value("fine_recent_prompts", cfg.get("recent_prompts"))[1], prompt,
+        session_id=session_id, claude_dir=config_dir())
     if kdeg:
         degraded.append(kdeg)
     work = recent_work_titles(worklog_files(Path(vault), safe_int(cfg.get("recent_worklog_days", 7), 7)),
@@ -1319,10 +1401,11 @@ def _child_main(cwd: Path, session_id: str, payload: dict, gen_id: "str | None")
                  n_summary_layer=fin.n_summary_layer)
     if not fin.candidates:
         # 排除之后无候选：不调用（不付费），按 NONE 记成功；首轮模式写 ok 占住结论，免得每轮重试
-        if mode == "pin":
-            save_session_topic(cwd, session_id, [], pinned=[], accounted=False, state="ok")
+        def apply_empty():
+            if mode == "pin":
+                save_session_topic(cwd, session_id, [], pinned=[], accounted=False, state="ok")
         stats["none"] = True
-        _done(True)
+        _done(True, apply=apply_empty)
         return
     text = build_pin_prompt(prompt, fin, pin_max) if mode == "pin" else build_supp_prompt(prompt, fin, supp_max)
     stats["bytes"] = len(text.encode("utf-8"))
@@ -1338,13 +1421,14 @@ def _child_main(cwd: Path, session_id: str, payload: dict, gen_id: "str | None")
     else:
         paths, mismatch, none = [], 0, False
     words_out = parse_words(raw)
-    if mode == "pin":
-        save_session_topic(cwd, session_id, words_out, pinned=paths, accounted=False, state="ok")
-    elif words_out:
-        # 补充模式只刷新主题词；模型没给出词时保留上一份（Q7/F01：成功但 0 词也不清空）
-        save_session_topic(cwd, session_id, words_out, state=_KEEP)
+    def apply_words():
+        if mode == "pin":
+            save_session_topic(cwd, session_id, words_out, pinned=paths, accounted=False, state="ok")
+        elif words_out:
+            # 补充模式只刷新主题词；模型没给出词时保留上一份（Q7/F01：成功但 0 词也不清空）
+            save_session_topic(cwd, session_id, words_out, state=_KEEP)
     stats.update(none=none, n_sel=len(paths), n_echo_mismatch=mismatch)
-    _done(True, paths=paths)
+    _done(True, paths=paths, apply=apply_words)
 
 
 def run_extraction_child(argv: list, stdin_text: "str | None" = None) -> int:
@@ -1358,7 +1442,7 @@ def run_extraction_child(argv: list, stdin_text: "str | None" = None) -> int:
     环境就等于留着第二个算落点的地方（白名单在那里保留）。fine 状态与 topics 走同一条落点链。
 
     无论结局如何（含 `_child_main` 抛出未预期的异常），都删除自己的在飞标记与机器槽位（按 gen_id 核对，
-    不删别人的），并把失败记进 fine 状态。
+    不删别人的）；错误同样核对代际，旧结局只保留用量。
     """
     try:
         cwd, session_id = argv[0], argv[1]
@@ -1383,12 +1467,15 @@ def run_extraction_child(argv: list, stdin_text: "str | None" = None) -> int:
     raw_gen = payload.get("gen_id")
     gen_id = raw_gen if isinstance(raw_gen, str) and _GEN_RE.fullmatch(raw_gen) else None
     slot = payload.get("slot") if isinstance(payload.get("slot"), str) else None
+    mode = payload.get("mode") if payload.get("mode") in _MODES else ""
+    stats = _new_stats(gen_id or "", mode)
     try:
-        _child_main(Path(cwd), session_id, payload, gen_id)
+        _child_main(Path(cwd), session_id, payload, gen_id, stats=stats)
     except Exception:                            # noqa: BLE001
         try:
-            _record_result(session_id, mode="", src_seq=-1, gen_id=gen_id or "", ok=False, fail="error",
-                           paths=[], stats=_new_stats(gen_id or "", ""))
+            stats.update(ok=False, fail="error")
+            _commit_child_result(session_id, payload, mode=mode, src_seq=-1, gen_id=gen_id or "",
+                                 ok=False, fail="error", paths=[], stats=stats)
         except Exception:                        # noqa: BLE001
             pass
     finally:

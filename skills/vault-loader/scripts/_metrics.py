@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import sys
 import time
 from collections import Counter
@@ -81,6 +82,7 @@ if TYPE_CHECKING:                      # 仅供类型标注，运行期不导入
 SCHEMA = 1
 RUNTIME_SCHEMA = 2
 _RUNTIME = "legacy"
+ACTIVE_RUNTIMES = ("legacy", "claude", "codex")
 _EVENT_ID = ""
 _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 _MONTH_RE = re.compile(r"\d{4}-\d{2}")
@@ -131,7 +133,7 @@ def configure_context(runtime: str, event_id: str = "") -> None:
             runtime == "claude" and not use_canonical_namespace()):
         _RUNTIME = "legacy"
     else:
-        _RUNTIME = runtime if runtime in {"claude"} else "legacy"
+        _RUNTIME = runtime if runtime in {"claude", "codex"} else "legacy"
     _EVENT_ID = event_id
 
 
@@ -146,6 +148,9 @@ def runtime_record_fields() -> dict:
 
 
 def metrics_dir(home: Path) -> Path:
+    if _RUNTIME == "codex":
+        from context_vault.paths import storage_root
+        return storage_root(home, host="codex", kind="metrics")
     if _RUNTIME != "legacy":
         return context_home(home) / "metrics" / _RUNTIME
     return home / ".claude" / "vault-loader-metrics"
@@ -376,7 +381,7 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
     - prompt 原文本身绝不出现在任何字段。
     - excluded 条目只记 path + topical（near_miss），不记 total/hits：两者在
       `_decision.py` 里是未计算的占位值（0.0 / []），补算在真实 Vault 上实测
-      +150~200ms，会顶穿 UPS 300ms 预算（见 EntryDecision 上方性能护栏注释）。
+      +150~200ms，会顶穿当时的 UPS 300ms 预算（见 EntryDecision 上方性能护栏注释）。
     - cwd 只存 hash（cwd_h），不存原路径。
 
     **`session_id`/`prompt_id` 强制 keyword-only（`*` 分隔）**：二者是相邻的
@@ -399,7 +404,7 @@ def build_record(decision: "Decision", prompt_keywords: "Collection[str] | None"
     kws = sorted(prompt_keywords or ())
     # 只排一次序，两个样本都从它切 —— excluded 在真实 Vault 上中位数 736 条。
     # 省下的第二次 `sorted(721)+[:10]` 实测 min 45.9us / median 50.6us，而本函数
-    # 全程 min 120~132us ⇒ **约 +38%**（占 300ms UPS 预算的 0.017%）。
+    # 全程 min 120~132us ⇒ **约 +38%**（占当时 300ms UPS 预算的 0.017%）。
     # ⚠️ 此处原写「会把本函数的主要开销翻倍」，是未经实证的推算，已按实测订正——
     # 它当时紧挨着下面那批精确实测数字（226/216、188/482），相邻的实证反而给它背了书。
     ranked = sorted(decision.excluded, key=lambda ed: -ed.topical)
@@ -786,6 +791,7 @@ def reset_counts(home: Path) -> int:
     拿不到锁时**如实报错**而不是假装成功——本函数跑在 CLI 里（`main()` 捕获后返回 1），
     不在 hook 路径上，fail-open 约束不适用。
     """
+    _check_codex_storage(home)
     n = len(load_near_miss_counts(home))
     metrics_dir(home).mkdir(parents=True, exist_ok=True)   # 取锁要求目录存在
     fd = _acquire_counts_lock(home)
@@ -1036,12 +1042,26 @@ def prune_expired(home: Path, retention_days: int) -> int:
 # 已退役的命名空间（2.0.0 移除 Codex 支持）。插件不再读写它们；只有用户显式
 # `--purge` / `--reset-counts` 且语义为 all 时按**路径**处理——不经 `configure_context`：
 # 白名单已不含这些值，经它会回落 legacy，等于把 legacy 扫两遍而退役目录照样漏掉。
-RETIRED_NAMESPACES = ("codex",)
+# Codex v1 保留原位；在用 v2 不能再被退役目录清理连带删除。
+RETIRED_NAMESPACES = ()
 
 
 def _is_link_like(p: Path) -> bool:
-    isjunction = getattr(os.path, "isjunction", None)        # Python 3.12+
-    return p.is_symlink() or bool(isjunction and isjunction(p))
+    try:
+        info = os.lstat(p)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0)
+                                              & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _check_codex_storage(home: Path) -> None:
+    if _RUNTIME == "codex":
+        root = metrics_dir(home)
+        if any(_is_link_like(p) for p in (root, root.parent, root.parent.parent, context_home(home))):
+            raise OSError("refusing linked Codex metrics storage")
 
 
 def retired_metrics_dirs(home: Path) -> list[Path]:
@@ -1116,6 +1136,7 @@ def purge(home: Path) -> int:
     root = metrics_dir(home)
     if not root.exists():
         return 0
+    _check_codex_storage(home)
     n = 0
     lock_target = root.parent / f".{root.name}-purge"
     with lease_lock(lock_target):

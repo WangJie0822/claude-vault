@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[3]
@@ -29,7 +30,7 @@ _LOOKS_LIKE_PLUGIN_ROOT = (_PLUGIN_ROOT / "context_vault" / "runtime.py").is_fil
 if _LOOKS_LIKE_PLUGIN_ROOT and str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from context_vault.model import call_claude, choose_backend
+from context_vault.model import call_claude, call_codex, choose_backend, configured_selection
 
 # sanitize / frontmatter 写入的权威实现在 _keywords.py——归集（archive_doc）与
 # 流程补全（keywords_gap）共用同一口径。此处导入同时起 re-export 作用，保持
@@ -39,13 +40,17 @@ from _keywords import build_frontmatter_with_keywords, sanitize_keywords
 _TIMEOUT = 60
 
 
-def _call_claude(content: str) -> str | None:
+def _prompt(content):
     """调 claude -p --model haiku，笔记内容经 stdin 传入。失败返回 None。"""
     prompt = (
         "为下面这篇笔记生成 3-8 个中文/英文检索扩展词（同义词、别名、跨语言术语），"
         "只输出 JSON：{\"keywords\": [...]}。笔记：\n"
     )
-    return call_claude(prompt + content, timeout=_TIMEOUT, model="haiku")
+    return prompt + content
+
+
+def _call_claude(content: str, model="haiku") -> str | None:
+    return call_claude(_prompt(content), timeout=_TIMEOUT, model=model)
 
 
 def _extract_json(text) -> str | None:
@@ -99,9 +104,10 @@ def main(argv=None) -> int:
     ap.add_argument("--vault", required=True)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--backend", choices=("auto", "claude"), default="auto",
+    ap.add_argument("--backend", choices=("auto", "claude", "codex"), default="auto",
                     help="模型后端；auto 只在带 CLAUDE_PLUGIN_ROOT 的 hook 子进程里成立，"
                          "手动运行（含 Claude Code 的 Bash 工具）请显式传 claude")
+    ap.add_argument("--model", help="本批显式模型；Codex 未传则继承插件/宿主选择")
     args = ap.parse_args(argv)
 
     vault = Path(args.vault).expanduser().resolve()
@@ -117,9 +123,15 @@ def main(argv=None) -> int:
     #    所以这个坑只在真跑时触发，更隐蔽。
     # 2. 每篇重复调用没有意义。
     backend = ""
+    selection = None
     if not args.dry_run:
         try:
             backend = choose_backend(args.backend)
+            if backend == "codex":
+                selection = asdict(configured_selection("codex", task_model=args.model))
+            elif args.model is not None:
+                from context_vault.host_config import validate_model
+                validate_model(args.model, host="claude")
         except ValueError as exc:
             print(f"错误：{exc}", file=sys.stderr)
             return 2
@@ -145,7 +157,8 @@ def main(argv=None) -> int:
             processed += 1
             continue
         processed += 1
-        out = _call_claude(text)
+        out = (call_codex(_prompt(text), selection=selection, timeout=_TIMEOUT) if backend == "codex" else
+               _call_claude(text, model=args.model) if args.model is not None else _call_claude(text))
         if out is None:
             print(f"跳过（{backend} 失败/缺失）: {note.relative_to(vault)}", file=sys.stderr)
             continue

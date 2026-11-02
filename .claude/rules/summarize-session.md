@@ -9,6 +9,12 @@ paths:
 
 ## 现行补充
 
+### 双宿主共享写入
+
+- `rebuild_index.main` 在扫描前取得 Vault 的 canonical cache 锁，持有到索引与 cache 写回完成；自定义 `--cache` 同样经过该 Vault 锁。锁失败非零退出且不写索引；不要恢复成只锁最后的 cache 写入。只读 dry-run / health-check 不创建事务锁。
+- `keywords_gap._sync_cache_entry` 与 `_summary_store.sync_cache_summary` 复用同一 cache 锁，锁内重读；不得让新写端裸读改写 cache。`git_commit_vault.commit_vault` 另用 Vault 提交锁，普通提交只含所选路径，保留其他暂存文件；baseline 全量仍需 preview 确认。
+- Codex 当前会话只取精确主线程来源，成功写入与重建后才标记；不按目录最新 mtime 选会话。归集对 Codex auth/config/sessions/日志的硬排除早于文档白名单，并校验解析后的别名路径；正常 docs 仍允许。Codex Memory 不经本技能写入。
+
 ### 摘要缺口的三条防线（2.3.0）
 
 - **写期口径唯一实现**：判据与清洗在 `scripts/_summary.py`（`classify` / `sanitize_summary` / `reject_reason`），写盘只走 `_summary_store.write_with_backup`（备份 → `write_summary` → 同步 cache，三个写入点共用；基于 `_frontmatter_field`：保留原行尾、删除块标量续行、BOM / 未闭合 / 无 frontmatter 一律跳过）。不要改用 `_frontmatter.upsert_fields`：它非原子、会改写整份行尾、会给无 frontmatter 的笔记前插新块。

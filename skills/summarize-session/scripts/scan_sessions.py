@@ -23,6 +23,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# 脚本按自身位置定位共享库；独立复制的旧 Claude 脚本保留原解析退路。
+_ROOT = Path(__file__).resolve().parents[3]
+if (_ROOT / "context_vault/runtime.py").is_file():
+    sys.path.insert(0, str(_ROOT))
+try:
+    from context_vault.session_source import SessionRef, read_session, resolve_current_session
+except ImportError:
+    SessionRef = read_session = resolve_current_session = None
+
 
 def _cwd_to_project_name(cwd: str) -> str:
     """把 cwd 标准化为 Claude Code 的 projects/ 子目录命名格式。
@@ -104,7 +113,8 @@ def load_manifest(manifest_path: str, runtime: str | None = None) -> set:
         result = set()
         for item in sessions:
             if isinstance(item, str):
-                result.add(item)
+                if runtime != "codex":
+                    result.add(item)
             elif isinstance(item, dict):
                 item_runtime = item.get("runtime")
                 session_id = item.get("id")
@@ -138,22 +148,24 @@ def save_manifest(manifest_path: str, session_ids: set,
         ), file=sys.stderr)
         return False
     try:
-        use_schema2 = runtime is not None and (
+        try:
+            raw = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            entries = raw.get("sessions", []) if isinstance(raw, dict) else []
+            entries = entries if isinstance(entries, list) else []
+        except (OSError, ValueError):
+            raw, entries = {}, []
+        use_schema2 = runtime == "codex" or runtime is not None and (
             Path(manifest_path).expanduser() == Path(DEFAULT_CONTEXT_MANIFEST).expanduser()
-        )
+        ) or isinstance(raw, dict) and raw.get("schema") == 2
         if use_schema2:
-            try:
-                raw = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-                entries = raw.get("sessions", []) if isinstance(raw, dict) else []
-            except (OSError, ValueError, json.JSONDecodeError):
-                entries = []
-            kept = [item for item in entries if isinstance(item, dict)
-                    and isinstance(item.get("runtime"), str)
-                    and isinstance(item.get("id"), str)]
+            # 旧裸 ID 属于 Claude 历史；补上宿主，避免被 Codex 同名 ID 命中或丢失。
+            kept = [{"runtime": "claude-legacy", "id": item} if isinstance(item, str) else item
+                    for item in entries if isinstance(item, str) or (isinstance(item, dict)
+                    and isinstance(item.get("runtime"), str) and isinstance(item.get("id"), str))]
             known = {(item["runtime"], item["id"]) for item in kept}
             for sid in sorted(session_ids):
                 if (runtime, sid) not in known:
-                    kept.append({"runtime": runtime, "id": sid})
+                    kept.append({"runtime": runtime or "claude-legacy", "id": sid})
             output = {"schema": 2, "sessions": kept,
                       "updated": datetime.now().isoformat()}
         else:
@@ -434,7 +446,7 @@ def _aggregate_touched_repos(touched_files: list) -> dict:
     return repo_map
 
 
-def parse_session(file_path: str, max_chars: int = 4000) -> dict:
+def _legacy_parse_session(file_path: str, max_chars: int = 4000) -> dict:
     """解析会话 JSONL 文件，提取对话内容。
 
     返回:
@@ -517,6 +529,39 @@ def parse_session(file_path: str, max_chars: int = 4000) -> dict:
     }
 
 
+def parse_session(file_path: str, max_chars: int = 4000, *, runtime: str = "claude",
+                  ref=None) -> dict:
+    """共享来源 → 兼容既有 CLI 的 dict，不把内部记录原样交给技能。"""
+    if read_session is None and runtime == "claude":
+        return _legacy_parse_session(file_path, max_chars)
+    if ref is None:
+        if runtime != "claude":
+            raise ValueError("exact session reference is required")
+        path = Path(file_path)
+        ref = SessionRef("claude", path.stem, path.stem, path, Path("."))
+    result = read_session(ref)
+    messages = [{"role": m["role"], "text": m["text"].strip()[:800]}
+                for m in result.messages if len(m["text"].strip()) > 3]
+    truncated, total = [], 0
+    for message in messages:
+        remaining = max_chars - total
+        if len(message["text"]) > remaining:
+            if remaining > 50:
+                truncated.append({"role": message["role"], "text": message["text"][:remaining] + "..."})
+            break
+        truncated.append(message)
+        total += len(message["text"])
+    date = ""
+    try:
+        date = datetime.fromisoformat(result.metadata["first_timestamp"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+    except (KeyError, ValueError, TypeError, AttributeError):
+        pass
+    return {"messages": truncated, "total_messages": len(messages),
+            "cwd": result.metadata.get("cwd", ""), "first_intent": extract_first_user_intent(messages),
+            "date": date, "timerange": result.timerange,
+            "completeness": result.completeness, "reasons": result.reasons}
+
+
 def get_current_session_id(claude_dir: str, cwd: str) -> str | None:
     """获取当前项目目录下最新的会话 ID。"""
     # 跨平台 cwd 编码（POSIX `/Users/...`、Windows `C:\\...`、Git Bash `/c/...` 全兼容）
@@ -573,12 +618,129 @@ def format_project_name(raw: str) -> str:
     return raw
 
 
+class _NonMainCodexSession(ValueError):
+    """沉淀入口的来源拒绝；共享 resolver 仍允许其它消费方解析任意角色。"""
+
+    def __init__(self, actor_kind):
+        self.actor_kind = actor_kind
+        super().__init__("main Codex session required; actor_kind=" + actor_kind)
+
+
+def _codex_ref(args, sid, path=None):
+    if resolve_current_session is None:
+        raise ValueError("session source adapter unavailable")
+    context = {"thread_id": sid, "codex_home": args.codex_dir}
+    if path is not None:
+        context["transcript_path"] = str(path)
+    ref = resolve_current_session(host="codex", context=context, home=Path.home())
+    if ref.actor_kind != "main":
+        raise _NonMainCodexSession(ref.actor_kind)
+    return ref
+
+
+def _codex_entry(args, ref, *, conversation=False):
+    parsed = parse_session(str(ref.transcript_path), args.max_chars, runtime="codex", ref=ref)
+    entry = {"session_id": ref.thread_id, "project": ref.cwd.name,
+             "date": parsed["date"], "cwd": parsed["cwd"],
+             "first_intent": parsed["first_intent"], "total_messages": parsed["total_messages"],
+             "timerange": parsed["timerange"], "completeness": parsed["completeness"],
+             "reasons": parsed["reasons"], "actor_kind": ref.actor_kind,
+             "size_kb": round(ref.transcript_path.stat().st_size / 1024, 1)}
+    if conversation:
+        entry["conversation"] = parsed["messages"]
+    return entry
+
+
+def _codex_main(args):
+    """Codex 当前会话只认显式线程；mtime 仅服务于历史会话的日期筛选。"""
+    args.manifest = args.manifest or DEFAULT_CONTEXT_MANIFEST
+    current = args.thread_id or os.environ.get("CODEX_THREAD_ID")
+    try:
+        if args.mark or args.mark_current:
+            ids = args.mark or [current]
+            refs = [_codex_ref(args, sid) for sid in ids]
+            for ref in refs:
+                result = read_session(ref)
+                if result.completeness != "complete":
+                    raise ValueError("incomplete session: " + ",".join(result.reasons))
+            if not save_manifest(args.manifest, {r.thread_id for r in refs}, "codex"):
+                return 2
+            out = {"action": "marked_current" if args.mark_current else "marked",
+                   "session_ids": ids, "manifest": args.manifest}
+            if args.mark_current:
+                out["session_id"] = refs[0].thread_id
+        elif args.timerange or args.touched_repos:
+            ref = _codex_ref(args, current)
+            result = read_session(ref)
+            if result.completeness != "complete":
+                raise ValueError("incomplete session: " + ",".join(result.reasons))
+            if args.timerange:
+                if result.timerange is None:
+                    raise ValueError("session timestamps unavailable")
+                out = dict(result.timerange, session_id=ref.thread_id)
+            else:
+                repo_map = _aggregate_touched_repos([str(p) for p in result.touched_files])
+                repos = sorted([dict(toplevel=k, **v) for k, v in repo_map.items()],
+                               key=lambda r: r["file_count"], reverse=True)
+                cwd_repo = _locate_git_repo(str(ref.cwd))
+                primary = repos[0]["toplevel"] if repos else None
+                out = {"session_id": ref.thread_id, "touched_file_count": len(result.touched_files),
+                       "touched_files_status": result.metadata["touched_files_status"],
+                       "cwd_repo": cwd_repo, "touched_repos": repos, "primary_repo": primary,
+                       "cross_repo": bool(cwd_repo and primary and primary != cwd_repo["toplevel"])}
+        elif args.session:
+            out = {"sessions": [_codex_entry(args, _codex_ref(args, sid), conversation=True)
+                                for sid in args.session]}
+        else:
+            refs, skipped = {}, []
+            cutoff = time.time() - args.days * 86400
+            for folder in ("sessions", "archived_sessions"):
+                for path in (Path(args.codex_dir) / folder).rglob("rollout-*.jsonl"):
+                    if path.stat().st_mtime < cutoff:
+                        continue
+                    # 文件名只作枚举，身份仍必须由首条 metadata 和共享解析器核对。
+                    try:
+                        with path.open(encoding="utf-8-sig") as stream:
+                            first = json.loads(stream.readline(128 * 1024 * 1024 + 1))
+                        meta = first.get("payload") if isinstance(first, dict) and first.get("type") == "session_meta" else None
+                        if not isinstance(meta, dict):
+                            raise ValueError("invalid metadata")
+                        ref = _codex_ref(args, meta.get("id"), path)
+                    except _NonMainCodexSession as exc:
+                        skipped.append({"source": path.name, "reason": "actor_not_main",
+                                        "actor_kind": exc.actor_kind})
+                        continue
+                    except (OSError, ValueError, RecursionError):
+                        skipped.append({"source": path.name, "reason": "invalid_metadata"})
+                        continue
+                    if args.project and args.project not in str(ref.cwd):
+                        continue
+                    refs[ref.thread_id] = ref
+            manifest = load_manifest(args.manifest, "codex")
+            unsummarized = [ref for sid, ref in refs.items() if sid not in manifest
+                            and ref.transcript_path.stat().st_size > args.min_size * 1024]
+            unsummarized.sort(key=lambda r: r.transcript_path.stat().st_mtime, reverse=True)
+            out = {"runtime": "codex", "scan_range_days": args.days,
+                   "total_sessions_in_range": len(refs), "already_summarized": len(refs.keys() & manifest),
+                   "unsummarized_count": len(unsummarized),
+                   "sessions": [_codex_entry(args, ref, conversation=args.parse) for ref in unsummarized],
+                   "skipped_sources": skipped}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    except (OSError, ValueError, TypeError) as exc:
+        print(json.dumps({"error": str(exc), "runtime": "codex"}, ensure_ascii=False))
+        return 2
+
+
 def main():
     parser = argparse.ArgumentParser(description="扫描未总结的 Claude Code 会话")
     # 隐藏的空操作：plugin cache 里多版本并存、定位器只取最高版本的脚本，旧版 SKILL.md
     # 仍会传 `--runtime claude`。直接删除会让那种组合报 unrecognized arguments 退出 2。
-    parser.add_argument("--runtime", choices=("claude",), default="claude",
+    parser.add_argument("--runtime", choices=("claude", "codex"), default="claude",
+                        help="会话来源宿主（默认 claude；Codex 须显式选择）")
+    parser.add_argument("--codex-dir", default=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")),
                         help=argparse.SUPPRESS)
+    parser.add_argument("--thread-id", help="Codex 精确线程 ID（默认 CODEX_THREAD_ID）")
     parser.add_argument("--days", type=int, default=7, help="回溯天数（默认 7）")
     parser.add_argument("--project", type=str, help="按项目目录名过滤")
     parser.add_argument("--manifest", type=str,
@@ -605,6 +767,9 @@ def main():
                         help="JSON 输出（默认）")
 
     args = parser.parse_args()
+
+    if args.runtime == "codex":
+        raise SystemExit(_codex_main(args))
 
     if args.manifest is None:
         # 判据用「迁移是否已提交」而不是「canonical config 是否存在」：

@@ -95,6 +95,9 @@ def test_all_manifests_follow_root_version():
     assert expected == claude["version"]
     assert _self_entry(market, claude["name"])["version"] == expected
     assert claude["name"] == "context-vault"
+    codex = _load(ROOT / ".codex-plugin" / "plugin.json")
+    assert codex["name"] == claude["name"]
+    assert codex["version"] == expected
 
 
 def _first_version_section(text: str) -> str | None:

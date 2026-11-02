@@ -251,7 +251,7 @@ def test_pinned_after_fulltext_fence_and_deduped_against_fulltext_pick(
     """I-2：spec §6「渲染两分支各追加」此前只有清单分支的 wiring 守卫——全文分支恰是
     没有外层 NOTICE、pinned 必须自带隔离声明的那条路径。prompt「配额上限说明 详细」
     产生两条独立证据链（「配额上限说明」5 个相邻 bigram 合并成一条 + 「详细」单独一条，
-    chains=2 ⇒ `has_strong_evidence` 成立，`_scorer.py:281-289`）触发全文分支——单独
+    chains=2 ⇒ `_scorer.py::has_strong_evidence` 成立）触发全文分支——单独
     连写「配额上限说明」只产生 1 条合并链，chains<2 达不到强证据档，故 fixture 需要
     这第二条独立链；cache summary/keywords 据此加宽，与终审报告 hands-on 探针
     （`D:\\Temp\\final-review-mut\\probe_branches.py` run1）逐字一致，已实测走到全文分支。

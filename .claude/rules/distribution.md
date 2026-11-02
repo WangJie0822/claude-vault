@@ -1,6 +1,8 @@
 ---
 paths:
   - ".claude-plugin/**/*"
+  - ".codex-plugin/plugin.json"
+  - ".agents/plugins/marketplace.json"
   - "scripts/**/*"
   - "/.gitignore"
   - "/.gitattributes"
@@ -16,6 +18,8 @@ paths:
 > 本文件是 CLAUDE.md「分发边界（重要）」的正文。「## 迁移原文」小节自 CLAUDE.md（基线 `3ac359f`，该提交只在开发仓库可取）迁出，除少量已失效的指代、路径与行号锚点外逐字保留；小节内「本文件」「本节」「此处」「上一版」凡指文档位置的，均指原 CLAUDE.md，出现的数字是当时的读数。此后新增内容写在「## 现行补充」里，按 CLAUDE.md「写入约定」执行。
 
 ## 现行补充
+
+- Codex 分发入口为 `.codex-plugin/plugin.json`，本地市场为 `.agents/plugins/marketplace.json`（只放行这两个精确文件）。市场 source 指向插件根，不另复制一套 skills；市场不重复 version，以两宿主 manifest 与根版本同步门禁为准。开发探针、会话、凭据与设计文档不得混入产物；安装成功不代表 hook 信任或原生 UI 验收。
 
 - 发布流程的理由（原 CLAUDE.md「发布流程」；发布形态已于 2026-09-29 改为每版一笔 squash）：clone 后可经 `git show <旧commit>:<file>` 取回历史内容，脱敏闸门拦不住，只有推送策略能；四处版本号同步是为了让 `/plugin update` 按版本识别更新，1.2.1 发布时曾漏改 `.codex-plugin/plugin.json`，由 `tests/test_plugin_version_sync.py::test_all_manifests_follow_root_version` 拦下。多笔提交形态下中间提交的树不经过脱敏闸门，这是改为每版一笔 squash 的理由之一。
 

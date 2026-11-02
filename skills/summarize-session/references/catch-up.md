@@ -2,6 +2,8 @@
 
 当用户执行 `/summarize-session --catch-up [N]` 时，扫描最近 N 天（默认 7）的历史会话，找出未总结的会话并按需补充总结。
 
+Codex 先读 [宿主差异](codex.md)：下文扫描/解析/标记命令须加 `--runtime codex`，使用已核验的线程 ID；不使用 Claude cache 定位器与 Memory 归集步骤。
+
 ## 执行流程
 
 ### 第一步：扫描未总结会话

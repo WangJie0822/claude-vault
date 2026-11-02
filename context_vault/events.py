@@ -9,15 +9,15 @@ import time
 from pathlib import Path
 
 from .atomic import atomic_write_json, lease_lock
-from .paths import context_home
+from .paths import context_home, storage_root
 
 _MARKER_RETENTION_SECONDS = 90 * 86400
-# 2.0.0 起只支持 Claude Code。`runtime` 会被拼进 marker 目录，这里自己校验，
+# `runtime` 会参与 marker 落点，这里自己校验，
 # 不依赖调用方传对：放行任意字符串等于一个任意路径写原语。
-_ALLOWED_RUNTIMES = frozenset({"claude"})
+_ALLOWED_RUNTIMES = frozenset({"claude", "codex"})
 
 
-def _event_salt(home: Path | None = None) -> bytes:
+def _event_salt(home: Path | None = None, *, runtime: str = "claude") -> bytes:
     """本机事件盐。与 metrics 的 `.salt` 同源思路，但**独立文件**——events 目录
     无条件写入，而 metrics 是 opt-in，不能让前者去创建后者的目录。
 
@@ -26,7 +26,8 @@ def _event_salt(home: Path | None = None) -> bytes:
     任何失败回落**进程内**随机盐：那会让本轮去重失效（等价于「没去重」），
     但绝不会把内容派生值写进磁盘。
     """
-    d = context_home(home) / "state" / "events"
+    d = (storage_root(home or Path.home(), host="codex", kind="state") / "events"
+         if runtime == "codex" else context_home(home) / "state" / "events")
     p = d / ".salt"
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -81,10 +82,12 @@ def claim_event(runtime: str, event_name: str, session_id: str,
         return True
     material = "\0".join((runtime, event_name, session_id, event_id, scope))
     if not stable:
-        material = _event_salt(home).hex() + "\0" + material
+        material = _event_salt(home, runtime=runtime).hex() + "\0" + material
     digest = hashlib.sha256(material.encode("utf-8", errors="replace")).hexdigest()
     session_hash = hashlib.sha256(session_id.encode("utf-8", errors="replace")).hexdigest()[:24]
-    marker = context_home(home) / "state" / "events" / runtime / f"{session_hash}.json"
+    directory = (storage_root(home or Path.home(), host="codex", kind="state") / "events"
+                 if runtime == "codex" else context_home(home) / "state" / "events" / runtime)
+    marker = directory / f"{session_hash}.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
     # Amortized cleanup keeps one-file-per-session markers bounded without a
     # directory scan on every prompt.

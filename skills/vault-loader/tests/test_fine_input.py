@@ -11,6 +11,35 @@ from pathlib import Path
 
 import pytest
 
+
+def test_codex_recent_context_uses_shared_source_and_trigger_cutoff(tmp_home):
+    from scripts import _fine_input as fi
+    path = tmp_home / ".codex/sessions/rollout-example-thread-a.jsonl"
+    path.parent.mkdir(parents=True)
+    rows = [{"type": "session_meta", "timestamp": "2026-10-20T00:00:00Z",
+             "payload": {"id": "thread-a", "cwd": str(tmp_home), "source": "vscode"}}]
+    for sec, text in ((1, "真正过去的输入"), (2, "未来输入不能进入")):
+        rows.append({"type": "response_item", "timestamp": f"2026-10-20T00:00:{sec:02d}Z", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+    path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    source = {"host": "codex", "thread_id": "thread-a", "home": str(tmp_home),
+              "transcript_path": str(path), "before": "2026-10-20T00:00:02Z"}
+    texts, degraded = fi.recent_prompts_for_payload({"session_source": source}, 3, "本轮输入",
+                                                  session_id="thread-a", claude_dir=tmp_home / ".claude")
+    assert texts == ["真正过去的输入"] and degraded is None
+
+
+@pytest.mark.parametrize("source", [None, {}, {"host": "claude"}, {"host": "codex", "thread_id": "wrong"}])
+def test_invalid_explicit_source_never_falls_back_to_claude(tmp_home, source):
+    from scripts import _fine_input as fi
+    p = tmp_home / ".claude/projects/p/thread-a.jsonl"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"type": "user", "promptSource": "typed",
+                            "message": {"content": "错误回落会读到的内容"}}), encoding="utf-8")
+    got = fi.recent_prompts_for_payload({"session_source": source, "transcript_path": str(p)}, 3,
+                                       "本轮", session_id="thread-a", claude_dir=tmp_home / ".claude")
+    assert got == ([], "transcript_err")
+
 from scripts import _fine_input as FI
 from scripts._fine_input import (build_fine_input, clean_text, exclusion_set,
                                  note_name, project_rels, recent_user_prompts, recent_work_titles,

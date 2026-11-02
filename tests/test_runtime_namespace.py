@@ -28,8 +28,8 @@ def _load_state_module():
     return module
 
 
-def test_runtime_kind_has_only_claude():
-    assert [kind.value for kind in RuntimeKind] == ["claude"]
+def test_runtime_kind_has_explicit_supported_hosts():
+    assert [kind.value for kind in RuntimeKind] == ["claude", "codex"]
 
 
 @pytest.mark.parametrize("payload", [
@@ -119,7 +119,7 @@ def test_fresh_config_uses_canonical_home(monkeypatch, tmp_path):
 
 
 def test_state_isolated_by_project_not_session(monkeypatch, tmp_path):
-    """state 按 cwd 隔离、不按 session；退役的 codex 不得再造出命名空间。"""
+    """state 按 cwd 隔离、不按 session；Codex 使用独立固定代际。"""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     state = _load_state_module()
@@ -137,13 +137,14 @@ def test_state_isolated_by_project_not_session(monkeypatch, tmp_path):
     state.configure_context("claude", "session-b")
     claude_b = state.state_path_for_cwd(cwd)
     state.configure_context("codex", "session-a")
-    retired = state.state_path_for_cwd(cwd)
+    codex = state.state_path_for_cwd(cwd)
 
     assert claude_a == claude_b, "同一 cwd 跨会话必须共用 state，否则注入去重失效"
     assert claude_a != claude_other_project, "不同项目仍须隔离"
     assert "state/claude/" in claude_a.as_posix()
     assert "sessions/" not in claude_a.as_posix(), "路径里不应再有 session 一层"
-    assert "state/codex/" not in retired.as_posix(), "codex 已不在白名单内，不得再造出它的命名空间"
+    assert "state/codex/v2/" in codex.as_posix()
+    assert codex != claude_a
 
 
 def test_legacy_state_namespace_survives_unknown_and_legacy_runtimes(monkeypatch, tmp_path):
@@ -160,9 +161,11 @@ def test_legacy_state_namespace_survives_unknown_and_legacy_runtimes(monkeypatch
     state = _load_state_module()
     cwd = tmp_path / "repo"
     cwd.mkdir()
-    for runtime in ("legacy", "unknown", "claude", "codex", "wat"):
+    for runtime in ("legacy", "unknown", "claude", "codex/../x", "wat"):
         state.configure_context(runtime, "S1")
         assert ".claude/projects" in state.state_path_for_cwd(cwd).as_posix(), runtime
+    state.configure_context("codex", "S1")
+    assert "state/codex/v2/" in state.state_path_for_cwd(cwd).as_posix()
 
     fresh = tmp_path / "fresh-home"
     fresh.mkdir()

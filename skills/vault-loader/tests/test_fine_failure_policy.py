@@ -118,15 +118,17 @@ def test_streak_disable_recovers_after_cooldown(cwd, monkeypatch, capsys):
     assert (st.disabled_reason, st.fail_streak) == (None, 0)
 
 
-def test_no_claude_disable_waits_for_ttl(cwd, monkeypatch, capsys):
-    _seed(cwd, disabled_reason="no_claude", disabled_at=time.time() - 3600)
+@pytest.mark.parametrize("reason", ["no_claude", "no_codex"])
+def test_no_claude_disable_waits_for_ttl(cwd, monkeypatch, capsys, reason):
+    _seed(cwd, disabled_reason=reason, disabled_at=time.time() - 3600)
     calls = _patch_spawn(monkeypatch)
     _turn(monkeypatch, capsys, cwd)
     assert calls == []
 
 
-def test_no_claude_disable_reprobes_after_ttl(cwd, monkeypatch, capsys):
-    _seed(cwd, disabled_reason="no_claude", disabled_at=time.time() - 25 * 3600)
+@pytest.mark.parametrize("reason", ["no_claude", "no_codex"])
+def test_no_claude_disable_reprobes_after_ttl(cwd, monkeypatch, capsys, reason):
+    _seed(cwd, disabled_reason=reason, disabled_at=time.time() - 25 * 3600)
     calls = _patch_spawn(monkeypatch)
     _turn(monkeypatch, capsys, cwd)
     assert len(calls) == 1

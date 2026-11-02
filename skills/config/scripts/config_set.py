@@ -176,13 +176,17 @@ def _config_lock(path: Path):
 
 
 def set_key(key: str, raw_value: Any, *, home: Path | None = None,
-            assume_yes: bool = False, privacy_ack: bool = False) -> dict:
+            assume_yes: bool = False, privacy_ack: bool = False, runtime=None) -> dict:
     """改一个配置项。返回 {"ok", "error", "backup", "old", "new", "path", "removed"}。
 
     `raw_value` 可以是 str（CLI）或 bool / int / list / dict（hook 里面板的「设为默认」），先转文本。
     `removed`：写新键时一并删掉的被取代旧键（全路径）。
     """
     defaults = inv.load_default_config()
+    try:
+        key = inv.runtime_key(key, runtime)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     flat_default = inv.flatten(defaults)
 
     # —— 写入白名单 ——
@@ -208,12 +212,22 @@ def set_key(key: str, raw_value: Any, *, home: Path | None = None,
     # —— 隐私旋钮 ——
     if key in inv.PRIVACY_KNOBS and not privacy_ack:
         return {"ok": False, "error":
-                f"`{key}` 是隐私旋钮：它控制**每会话有多少篇笔记被发往外部模型端点**。"
+                f"`{key}` 是隐私旋钮：它决定外发模型、端点或发送内容的范围。"
                 f"确认要改请显式加 --i-understand-privacy。"}
 
     ok, value, err = _parse_value(_as_text(raw_value), flat_default[key])
     if not ok:
         return {"ok": False, "error": err}
+
+    if key in {"runtimes.codex.model", "runtimes.codex.profile", "runtimes.codex.model_provider"}:
+        from context_vault.host_config import resolve_model_selection
+        if not isinstance(raw_value, str):
+            return {"ok": False, "error": "Codex 模型选择必须是字符串"}
+        try:
+            resolve_model_selection({"runtimes": {"codex": {key.rsplit(".", 1)[-1]: value}}},
+                                    host="codex")
+        except ValueError as exc:
+            return {"ok": False, "error": f"Codex 模型配置无效：{exc}"}
 
     mc = _migrate_config()
     path = inv._config_path(home)
@@ -290,7 +304,7 @@ def _write_locked(mc, path: Path, key: str, value: Any, home: Path | None) -> di
             "path": str(path), "removed": removed}
 
 
-def restore(backup: str, *, home: Path | None = None, assume_yes: bool = False) -> dict:
+def restore(backup: str, *, home: Path | None = None, assume_yes: bool = False, runtime=None) -> dict:
     """从备份还原。还原前同样先备份当前值（继承 migrate_config 的做法）。
 
     备份必须是 JSON 对象（2.4.0 full-review DO-M2）：数组、标量写进去后 loader 判 config 读坏、整份回落默认值，
@@ -308,10 +322,35 @@ def restore(backup: str, *, home: Path | None = None, assume_yes: bool = False) 
 
     mc = _migrate_config()
     path = inv._config_path(home)
-    cur, _p, existed = inv.read_raw_config(home)
-    pre = str(mc.write_backup(cur)) if existed and cur else ""
-    _atomic_write(path, data)
-    return {"ok": True, "error": "", "backup": pre, "path": str(path)}
+    if runtime not in (None, "codex"):
+        return {"ok": False, "error": "unsupported runtime"}
+    try:
+        if mc.is_path_redirected(path):
+            return {"ok": False, "error": "目标路径存在重定向，未还原"}
+        with _config_lock(path):
+            cur, _p, existed, readable = inv.read_raw_config_strict(home)
+            if existed and not readable and runtime == "codex":
+                return {"ok": False, "error": "当前配置读不出，未还原"}
+            if runtime == "codex":
+                new_data = deepcopy(cur)
+                if not isinstance(new_data.get("runtimes", {}), dict):
+                    return {"ok": False, "error": "当前 runtimes 无效，无法隔离还原"}
+                runtime_data = data.get("runtimes", {})
+                if not isinstance(runtime_data, dict):
+                    return {"ok": False, "error": "备份 runtimes 无效"}
+                if "codex" in runtime_data:
+                    _set_path(new_data, ["runtimes", "codex"], deepcopy(runtime_data["codex"]))
+                else:
+                    _del_path(new_data, ["runtimes", "codex"])
+                data = new_data
+            pre = str(mc.write_backup(cur)) if existed and cur else ""
+            _atomic_write(path, data)
+            got, _, _, readable = inv.read_raw_config_strict(home)
+            if not readable or got != data:
+                return {"ok": False, "error": "还原后回读不一致", "backup": pre}
+            return {"ok": True, "error": "", "backup": pre, "path": str(path)}
+    except (OSError, ValueError, ImportError) as exc:
+        return {"ok": False, "error": "还原失败：" + type(exc).__name__}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -322,13 +361,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--i-understand-privacy", dest="privacy_ack", action="store_true",
                     help="确认知晓隐私旋钮会改变外发篇数")
     ap.add_argument("--restore", metavar="BACKUP", help="从备份还原")
+    ap.add_argument("--runtime", choices=("codex",), help="只修改/还原 Codex 宿主配置")
     args = ap.parse_args(argv)
 
     if args.restore:
-        res = restore(args.restore, assume_yes=args.yes)
+        res = restore(args.restore, assume_yes=args.yes, runtime=args.runtime)
     elif args.key and args.value is not None:
         res = set_key(args.key, args.value, assume_yes=args.yes,
-                      privacy_ack=args.privacy_ack)
+                      privacy_ack=args.privacy_ack, runtime=args.runtime)
     else:
         ap.error("需要 <key> <value>，或 --restore <备份路径>")
         return 2

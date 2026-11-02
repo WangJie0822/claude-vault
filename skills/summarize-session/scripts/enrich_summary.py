@@ -27,6 +27,8 @@ import re
 import secrets
 import subprocess
 import sys
+from contextvars import ContextVar
+from dataclasses import asdict
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -37,7 +39,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parents[3]
 if (_PLUGIN_ROOT / "context_vault" / "runtime.py").is_file() and str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from context_vault.model import call_claude, choose_backend  # noqa: E402
+from context_vault.model import call_claude, call_codex, choose_backend, configured_selection  # noqa: E402
 
 from _summary import (GAP_KINDS, OPTIMIZE_KINDS, applicable, classify, payload_sensitive,  # noqa: E402
                       proposal_id, reject_reason, sanitize_summary)
@@ -60,9 +62,17 @@ COMMIT_PREFIX = "[docs|vault|摘要][公共]"
 MODEL_FAIL_STREAK = 3         # 连续这么多次 model_failed（模型不可用 / 超时）即熔断整批，退出码 4
 PROPOSAL_DIRNAME = "summary-proposals"
 _PROPOSAL_NAME_RE = re.compile(r"^\d{8}-\d{6}(-\d+)?\.jsonl$")
+_MODEL_CALL = ContextVar("summary_model_call", default=None)
 
 
 def _call_model(prompt: str):
+    options = _MODEL_CALL.get()
+    if options is not None:
+        backend, selection = options
+        if backend == "codex":
+            return call_codex(prompt, selection=selection, timeout=60)
+        if selection is not None:
+            return call_claude(prompt, timeout=60, model=selection)
     return call_claude(prompt, timeout=60, model="haiku")
 
 
@@ -281,8 +291,9 @@ def _err(code: int, reason: str, **kw) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="付费补全 / 优化笔记摘要（默认只列不调；退出码见模块说明）")
     ap.add_argument("--vault", required=True, help="知识库根目录")
-    ap.add_argument("--backend", choices=("auto", "claude"), default="auto",
+    ap.add_argument("--backend", choices=("auto", "claude", "codex"), default="auto",
                     help="模型后端；在 Claude Code 的 Bash 工具与普通终端里须显式传 claude")
+    ap.add_argument("--model", help="本批显式模型；Codex 未传则继承插件/宿主选择")
     ap.add_argument("--tier", action="append", choices=("gaps", "long"),
                     help="候选档：gaps 缺失 / 不足 20 字 / 等于文件名（默认），long 超过 240 字；可重复")
     ap.add_argument("--paths", nargs="+", help="指定笔记（vault 相对路径），与 --tier 互斥；只能 --propose")
@@ -328,6 +339,8 @@ def main(argv=None) -> int:
                "bytes_total": total_bytes, "est_tokens": len(cands) * FIXED_CALL_TOKENS + total_bytes // 3,
                "exhausted": sum(1 for r in rejected if r["reason"] == "attempts_exhausted"),
                "items": cands, "rejected": rejected}
+    if args.backend == "codex":
+        listing.update(est_tokens=None, estimate_basis="codex_overhead_unmeasured")
     if not (args.apply or args.propose):
         print(json.dumps(dict({"status": "list"}, **listing), ensure_ascii=False))
         return 0
@@ -336,12 +349,17 @@ def main(argv=None) -> int:
     if args.expect is None or args.expect != len(cands):
         return _err(2, "expect_mismatch", count=len(cands))
     try:
-        choose_backend(args.backend)
+        backend = choose_backend(args.backend)
+        selection = asdict(configured_selection("codex", task_model=args.model)) if backend == "codex" else args.model
+        if backend == "claude" and args.model is not None:
+            from context_vault.host_config import validate_model
+            validate_model(args.model, host="claude")
     except ValueError as exc:
         return _err(2, "backend", detail=str(exc))
     lock = acquire_single_instance(vault)
     if lock is None:
         return _err(3, "another_instance_running", **(single_instance_holder(vault) or {}))
+    token = _MODEL_CALL.set((backend, selection))
     try:
         if args.propose:
             return _run_propose(vault, entries, cands, args)     # Task 9
@@ -357,6 +375,7 @@ def main(argv=None) -> int:
                           "backup": str(bf), "commit": commit}, ensure_ascii=False))
         return 4 if aborted else 0
     finally:
+        _MODEL_CALL.reset(token)
         release_single_instance(lock)
 
 

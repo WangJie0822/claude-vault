@@ -86,7 +86,7 @@ def _recovery(state: FineState, stored: dict, session: dict, config: dict, now: 
             return True
         return any(stored.get(k) is False and session.get(k) is True
                    for k in ("fine_rank", "fine_supplement"))
-    if reason == "no_claude":
+    if reason in ("no_claude", "no_codex"):
         return _num(at) and now - at >= _ttl_hours(config) * 3600
     return False
 
@@ -307,9 +307,12 @@ def finish_turn(tf: "TurnFine | None", *, consume_stats: bool = True) -> None:
             st.last_fail, st.last_ts = "lost", now
         if tf.spawned_gen:
             st.calls = (_int(st.calls) or 0) + 1
-        if tf.spawn_result == "no_claude" or any(s.get("fail") == "no_claude" for s in popped):
-            st.disabled_reason, st.disabled_at = "no_claude", now
-            st.last_fail, st.last_ts = "no_claude", now
+        unavailable = next((s.get("fail") for s in popped if s.get("fail") in ("no_claude", "no_codex")), None)
+        if tf.spawn_result in ("no_claude", "no_codex"):
+            unavailable = tf.spawn_result
+        if unavailable:
+            st.disabled_reason, st.disabled_at = unavailable, now
+            st.last_fail, st.last_ts = unavailable, now
         if st.disabled_reason not in _fine_state.DISABLED_REASONS:
             st.disabled_reason = None
             reason = None

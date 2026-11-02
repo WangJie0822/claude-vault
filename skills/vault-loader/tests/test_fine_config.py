@@ -356,3 +356,47 @@ def test_persist_judged_against_config_not_session():
     v2 = fc.apply_session_settings(_cfg(fine_model="sonnet"), {})
     assert fc.check_persist("fine_model", "sonnet", v2) is None
     assert fc.check_persist("fine_model", "opus", v2) == "widen"
+def test_codex_effective_native_model_survives_session_settings():
+    from context_vault.host_config import effective_host_config
+    from scripts._config_loader import DEFAULT_CONFIG
+    from scripts._fine_config import apply_session_settings, get_value
+    cfg = effective_host_config({}, host="codex", base=DEFAULT_CONFIG)
+    assert get_value(cfg, "fine_model") is None
+    view = apply_session_settings(cfg, {})
+    assert view.effective["fine_model"] is None
+    assert view.config["relevance"]["fine_model"] is None
+    assert view.source["fine_model"] == "default"
+
+
+def test_json_host_marker_cannot_switch_claude_model_validation():
+    from scripts._fine_config import get_value
+    assert get_value({"_host": "codex", "host": "codex", "relevance": {"fine_model": None}},
+                     "fine_model") == "haiku"
+
+
+def test_codex_custom_model_is_not_validated_as_a_claude_alias():
+    from context_vault.host_config import effective_host_config
+    from scripts._config_loader import DEFAULT_CONFIG
+    from scripts._fine_config import apply_session_settings, check_persist
+    cfg = effective_host_config({"runtimes": {"codex": {"model": "Org/Existing"}}},
+                                host="codex", base=DEFAULT_CONFIG)
+    view = apply_session_settings(cfg, {"fine_model": "Org/Session"})
+    assert view.effective["fine_model"] == "Org/Session"
+    assert check_persist("fine_model", "haiku", view) == "widen"
+    assert check_persist("fine_model", "Org/Existing", view) is None
+
+
+def test_codex_session_selection_metadata_tracks_accepted_model():
+    from context_vault.host_config import effective_host_config, resolve_model_selection
+    from scripts._config_loader import DEFAULT_CONFIG
+    raw = {"runtimes": {"codex": {"model": "Org/Base", "profile": "selected",
+                                   "model_provider": "gateway"}}}
+    cfg = effective_host_config(raw, host="codex", base=DEFAULT_CONFIG)
+    view = fc.apply_session_settings(cfg, {"fine_model": "Org/Session"})
+    selected = view.config.model_selection
+    assert (selected.model, selected.source) == ("Org/Session", "session")
+    assert (selected.profile, selected.provider) == ("selected", "gateway")
+    assert cfg.model_selection.model == "Org/Base"
+    task = resolve_model_selection(raw, host="codex", session_model=selected.model,
+                                   task_model="Org/Task")
+    assert (task.model, task.source) == ("Org/Task", "task")
